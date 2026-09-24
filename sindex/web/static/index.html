@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sindex search</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
+    --accent: #2f5fd0; --mark: #ffe58a; --danger: #b3261e; --ok: #1f7a3f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #e9e8e4; --muted: #9a9993; --line: #33332f;
+      --accent: #8fb0ff; --mark: #6b5a12; --danger: #ff8a80; --ok: #7ad19a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  #state { color: var(--muted); font-size: 13px; }
+  form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input, button { font: inherit; color: inherit; }
+  input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #q { flex: 1 1 320px; font-size: 16px; }
+  .filters { margin-top: 10px; }
+  .filters label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
+  .filters input { font-size: 14px; }
+  #path { width: 280px; } #ext { width: 140px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px; padding: 7px 16px; cursor: pointer; }
+  button.plain { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 3px 10px; font-size: 13px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  #summary { color: var(--muted); margin: 18px 2px 8px; font-size: 14px; }
+  .err { color: var(--danger); }
+  ol { list-style: none; padding: 0; margin: 0; }
+  li.hit { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .name { font-weight: 600; word-break: break-all; }
+  .dir { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+  .snip { margin-top: 6px; font-size: 14px; overflow-wrap: anywhere; }
+  mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
+  .pager { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
+  details { margin-top: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+  summary { cursor: pointer; font-weight: 600; }
+  table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  td { padding: 2px 14px 2px 0; vertical-align: top; }
+  td:first-child { color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 6px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>sindex</h1><span id="state"><span class="dot"></span>…</span></header>
+
+  <form id="form" autocomplete="off">
+    <div class="row">
+      <input id="q" type="search" placeholder="Search file contents…" autofocus>
+      <button type="submit">Search</button>
+    </div>
+    <div class="row filters">
+      <label>In folder <input id="path" placeholder="D:\Documents"></label>
+      <label>Extensions <input id="ext" placeholder="pdf docx"></label>
+      <label>Modified after <input id="after" type="date"></label>
+      <label>Modified before <input id="before" type="date"></label>
+    </div>
+    <div class="hint">Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
+  </form>
+
+  <div id="summary"></div>
+  <ol id="results"></ol>
+  <div class="pager" id="pager"></div>
+
+  <details id="statusBox">
+    <summary>Indexer status</summary>
+    <table id="statusTable"></table>
+    <div class="row" style="margin-top:10px">
+      <button type="button" class="plain" id="pauseBtn">Pause</button>
+      <input id="reindexPath" placeholder="File or folder to reindex" style="flex:1 1 260px">
+      <button type="button" class="plain" id="reindexBtn">Reindex</button>
+    </div>
+  </details>
+</main>
+<div id="toast"></div>
+
+<script>
+const TOKEN = {{TOKEN}};
+const $ = (id) => document.getElementById(id);
+const PAGE = 20;
+let offset = 0;
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.opacity = 0, 1600);
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+}
+function fmtDate(sec) { return new Date(sec * 1000).toLocaleString(); }
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { prompt("Copy:", text); }
+}
+
+function params() {
+  const p = new URLSearchParams({ q: $("q").value, offset });
+  for (const k of ["path", "ext", "after", "before"]) if ($(k).value) p.set(k, $(k).value);
+  return p;
+}
+
+async function runSearch() {
+  if (!$("q").value.trim()) { $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; return; }
+  const p = params();
+  history.replaceState(null, "", "?" + p);
+  const res = await fetch("/api/search?" + p).then(r => r.json()).catch(e => ({ error: String(e), results: [] }));
+  const sum = $("summary");
+  if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
+  else if (!res.total) { sum.textContent = "No matches."; }
+  else {
+    sum.textContent = `${res.total}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
+  }
+  $("results").innerHTML = res.results.map((r, i) => `
+    <li class="hit">
+      <div class="name">${esc(r.name)}</div>
+      <div class="dir">${esc(r.dir)}</div>
+      <div class="snip">${r.snippet}</div>
+      <div class="meta">
+        <span>${fmtSize(r.size)}</span><span>${fmtDate(r.mtime)}</span>
+        ${r.status !== "ok" ? `<span>${esc(r.status)}</span>` : ""}
+        <button class="plain" data-copy="${i}" data-what="path">Copy path</button>
+        <button class="plain" data-copy="${i}" data-what="dir">Copy folder</button>
+      </div>
+    </li>`).join("");
+  $("results").querySelectorAll("[data-copy]").forEach(b =>
+    b.onclick = () => copy(res.results[+b.dataset.copy][b.dataset.what]));
+  const pager = $("pager"); pager.innerHTML = "";
+  if (offset > 0) pager.append(pageBtn("← Previous", offset - PAGE));
+  if (offset + PAGE < res.total) pager.append(pageBtn("Next →", offset + PAGE));
+}
+function pageBtn(label, to) {
+  const b = document.createElement("button"); b.className = "plain"; b.textContent = label;
+  b.onclick = () => { offset = to; runSearch(); window.scrollTo(0, 0); }; return b;
+}
+
+async function post(action, body) {
+  const r = await fetch("/api/" + action, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Sindex-Token": TOKEN },
+    body: JSON.stringify(body || {}),
+  });
+  return r.ok;
+}
+
+async function refreshStatus() {
+  const s = await fetch("/api/status").then(r => r.json()).catch(() => null);
+  if (!s) return;
+  const ix = s.indexer || {}, idx = s.index || {}, sup = s.supervisor;
+  const alive = sup ? sup.running : ix.age_s !== null && ix.age_s < 90;
+  const state = ix.user_paused ? "paused" : (ix.state || "unknown");
+  $("state").innerHTML = `<span class="dot ${alive ? "on" : ""}"></span>${esc(alive ? state : "indexer not running")}` +
+    (idx.total_files !== undefined ? ` · ${idx.total_files.toLocaleString()} files · ${idx.queued.toLocaleString()} queued` : "");
+  const rows = [
+    ["State", state + (ix.paused_reason && !ix.user_paused ? ` (${ix.paused_reason})` : "")],
+    ["Working on", ix.detail || "—"],
+    ["Indexer memory", ix.rss_mb !== undefined ? ix.rss_mb + " MB" : "—"],
+    ["Roots", (ix.roots || []).join(", ") || "—"],
+    ["USN journal", Object.entries(ix.usn || {}).map(([k, v]) => `${k} ${v ? "on" : "rescans"}`).join(", ") || "—"],
+    ["Files by status", Object.entries(idx.files || {}).map(([k, v]) => `${k}: ${v.toLocaleString()}`).join(", ") || "—"],
+    ["Index size", idx.db_mb !== undefined ? idx.db_mb + " MB" : "—"],
+  ];
+  if (sup) rows.push(["Process restarts", `${sup.restarts} (recycling)`]);
+  $("statusTable").innerHTML = rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join("");
+  $("pauseBtn").textContent = ix.user_paused ? "Resume" : "Pause";
+  $("pauseBtn").dataset.paused = ix.user_paused ? "1" : "";
+}
+
+$("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
+$("pauseBtn").onclick = async () => {
+  await post($("pauseBtn").dataset.paused ? "resume" : "pause"); refreshStatus();
+};
+$("reindexBtn").onclick = async () => {
+  const path = $("reindexPath").value.trim(); if (!path) return;
+  toast(await post("reindex", { path }) ? "Reindex queued" : "Failed");
+  $("reindexPath").value = "";
+};
+
+const init = new URLSearchParams(location.search);
+for (const k of ["q", "path", "ext", "after", "before"]) if (init.get(k)) $(k).value = init.get(k);
+offset = +(init.get("offset") || 0);
+if (init.get("q")) runSearch();
+refreshStatus(); setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>

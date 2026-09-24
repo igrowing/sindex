@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sindex"
+version = "0.1.0"
+description = "Low-footprint full-text indexing service for Windows"
+requires-python = ">=3.12"
+dependencies = [
+    "charset-normalizer>=3.3",
+    "pypdf[cryptodome]>=4.0",  # cryptodome: AES-encrypted PDFs (+1.6 MB RAM; the `crypto` extra costs +3.4 MB)
+    "pywin32>=306",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+sindex = "sindex.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sindex*"]
+
+[tool.setuptools.package-data]
+"sindex.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# deprecated APIs are fixed, not suppressed
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, B bugbear, UP modern syntax, C4 comprehensions,
+# T20 no print(), BLE no blind except, FBT no positional boolean parameters
+select = ["E", "W", "F", "I", "B", "UP", "C4", "T20", "BLE", "FBT001", "FBT002"]
+
+[tool.ruff.lint.per-file-ignores]
+# the command line tool talks to the user with print()
+"sindex/cli.py" = ["T201"]
