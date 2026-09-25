@@ -155,7 +155,9 @@ class Indexer:
         try:
             tmp.write_text(json.dumps(data), encoding="utf-8")
             os.replace(tmp, self.status_path)
-        except OSError as e:
+        except (OSError, MemoryError) as e:
+            # best effort. At the memory cap even opening a small file can fail, and losing the
+            # status file must not turn a normal exit or recycle into a crash
             log.debug("status write failed: %s", e)
 
     def _take_requests(self) -> None:

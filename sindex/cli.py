@@ -8,6 +8,7 @@ import html
 import json
 import re
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -44,16 +45,24 @@ def cmd_run(args) -> int:
 
 
 def cmd_index(args) -> int:
-    """Index in this process until there is nothing left to do."""
-    from .indexer import Indexer
+    """Index until there is nothing left to do, in indexer processes that are recycled.
+
+    The indexer asks to be restarted when it has read many files or grown too big. Only a new
+    process gives the memory back (a second Indexer in the same process frees nothing), so like
+    the service this runs the indexer as a child and starts a fresh one for every recycle.
+    """
+    from .indexer import EXIT_RECYCLE
 
     cfg = _cfg(args)
-    config.setup_logging(cfg.data_dir, "indexer", console=True)
-    indexer = Indexer(cfg, args.root, until_idle=True, limits=not args.no_limits)
+    cmd = [sys.executable, "-m", "sindex.indexer", "--data-dir", str(cfg.data_dir), "--until-idle", "--console"]
+    for root in args.root or []:
+        cmd += ["--root", root]
+    if args.no_limits:
+        cmd.append("--no-limits")
     try:
-        while (code := indexer.run()) == 3:  # recycle request: just keep going in-process
-            indexer = Indexer(cfg, args.root, until_idle=True, limits=False)
-    except KeyboardInterrupt:
+        while (code := subprocess.call(cmd)) == EXIT_RECYCLE:
+            pass
+    except KeyboardInterrupt:  # the child received Ctrl+C as well and has stopped
         return 1
     return code
 

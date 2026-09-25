@@ -190,6 +190,51 @@ class _PdfWithoutCrypto:
 CRYPTO_MESSAGE = "cryptography>=3.1 is required for AES algorithm"
 
 
+class _Page:
+    def __init__(self, reader, text=None, error=None):
+        self.reader, self.text, self.error = reader, text, error
+
+    def extract_text(self):
+        # what pypdf does: everything decoded for a page is cached on the reader for good
+        self.reader.cache_seen.append(len(self.reader.resolved_objects))
+        self.reader.resolved_objects[len(self.reader.cache_seen)] = object()
+        if self.error:
+            raise self.error
+        return self.text
+
+
+class _Reader:
+    is_encrypted = False
+
+    def __init__(self, plan):
+        self.resolved_objects = {}
+        self.cache_seen = []
+        self.pages = [_Page(self, *item) for item in plan]
+
+
+def _use_reader(monkeypatch, reader):
+    monkeypatch.setattr(pypdf, "PdfReader", lambda *args, **kwargs: reader)
+
+
+def test_pdf_page_memory_is_released_after_every_page(tmp_path, ctx, monkeypatch):
+    # pypdf keeps every decoded font and stream for the life of the reader, so memory used to
+    # grow with the page count: a 124-page PDF peaked at 47 MB, with releasing it is 22 MB
+    reader = _Reader([("one",), ("two",), ("three",)])
+    _use_reader(monkeypatch, reader)
+    out = "".join(extract(str(make_pdf(tmp_path / "a.pdf", ["x"])), "pdf", ctx))
+    assert out.split() == ["one", "two", "three"]
+    assert reader.cache_seen == [0, 0, 0], "each page must start with an empty object cache"
+
+
+def test_pdf_page_that_runs_out_of_memory_is_skipped(tmp_path, ctx, monkeypatch):
+    # a single page can need >100 MB to decode; under the memory cap that is a MemoryError.
+    # It costs that page, not the whole document.
+    reader = _Reader([("one",), (None, MemoryError()), ("three",)])
+    _use_reader(monkeypatch, reader)
+    out = "".join(extract(str(make_pdf(tmp_path / "a.pdf", ["x"])), "pdf", ctx))
+    assert out.split() == ["one", "three"]
+
+
 @pytest.mark.parametrize("algorithm", ["RC4-128", "AES-128", "AES-256"])
 def test_pdf_encrypted_with_empty_user_password_is_readable(tmp_path, ctx, algorithm):
     # the usual manufacturer datasheet: opens without a password but has an owner password and

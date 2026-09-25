@@ -24,7 +24,7 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 ## Try it without installing the service
 
 ```powershell
-# index a folder once, in this process, then exit
+# index a folder once, in recycled indexer processes like the service uses, then exit
 .venv\Scripts\sindex --data-dir .\data index --root D:\Download
 .venv\Scripts\sindex --data-dir .\data search "sample" --ext csv
 
@@ -60,6 +60,10 @@ while the service is installed.
   IDLE priority in background mode (low I/O and memory priority) with EcoQoS ("Efficiency mode" in Task Manager),
   inside a Job Object with a hard memory cap (256 MB) and a hard CPU cap (10% of the machine).
 - The child is restarted every 1000 files or when it grows past 150 MB. Work is persisted in the `queue` table.
+  Only a new process gives memory back to Windows, which is why `sindex index` also runs the indexer as recycled
+  children. PDFs are the heavy part, because pypdf parses whole pages: a page can need 30 to 130 MB while it is
+  decoded. After each page the decoded objects are dropped, and a page that does not fit under the 256 MB cap is
+  skipped without losing the rest of the document.
 - A duty cycle sleeps as long as it works (`duty_factor`) and reads are rate-limited (`read_mb_per_sec`). Indexing
   pauses on battery, when the system is busy, or when you pause it.
 - Everything is streamed: 64 KB reads, incremental decoders, expat for Office XML, one PDF page at a time, and one
