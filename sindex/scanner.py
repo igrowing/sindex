@@ -12,6 +12,7 @@ import sqlite3
 from collections.abc import Callable
 
 from . import db
+from .config import Config
 from .extract import file_ext, kind_of
 from .filters import A_DIRECTORY, PathFilter
 from .throttle import Throttle
@@ -19,6 +20,15 @@ from .throttle import Throttle
 log = logging.getLogger(__name__)
 
 COMMIT_EVERY_DIRS = 200
+
+
+def queue_priority(name: str, cfg: Config, *, force: bool = False) -> int:
+    """Priority for a file about to be queued: a forced reindex goes first; otherwise plain text and
+    markup (cheap to parse) go before the slower formats (PDF, Office, RTF), so their content is
+    searchable while the slow formats are still being read."""
+    if force:
+        return db.PRIORITY_FORCED
+    return db.PRIORITY_TEXT_EASY if kind_of(file_ext(name), cfg) == "text" else db.PRIORITY_TEXT_HARD
 
 
 def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttle,
@@ -29,7 +39,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
     Manages its own transactions; must be called outside one.
     """
     cfg = filt.cfg
-    reason, priority = ("force", db.PRIORITY_FORCED) if force else ("scan", None)
+    reason = "force" if force else "scan"
     queued = 0
     dirs = 0
     stack = [top] if not filt.dir_excluded(top) else []
@@ -62,10 +72,12 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
                     "SELECT name, size, mtime_ns FROM files WHERE dir = ?", (d,)).fetchall():
                 entry = seen.pop(name.lower(), None)
                 if force or entry is None or entry[1] != size or entry[2] != mtime_ns:
-                    db.enqueue(conn, os.path.join(d, name), reason=reason, priority=priority)
+                    prio = queue_priority(name, cfg, force=force)
+                    db.enqueue(conn, os.path.join(d, name), reason=reason, priority=prio)
                     queued += 1
             for name, _, _ in seen.values():
-                db.enqueue(conn, os.path.join(d, name), reason=reason, priority=priority)
+                prio = queue_priority(name, cfg, force=force)
+                db.enqueue(conn, os.path.join(d, name), reason=reason, priority=prio)
                 queued += 1
 
             dirs += 1
@@ -84,7 +96,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
             throttle.checkpoint()
             if filt.dir_excluded(d) or not os.path.isdir(d):
                 for (name,) in conn.execute("SELECT name FROM files WHERE dir = ?", (d,)).fetchall():
-                    db.enqueue(conn, os.path.join(d, name), reason="scan")
+                    db.enqueue(conn, os.path.join(d, name), reason="scan", priority=queue_priority(name, cfg))
                     queued += 1
         conn.execute("COMMIT")
     except BaseException:

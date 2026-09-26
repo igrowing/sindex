@@ -19,6 +19,10 @@ STAGE_META = "meta"  # phase 2
 STAGE_OCR = "ocr"  # phase 3
 PRIORITY = {STAGE_DIR: 5, STAGE_TEXT: 10, STAGE_META: 20, STAGE_OCR: 30}
 PRIORITY_FORCED = 1
+# within STAGE_TEXT: plain text and markup are cheap to parse, so they are read (and become searchable)
+# before the slower formats (PDF, Office, RTF); both stay well short of STAGE_META.
+PRIORITY_TEXT_EASY = PRIORITY[STAGE_TEXT]
+PRIORITY_TEXT_HARD = PRIORITY_TEXT_EASY + 5
 
 # A file's chunks live at rowids [file_id << CHUNK_BITS, (file_id + 1) << CHUNK_BITS).
 CHUNK_BITS = 16

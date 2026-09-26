@@ -278,6 +278,7 @@ class Indexer:
         clean = True
         try:
             self._prune_removed_roots()
+            self._migrate_queue_priorities()
             self._load_volumes()
             return self._loop()
         except Stopped:
@@ -356,6 +357,31 @@ class Indexer:
         db.set_meta(self.conn, "roots", roots)
         if removed:
             log.info("removed %d files outside the configured roots", removed)
+
+    def _migrate_queue_priorities(self) -> None:
+        """One-time fix for files queued before the easy/hard split existed.
+
+        Every STAGE_TEXT file used to be enqueued at PRIORITY_TEXT_EASY, whatever its kind. `enqueue()`
+        merges priorities with min(), so a later rescan of an already-queued PDF cannot raise it back to
+        PRIORITY_TEXT_HARD on its own; without this, PDFs queued by an older version keep running ahead
+        of plain text files forever. Runs once (a meta flag records that), since after this every queued
+        file gets its priority right from `scanner.queue_priority()` at enqueue time.
+        """
+        if db.get_meta(self.conn, "queue_priorities_migrated"):
+            return
+        rows = self.conn.execute("SELECT path FROM queue WHERE stage = ? AND priority = ?",
+                                 (db.STAGE_TEXT, db.PRIORITY_TEXT_EASY)).fetchall()
+        fixed = 0
+        self.conn.execute("BEGIN")
+        for (path,) in rows:
+            if scanner.queue_priority(os.path.basename(path), self.cfg) != db.PRIORITY_TEXT_EASY:
+                self.conn.execute("UPDATE queue SET priority = ? WHERE path = ? AND stage = ?",
+                                  (db.PRIORITY_TEXT_HARD, path, db.STAGE_TEXT))
+                fixed += 1
+        db.set_meta(self.conn, "queue_priorities_migrated", True)
+        self.conn.execute("COMMIT")
+        if fixed:
+            log.info("queue: corrected priority for %d files queued before the easy/hard split existed", fixed)
 
     def _rules(self) -> dict:
         """What decides which files are in the index, apart from the roots (those are compared on their own)."""
@@ -454,7 +480,8 @@ class Indexer:
         if ch.is_dir:
             db.enqueue(self.conn, ch.path, db.STAGE_DIR, reason="usn")
         else:
-            db.enqueue(self.conn, ch.path, reason="usn")
+            priority = scanner.queue_priority(os.path.basename(ch.path), self.cfg)
+            db.enqueue(self.conn, ch.path, reason="usn", priority=priority)
 
     def _poll_journals(self) -> bool:
         did = False
