@@ -16,18 +16,20 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import control, db
+from .. import config, control, db
 from ..config import Config
 from ..search import search
 
 log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).with_name("static")
+PAGES = {"/": "index.html", "/settings": "settings.html", "/log": "log.html"}
 MAX_BODY = 64 * 1024
+HEALTH_PAGE = 50  # files per page of the health list
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "sindex"
+    server_version = "sindex v." + config.VERSION
     server: _Server
 
     def log_message(self, fmt, *args) -> None:
@@ -65,10 +67,20 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         url = urlsplit(self.path)
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
-        if url.path == "/":
-            page = (STATIC / "index.html").read_text(encoding="utf-8")
-            page = page.replace("{{TOKEN}}", json.dumps(self.server.cfg.token))
+        if url.path in PAGES:
+            page = (STATIC / PAGES[url.path]).read_text(encoding="utf-8")
+            page = page.replace("{{TOKEN}}", json.dumps(self.server.cfg.token)).replace("{{VERSION}}", config.VERSION)
             return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+        if url.path == "/style.css":
+            return self._send(200, (STATIC / "style.css").read_bytes(), "text/css; charset=utf-8")
+        if url.path == "/api/settings":
+            return self._json(config.public_settings(config.load(self.server.cfg.data_dir)))
+        if url.path == "/api/health":
+            return self._health(q)
+        if url.path == "/api/browse":
+            return self._browse(q)
+        if url.path == "/api/log":
+            return self._log(q)
         if url.path == "/api/search":
             return self._search(q)
         if url.path == "/api/status":
@@ -76,15 +88,20 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
+        # the body is read before anything is refused: closing a connection with unread request data makes
+        # Windows reset it, and the client then sees a connection error instead of the 403
+        length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
+        raw = self.rfile.read(length)
         if not self._host_ok():
             return self._send(403, b"forbidden", "text/plain")
         token = self.headers.get("X-Sindex-Token", "")
         if not self.server.cfg.token or not hmac.compare_digest(token, self.server.cfg.token):
             return self._json({"error": "bad token"}, 403)
-        length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(raw or b"{}")
         except ValueError:
+            return self._json({"error": "bad json"}, 400)
+        if not isinstance(body, dict):
             return self._json({"error": "bad json"}, 400)
         path = urlsplit(self.path).path
         cfg = self.server.cfg
@@ -92,11 +109,67 @@ class _Handler(BaseHTTPRequestHandler):
             control.pause(cfg)
         elif path == "/api/resume":
             control.resume(cfg)
+        elif path == "/api/settings":
+            return self._change_settings(body)
+        elif path == "/api/retry" and body.get("status") in control.RETRY_STATUSES:
+            control.request_retry(cfg, body["status"])
+        elif path == "/api/rebuild":
+            control.request_rebuild(cfg)
+        elif path == "/api/maintenance" and body.get("action") in control.MAINTENANCE_ACTIONS:
+            control.request_maintenance(cfg, body["action"])
         elif path == "/api/reindex" and isinstance(body.get("path"), str) and body["path"].strip():
             control.request_reindex(cfg, body["path"].strip())
         else:
             return self._json({"error": "unknown action"}, 404)
         self._json({"ok": True})
+
+    def _change_settings(self, body: dict) -> None:
+        # validated here so that the UI hears about a bad value at once; the supervisor writes the file
+        try:
+            changes = config.validate_changes(body.get("changes"), check_paths=True)
+        except config.ConfigError as e:
+            return self._json({"error": str(e), "errors": e.errors}, 400)
+        control.request_settings(self.server.cfg, changes)
+        self._json({"ok": True})
+
+    def _token_ok(self) -> bool:
+        token = self.headers.get("X-Sindex-Token", "")
+        return bool(self.server.cfg.token) and hmac.compare_digest(token, self.server.cfg.token)
+
+    def _browse(self, q: dict) -> None:
+        # the folder names of the whole computer are not for every web page that can reach localhost
+        if not self._token_ok():
+            return self._json({"error": "bad token"}, 403)
+        try:
+            self._json(control.list_folders(q.get("path", "")))
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+
+    def _log(self, q: dict) -> None:
+        # logs name the files and folders that were indexed
+        if not self._token_ok():
+            return self._json({"error": "bad token"}, 403)
+        try:
+            self._json(control.read_log(self.server.cfg, q.get("name", ""), int(q.get("kb") or 256)))
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+
+    def _health(self, q: dict) -> None:
+        conn = self._connect()
+        if conn is None:
+            return self._json({"counts": {}, "files": [], "limit": HEALTH_PAGE})
+        try:
+            status = q.get("status")
+            files = []
+            if status:
+                files = control.problem_files(conn, status, limit=HEALTH_PAGE, offset=max(0, int(q.get("offset") or 0)))
+            counts = control.index_stats(conn, self.server.cfg)["files"]
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        finally:
+            conn.close()
+        self._json({"counts": {s: counts.get(s, 0) for s in control.RETRY_STATUSES}, "files": files,
+                    "limit": HEALTH_PAGE})
 
     def _search(self, q: dict) -> None:
         conn = self._connect()
@@ -118,7 +191,8 @@ class _Handler(BaseHTTPRequestHandler):
         data = {"indexer": control.indexer_status(cfg)}
         sup = self.server.supervisor
         if sup is not None:
-            data["supervisor"] = {"running": sup.running, "restarts": sup.restarts, "last_exit": sup.last_exit}
+            data["supervisor"] = {"running": sup.running, "restarts": sup.restarts, "last_exit": sup.last_exit,
+                                  "settings_error": sup.settings_error}
         conn = self._connect()
         if conn is not None:
             try:

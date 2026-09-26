@@ -5,8 +5,9 @@ It keeps CPU and memory use low, even if that makes indexing slower.
 
 - **Formats:** about 165 text extensions (txt, md, csv, json, yaml, toml, ini, log, source code, ...), HTML and
   XML-family markup (xml, svg, rss, xaml, csproj, ...), docx/xlsx/pptx, odt/ods/odp, rtf, and pdf (text layer,
-  including AES/RC4-encrypted PDFs that open without a password; PDFs that need one are skipped). Add your own
-  with `extra_text_extensions` in `config.toml`. Only text between XML tags is indexed, not attribute values.
+  including AES/RC4-encrypted PDFs that open without a password; PDFs that need one are skipped). The list is
+  `text_extensions` in `config.toml` (Settings shows all of it): take out what you do not want, add your own.
+  An old `extra_text_extensions` entry is merged into it. Only text between XML tags is indexed, not attribute values.
   Files are matched by extension, so extension-less files such as `README` or `Makefile` are not indexed.
 - **Languages and encodings:** it detects BOMs, UTF-8/16, cp125x, KOI8-R, cp866, ISO-8859-x, Shift-JIS, EUC-JP,
   GB18030, Big5 and EUC-KR. Search ignores accents and case: Latin accents, Greek tonos, and Hebrew/Arabic vowel
@@ -52,10 +53,10 @@ The service keeps its data in `%ProgramData%\sindex`:
 
 | File | Purpose |
 |---|---|
-| `config.toml` | settings (roots, exclusions, throttling, web port/token); restart the service after editing |
+| `config.toml` | settings (roots, exclusions, throttling, web port/token); see below for how it is edited |
 | `index.db` | SQLite FTS5 index |
 | `logs\` | `service.log`, `indexer.log` (with a `progress: N files indexed, M files in queue` line after every 1000 files), `indexer-stderr.log` |
-| `status.json`, `paused`, `requests\` | control files the web UI and CLI use to talk to the indexer |
+| `status.json`, `paused`, `requests\`, `settings-requests\` | control files the web UI and CLI use to talk to the indexer and the service |
 
 To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
 while the service is installed.
@@ -81,9 +82,49 @@ while the service is installed.
 - Everything is streamed: 64 KB reads, incremental decoders, expat for Office XML, one PDF page at a time, and one
   directory at a time while scanning. SQLite uses an 8 MB page cache and no mmap.
 
+## Settings page
+
+The web UI has a **Settings** page (the gear link at the top right of the search page), in five tabs: Speed,
+Schedule, What to index, Health and Maintenance. One *Save changes* button stores everything changed on the first
+three; a tab with a rejected value is marked and opened. It covers:
+
+- **Speed:** the presets Background, Balanced and Fast (the measured steps below: 22 s, 9 s and 3.8 s for the
+  test files), the two pause rules, and all the other `[throttle]` values under *Advanced*.
+- **Schedule and freshness:** `schedule_windows` (for example `22:00-06:00`; the indexer pauses outside them),
+  `rescan_hours` and `usn_poll_seconds`.
+- **What to index:** roots and folders to skip (picked in a folder browser, with the chosen folders listed beside it;
+  the browser lists folders of this computer and needs the web token), folder names to skip anywhere and file
+  extensions to skip (side by side), patterns to skip and the file types read as text (side by side; extensions can be
+  typed separated by spaces, commas or lines, with or without the dot), hidden files, and the size limits. A pattern without a backslash is matched against the name
+  (`*.env`, `secret*`), one with a backslash against the whole path (`*\.ssh\*`, `D:\Private\*`); `*` also matches
+  across folders and case is ignored. Saving a change to these rules makes the indexer rescan, so files that are
+  excluded now leave the index and files that are allowed now enter it.
+- **Index storage:** where `index.db` is and how big it is. To move it, stop the service, move the `index.db*` files,
+  set `db_dir` in `config.toml` and start the service. The folder must exist and be on a local fixed drive (SQLite's
+  write-ahead log does not work on network shares); otherwise the indexer refuses to start and says why in its status.
+  The index folder is never indexed.
+- **Indexing health:** the files that ended as error, too big, not text, cut short or empty, with their error, and a
+  retry for one file or for a whole group (after raising a size limit, for example).
+- **Maintenance:** rebuild everything, optimize the search index, compact the database (both run when the queue is
+  empty, rewrite much of the database and cannot be interrupted), and reindex a path.
+
+The **Log** link in the status panel of the search page opens a read-only log viewer: the indexer log, the service
+and web UI log, or the indexer's stderr, showing the last 64 KB to 1 MB, with a text filter, highlighted warnings and
+errors, and a *Follow* switch that refreshes every 3 s. Reading a log needs the web token, because logs name the
+files and folders that were indexed. (Searches are not logged.)
+
+The page never writes `config.toml` itself: it validates the change (roots must exist, patterns and windows must be
+well formed), then drops a request in `settings-requests\` and the service writes the file and restarts the indexer,
+which reads the new values when it starts. A value that is out of range is refused with a message and the file stays
+as it was. Every write needs the web token, like Pause and Reindex.
+
+The service rewrites `config.toml` from a template with every key filled in, so comments you add by hand are lost;
+the previous file is kept as `config.toml.bak`. Edit it by hand only while the service is stopped, or expect the
+indexer to pick the change up at its next restart.
+
 ## Tuning how hard it is throttled
 
-All of these are in the `[throttle]` section of `config.toml` (restart the service after editing). Indexing 2,506
+All of these are in the `[throttle]` section of `config.toml`, or under *Advanced* on the Settings page. Indexing 2,506
 files on an otherwise idle 8-core machine took 2.8 s unthrottled and 22 s with the defaults:
 
 | Setting (default) | What it does | Cost |

@@ -10,8 +10,9 @@ import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
+from datetime import datetime
 
-from .config import Config
+from .config import Config, parse_window
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +193,18 @@ def on_battery() -> bool:
     return status.ACLineStatus == 0
 
 
+def in_schedule(windows: list[str], now: datetime) -> bool:
+    """Whether `now` is inside one of the "HH:MM-HH:MM" windows (no windows: always)."""
+    if not windows:
+        return True
+    minute = now.hour * 60 + now.minute
+    for window in windows:
+        start, end = parse_window(window)
+        if (start <= minute < end) if start < end else (minute >= start or minute < end):
+            return True
+    return False
+
+
 class _CpuMeter:
     """System-wide CPU usage between successive calls."""
 
@@ -273,6 +286,8 @@ class Throttle:
             return reason
         if self.cfg.pause_on_battery and on_battery():
             return "on battery"
+        if self.cfg.schedule_windows and not in_schedule(self.cfg.schedule_windows, datetime.now()):
+            return "outside the schedule"
         limit = self.cfg.pause_when_cpu_busy_percent
         if limit > 0 and self._cpu.percent() > limit:
             return "system busy"

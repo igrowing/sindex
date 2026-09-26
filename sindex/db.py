@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .textnorm import BIGRAM_SEP, RUN_END, RUN_START
+from .usn import is_local_folder
 
 SCHEMA_VERSION = 1
 
@@ -71,6 +72,21 @@ CREATE TABLE IF NOT EXISTS media (
     ocr_hash TEXT, ocr_lang TEXT, ocr_at REAL
 );
 """
+
+
+class DbLocationError(Exception):
+    """index.db cannot live where the configuration puts it."""
+
+
+def check_location(path: Path) -> None:
+    """The folder of `path` must exist and be on a local drive: the write-ahead log needs shared memory
+    and file locks that network shares do not provide, and a database there gets corrupted."""
+    folder = Path(path).parent
+    if not folder.is_dir():
+        raise DbLocationError(f"the index folder {folder} does not exist (db_dir in config.toml)")
+    if not is_local_folder(str(folder)):
+        raise DbLocationError(f"the index folder {folder} is not on a local drive; SQLite cannot keep its "
+                              "write-ahead log on a network share or a removable drive")
 
 
 def connect(path: Path, *, readonly: bool = False, wal_pages: int | None = None,

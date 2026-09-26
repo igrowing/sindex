@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config
+from . import config, control
 from .indexer import EXIT_RECYCLE
 from .web.server import WebServer
 
@@ -47,6 +47,7 @@ class Supervisor:
         self.proc: subprocess.Popen | None = None
         self.restarts = 0
         self.last_exit: int | None = None
+        self.settings_error: str | None = None  # why the last settings request was not applied
 
     @property
     def running(self) -> bool:
@@ -78,26 +79,63 @@ class Supervisor:
                            capture_output=True, creationflags=CREATE_NO_WINDOW)
             proc.wait()
 
+    def _apply_settings(self) -> bool:
+        """Write the settings the web UI asked for; True if config.toml changed, so the indexer must restart.
+
+        The web UI validated them already. A request can still fail here, for example when config.toml was
+        edited by hand in the meantime; that is logged and shown in the status, and the file is left as it was.
+        """
+        changed = False
+        for changes in control.take_settings_requests(self.cfg):
+            try:
+                config.apply(self.cfg.data_dir, changes)
+            except (config.ConfigError, OSError) as e:
+                log.error("settings not applied: %s", e)
+                self.settings_error = str(e)
+            else:
+                log.info("settings applied: %s", ", ".join(changes))
+                self.settings_error = None
+                changed = True
+        return changed
+
+    def _wait_before_restart(self, seconds: float) -> bool:
+        """Sleep before restarting a failed indexer, but not through a settings change (it may be the fix).
+
+        Returns True when the service is stopping.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.stop.wait(1.0):
+                return True
+            if self._apply_settings():
+                break
+        return False
+
     def run(self) -> None:
         backoff = 30.0
         while not self.stop.is_set():
             started = time.monotonic()
             self.proc = self._spawn()
             log.info("indexer started (pid %d)", self.proc.pid)
+            settings_changed = False
             while self.proc.poll() is None:
                 if self.stop.wait(1.0):
                     self._terminate(self.proc)
                     log.info("indexer stopped")
                     return
+                if self._apply_settings():
+                    log.info("restarting the indexer to apply the new settings")
+                    self._terminate(self.proc)
+                    settings_changed = True
             self.last_exit = code = self.proc.returncode
-            if code == EXIT_RECYCLE:
+            if code == EXIT_RECYCLE or settings_changed:
                 self.restarts += 1
                 continue
             if time.monotonic() - started > 600:
                 backoff = 30.0
             log.log(logging.INFO if code == 0 else logging.ERROR,
                     "indexer exited with code %s; restarting in %.0f s", code, backoff)
-            if self.stop.wait(backoff):
+            if self._wait_before_restart(backoff):
                 return
             backoff = min(backoff * 2, 900.0)
 

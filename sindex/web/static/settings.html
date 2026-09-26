@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sindex settings</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  header a { color: var(--accent); font-size: 13px; text-decoration: none; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  h2 { font-size: 16px; margin: 0 0 4px; }
+  .lead { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  .presets { display: grid; gap: 6px; margin-bottom: 14px; }
+  .presets label { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
+  .presets small { color: var(--muted); }
+  .field { display: grid; grid-template-columns: 240px 130px 1fr; gap: 4px 12px; align-items: start; margin: 8px 0; }
+  .field > label { font-size: 14px; padding-top: 5px; }
+  .field input[type=number] { width: 130px; }
+  .field input[type=checkbox] { margin-top: 8px; }
+  .field .hint { margin: 4px 0 0; }
+  .field .bad { grid-column: 2 / 4; color: var(--danger); font-size: 12px; }
+  textarea.tall { min-height: 13.5em; }
+  .field.invalid input, .field.invalid textarea { outline: 2px solid var(--danger); }
+  .field.wide { grid-template-columns: 1fr; }
+  .field.wide > label { padding-top: 0; font-weight: 600; }
+  .field.wide .bad { grid-column: 1; }
+  textarea { width: 100%; min-height: 4.5em; resize: vertical; font: 13px/1.4 Consolas, monospace; color: inherit;
+             background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; }
+  details { margin-top: 12px; }
+  details > summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+  .tabs.pages { margin: 0 0 16px; gap: 4px; border-bottom: 1px solid var(--line); }
+  .tabs.pages button { border: 0; border-bottom: 3px solid transparent; border-radius: 0; padding: 8px 14px; font-size: 14px; }
+  .tabs.pages button.on { background: transparent; color: var(--accent); border-bottom-color: var(--accent); }
+  .tabs.pages button.err { color: var(--danger); }
+  .tabs.pages button.err::after { content: " \25CF"; font-size: 10px; }
+  section[hidden], .savebar[hidden] { display: none; }
+  .savebar { position: sticky; bottom: 0; display: flex; gap: 12px; align-items: center; padding: 10px 16px;
+             margin: 0 -16px 16px; background: var(--bg); border-top: 1px solid var(--line); }
+  #msg { font-size: 13px; }
+  #msg.err { color: var(--danger); }
+  #msg.ok { color: var(--ok); }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-size: 14px; margin: 6px 0 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; word-break: break-all; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  .tabs button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: 4px 12px; font-size: 13px; }
+  .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .tabs button[disabled] { opacity: .5; cursor: default; }
+  .files { width: 100%; }
+  .files td { padding: 5px 10px 5px 0; border-top: 1px solid var(--line); word-break: break-all; }
+  .files td:last-child { white-space: nowrap; text-align: right; }
+  .acts { display: grid; gap: 10px; margin-top: 8px; }
+  .act { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .act button { flex: none; min-width: 190px; }
+  .act span { color: var(--muted); font-size: 13px; flex: 1 1 320px; }
+  .warn { color: var(--danger); font-size: 13px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+  .picker { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .picker > div { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); min-width: 0; display: flex; flex-direction: column; }
+  .pk-bar { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .pk-bar button { padding: 1px 9px; }
+  .pk-path { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pk-rows, .pk-list { height: 200px; overflow-y: auto; padding: 2px 0; }
+  .pk-row { display: flex; align-items: center; gap: 8px; padding: 2px 10px; font-size: 14px; }
+  .pk-row:hover { background: var(--panel); }
+  .pk-row .name { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pk-row .go { color: var(--muted); cursor: pointer; }
+  .pk-row input { margin: 0; }
+  .pk-row.chosen span.path { flex: 1; word-break: break-all; font-size: 13px; }
+  .pk-row.chosen button { padding: 0 8px; }
+  .pk-title { padding: 6px 10px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  .pk-empty { padding: 8px 10px; color: var(--muted); font-size: 13px; }
+  .pk-add { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--line); }
+  .pk-add input { flex: 1; font-size: 13px; }
+  .field.invalid .picker > div { outline: 2px solid var(--danger); }
+  @media (max-width: 720px) {
+    .field { grid-template-columns: 1fr 130px; } .field .hint { grid-column: 1 / 3; }
+    .pair, .picker { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>sindex</h1><span class="ver">v{{VERSION}}</span><span>Settings</span><a href="/">&larr; Back to search</a></header>
+  <nav class="tabs pages" id="pages">
+    <button type="button" data-tab="speed">Speed</button>
+    <button type="button" data-tab="schedule">Schedule</button>
+    <button type="button" data-tab="index">What to index</button>
+    <button type="button" data-tab="health">Health</button>
+    <button type="button" data-tab="maintenance">Maintenance</button>
+  </nav>
+
+  <section data-tab="speed">
+    <h2>Indexing speed</h2>
+    <p class="lead">How hard the indexer is held back. A slower setting is gentler on the CPU, the disk and the battery.
+      Saving restarts the indexer, which finishes the file it is on first; nothing is lost.</p>
+    <div class="presets" id="presets"></div>
+    <div id="f-visible"></div>
+    <details>
+      <summary>Advanced</summary>
+      <div id="f-advanced"></div>
+    </details>
+  </section>
+
+  <section data-tab="schedule">
+    <h2>Schedule and freshness</h2>
+    <p class="lead">When the indexer may work and how often it looks for changes.</p>
+    <div id="f-schedule"></div>
+  </section>
+
+  <section data-tab="index">
+    <h2>What to index</h2>
+    <p class="lead">Windows, Program Files, ProgramData and the index folder itself are never indexed. Files that
+      are excluded here also disappear from the index at the next scan, which starts when you save.</p>
+    <div id="f-roots"></div>
+    <div id="f-skip"></div>
+    <div class="pair"><div id="f-names"></div><div id="f-exts"></div></div>
+    <div class="pair"><div id="f-globs"></div><div id="f-text"></div></div>
+    <div id="f-index"></div>
+    <details>
+      <summary>Size limits</summary>
+      <p class="lead" style="margin-top:8px">Bigger files are listed as <i>too big</i> under Indexing health.</p>
+      <div id="f-limits"></div>
+    </details>
+  </section>
+
+  <section data-tab="maintenance">
+    <h2>Index storage</h2>
+    <dl class="kv">
+      <dt>Database</dt><dd id="dbPath">…</dd>
+      <dt>Size on disk</dt><dd id="dbSize">…</dd>
+    </dl>
+    <p class="lead">To move it to another local drive: stop the service, move the <code>index.db*</code> files, set
+      <code>db_dir</code> in <code>config.toml</code>, and start the service. Network shares and removable drives
+      are refused, because SQLite's write-ahead log does not work there.</p>
+  </section>
+
+  <section id="healthSection" data-tab="health">
+    <h2>Indexing health</h2>
+    <p class="lead">Files that could not be indexed completely.</p>
+    <div class="tabs" id="healthTabs"></div>
+    <p class="lead" id="healthWhy"></p>
+    <table class="files" id="healthFiles"></table>
+    <div class="pager" id="healthPager"></div>
+    <div class="act" id="healthAct"></div>
+  </section>
+
+  <section data-tab="maintenance">
+    <h2>Maintenance</h2>
+    <div class="acts">
+      <div class="act"><button type="button" class="plain" id="rebuildBtn">Rebuild everything</button>
+        <span>Reads every file under the indexed folders again. Takes as long as the first indexing did and writes as much.</span></div>
+      <div class="act"><button type="button" class="plain" id="optimizeBtn">Optimize search index</button>
+        <span>Merges the index into one piece for faster searches. Writes about the size of the index to the disk once.</span></div>
+      <div class="act"><button type="button" class="plain" id="vacuumBtn">Compact database</button>
+        <span>Gives the space of deleted files back to Windows. Needs free disk space as large as the database.</span></div>
+      <div class="act"><input id="reindexPath" placeholder="File or folder to reindex" style="flex:1 1 260px">
+        <button type="button" class="plain" id="reindexBtn" style="min-width:0">Reindex</button></div>
+    </div>
+    <p class="lead" id="maintInfo" style="margin-top:12px"></p>
+  </section>
+  <div class="savebar" id="savebar">
+    <button type="button" id="save">Save changes</button>
+    <span id="msg"></span>
+  </div>
+
+</main>
+<div id="toast"></div>
+
+<script>
+const TOKEN = {{TOKEN}};
+const $ = (id) => document.getElementById(id);
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.opacity = 0, 2200);
+}
+
+const PRESET_INFO = {
+  background: ["Background", "gentlest: works half the time, Efficiency mode, low disk priority (about 22 s for 2,506 files on our test machine)"],
+  balanced: ["Balanced", "normal speed, still low disk priority (about 9 s)"],
+  fast: ["Fast", "full speed while the machine is otherwise idle (about 3.8 s)"],
+  custom: ["Custom", "your own values, see Advanced"],
+};
+// container id -> { key: [label, hint] }; every key here is a setting the page can change
+const GROUPS = {
+  "f-visible": {
+    pause_on_battery: ["Pause on battery", "Stop indexing while the laptop runs on battery."],
+    pause_when_cpu_busy_percent: ["Pause when the CPU is busier than (%)", "Indexing resumes when it calms down. 0 = never pause."],
+  },
+  "f-advanced": {
+    efficiency_mode: ["Windows Efficiency mode", "Low clock speeds, efficiency cores. Makes indexing about 2x slower."],
+    background_io: ["Low disk and memory priority", "About 1.5x slower, but never in the way of other programs."],
+    idle_priority: ["Lowest CPU priority", "Free on an idle machine; keeps your foreground work first."],
+    cpu_rate_percent: ["CPU cap (% of the machine)", "Hard limit for the indexer and its workers together. 0 = off."],
+    memory_limit_mb: ["Memory cap (MB)", "Hard limit for the indexer process. 0 = off."],
+    duty_factor: ["Rest per work", "After working for t seconds, sleep this many times t. 1 = 50% duty."],
+    read_mb_per_sec: ["Read speed cap (MB/s)", "Limits how fast files are read. 0 = off."],
+    extract_workers: ["Parsing processes", "Files are parsed in parallel; each costs about 50 MB of RAM. 0 = in the indexer."],
+    recycle_after_files: ["Restart the indexer after (files)", "A fresh process gives memory back to Windows."],
+    recycle_rss_mb: ["... or when it grows past (MB)", "Also applies to each parsing process."],
+    commit_every_files: ["Save to disk every (files)", "Bigger batches write less to the SSD."],
+    commit_every_seconds: ["... or every (seconds)", "New files show up in search after a save."],
+    sqlite_cache_mb: ["Database cache (MB)", "A batch must fit in it."],
+    wal_autocheckpoint_pages: ["Log checkpoint (pages)", "4 KB pages of the write-ahead log before it is merged."],
+  },
+  "f-schedule": {
+    schedule_windows: ["Only index during these hours", "One window per line, like 22:00-06:00 (it may pass midnight). Empty = at any time."],
+    rescan_hours: ["Full rescan every (hours)", "Only for drives without an NTFS change journal."],
+    usn_poll_seconds: ["Look for changes every (seconds)", "How often the NTFS change journal is read."],
+  },
+  "f-roots": {
+    roots: ["Folders to index", "Tick the folders to index; browse into a folder with its name or arrow. Nothing chosen = all fixed drives."],
+  },
+  "f-skip": {
+    exclude_paths: ["Folders to skip", "Tick the folders to leave out. Everything below them is skipped."],
+  },
+  "f-names": {
+    exclude_dir_names: ["Folder names to skip anywhere", "One name per line, like node_modules."],
+  },
+  "f-exts": {
+    exclude_extensions: ["File types to skip", "Like env pem key, separated by spaces, commas or lines. Good for keys and secrets."],
+  },
+  "f-globs": {
+    exclude_globs: ["Patterns to skip",
+      "One per line. * matches any text, ? one character. Without a backslash it is matched against the name (*.env, secret*); with one, against the whole path (*\\.ssh\\*, D:\\Private\\*)."],
+  },
+  "f-text": {
+    text_extensions: ["File types to read as text",
+      "Everything that is read as plain text or markup now. Take out what you do not want and add your own, separated by spaces, commas or lines, with or without the dot."],
+  },
+  "f-index": {
+    index_hidden: ["Index hidden files and folders", ""],
+  },
+  "f-limits": {
+    max_text_mb: ["Text files up to (MB)", ""],
+    max_office_mb: ["Office documents up to (MB)", ""],
+    max_pdf_mb: ["PDF files up to (MB)", ""],
+    max_chars_per_file: ["Characters read per file", "The rest of a longer file is not indexed (it is listed as truncated)."],
+  },
+};
+const KEYS = Object.values(GROUPS).flatMap(g => Object.keys(g));
+const PICKERS = ["roots", "exclude_paths"];  // lists of folders, chosen in a folder browser
+const TALL = ["exclude_globs", "text_extensions", "exclude_dir_names", "exclude_extensions"];  // these four boxes are equally tall
+const PRESET_KEYS = ["efficiency_mode", "background_io", "duty_factor", "read_mb_per_sec", "cpu_rate_percent"];
+
+let state = null;  // what GET /api/settings returned
+
+function fieldHtml(key, [label, hint]) {
+  const spec = state.specs[key], id = "f_" + key;
+  let input, cls = "field";
+  if (PICKERS.includes(key)) { input = `<div class="picker" id="${id}"></div>`; cls += " wide"; }
+  else if (spec.kind === "bool") input = `<input type="checkbox" id="${id}">`;
+  else if (spec.kind === "list") { input = `<textarea id="${id}" spellcheck="false" class="${TALL.includes(key) ? "tall" : ""}"></textarea>`; cls += " wide"; }
+  else input = `<input type="number" id="${id}" ${spec.lo !== null ? `min="${spec.lo}"` : ""} ` +
+                 `${spec.hi !== null ? `max="${spec.hi}"` : ""} step="${spec.kind === "int" ? 1 : "any"}">`;
+  return `<div class="${cls}" data-field="${key}"><label for="${id}">${esc(label)}</label>${input}` +
+         `<p class="hint">${esc(hint)}</p><div class="bad" hidden></div></div>`;
+}
+function setField(key, value) {
+  const el = $("f_" + key), kind = state.specs[key].kind;
+  if (PICKERS.includes(key)) { pickers[key].items = [...value]; renderPicker(key); }
+  else if (kind === "bool") el.checked = value;
+  else if (kind === "list") el.value = value.join(state.specs[key].items === "ext" ? " " : "\n");
+  else el.value = value;
+}
+function getField(key) {
+  const el = $("f_" + key), kind = state.specs[key].kind;
+  if (PICKERS.includes(key)) return [...pickers[key].items];
+  if (kind === "bool") return el.checked;
+  if (kind === "list" && state.specs[key].items === "ext")  // spaces, commas or lines; a dot or *. in front is optional
+    return [...new Set(el.value.split(/[\s,;]+/).map(w => w.toLowerCase().replace(/^\*?\.+/, "")).filter(Boolean))];
+  if (kind === "list") return el.value.split("\n").map(l => l.trim()).filter(Boolean);
+  return el.value === "" ? NaN : Number(el.value);
+}
+function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+function currentPreset() {
+  for (const [name, values] of Object.entries(state.presets))
+    if (PRESET_KEYS.every(k => getField(k) === values[k])) return name;
+  return "custom";
+}
+function showPreset() { const r = document.querySelector(`input[name=preset][value=${currentPreset()}]`); if (r) r.checked = true; }
+
+function build() {
+  $("presets").innerHTML = [...Object.keys(state.presets), "custom"].map(name => `
+    <label><input type="radio" name="preset" value="${name}"><span><b>${PRESET_INFO[name][0]}</b> <small>${esc(PRESET_INFO[name][1])}</small></span></label>`).join("");
+  for (const [container, fields] of Object.entries(GROUPS))
+    $(container).innerHTML = Object.entries(fields).map(([k, v]) => fieldHtml(k, v)).join("");
+  document.querySelectorAll("input[name=preset]").forEach(r => r.onchange = () => {
+    const values = state.presets[r.value];
+    if (values) for (const k of PRESET_KEYS) setField(k, values[k]);
+    else showPreset();  // "Custom" is only what the fields say
+  });
+  document.querySelectorAll(".field input, .field textarea").forEach(i => i.oninput = i.onchange = () => { clearErrors(); showPreset(); });
+  for (const key of PICKERS) buildPicker(key);
+}
+function fill() { for (const key of KEYS) setField(key, state.values[key]); showPreset(); }
+
+function clearErrors() {
+  document.querySelectorAll(".field").forEach(f => { f.classList.remove("invalid"); f.querySelector(".bad").hidden = true; });
+  document.querySelectorAll("#pages button.err").forEach(b => b.classList.remove("err"));
+}
+
+// ---- tabs: one group of sections at a time; the choice is kept in the address (#index) ---------
+const SETTING_TABS = ["speed", "schedule", "index"];  // the tabs whose fields the Save button stores
+function showTab(name) {
+  if (!document.querySelector(`#pages button[data-tab="${name}"]`)) name = "speed";
+  document.querySelectorAll("section[data-tab]").forEach(sec => sec.hidden = sec.dataset.tab !== name);
+  document.querySelectorAll("#pages button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
+  $("savebar").hidden = !SETTING_TABS.includes(name);
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+}
+document.querySelectorAll("#pages button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+function message(text, kind) { const m = $("msg"); m.textContent = text; m.className = kind || ""; }
+
+async function load() {
+  state = await fetch("/api/settings").then(r => r.json());
+  if (!$("presets").children.length) build();
+  fill();
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Sindex-Token": TOKEN },
+    body: JSON.stringify(body || {}),
+  });
+  return { ok: r.ok, data: await r.json().catch(() => ({ error: "unexpected answer from the server" })) };
+}
+
+async function save() {
+  clearErrors();
+  const changes = {};
+  for (const key of KEYS) {
+    const value = getField(key);
+    if (typeof value === "number" && Number.isNaN(value)) { showErrors({ [key]: "enter a number" }); return; }
+    if (!same(value, state.values[key])) changes[key] = value;
+  }
+  if (!Object.keys(changes).length) { message("Nothing changed.", ""); return; }
+  message("Saving…", "");
+  const { ok, data } = await post("/api/settings", { changes });
+  if (!ok) { showErrors(data.errors || {}, data.error); return; }
+  message("Saved. Restarting the indexer…", "ok");
+  setTimeout(confirmApplied, 2500);
+}
+
+function showErrors(errors, fallback) {
+  const keys = Object.keys(errors).filter(k => $("f_" + k));
+  for (const k of keys) {
+    const f = document.querySelector(`[data-field="${k}"]`);
+    f.classList.add("invalid");
+    const bad = f.querySelector(".bad"); bad.textContent = errors[k]; bad.hidden = false;
+    if (f.closest("details")) f.closest("details").open = true;
+    document.querySelector(`#pages button[data-tab="${f.closest("section").dataset.tab}"]`).classList.add("err");
+  }
+  if (keys.length) showTab(document.querySelector(`[data-field="${keys[0]}"]`).closest("section").dataset.tab);
+  message(keys.length ? "Not saved: fix the marked values." : "Not saved: " + (fallback || Object.values(errors).join("; ")), "err");
+}
+
+async function confirmApplied() {
+  const s = await fetch("/api/status").then(r => r.json()).catch(() => null);
+  const err = s && s.supervisor && s.supervisor.settings_error;
+  if (err) { message("Not applied: " + err, "err"); return; }
+  message("Applied.", "ok");
+  load(); refresh();
+}
+
+// ---- folder picker: a browser on the left, the chosen folders on the right ------------------------
+
+const pickers = Object.fromEntries(PICKERS.map(k => [k, { items: [], cwd: "", parent: null }]));
+const pathKey = (p) => p.replace(/\\+$/, "").toLowerCase();  // Windows paths are not case sensitive
+
+function buildPicker(key) {
+  const el = $("f_" + key);
+  el.innerHTML = `<div><div class="pk-bar"><button type="button" class="plain pk-up" title="Up one level">&uarr;</button>` +
+    `<span class="pk-path"></span></div><div class="pk-rows"></div></div>` +
+    `<div><div class="pk-title"></div><div class="pk-list"></div>` +
+    `<div class="pk-add"><input placeholder="or type a full path" spellcheck="false"><button type="button" class="plain">Add</button></div></div>`;
+  el.querySelector(".pk-up").onclick = () => { if (pickers[key].parent !== null) browse(key, pickers[key].parent); };
+  const input = el.querySelector(".pk-add input");
+  const add = () => { const v = input.value.trim(); if (v) { toggle(key, v, true); input.value = ""; } };
+  el.querySelector(".pk-add button").onclick = add;
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } };
+  browse(key, "");
+}
+
+async function browse(key, path) {
+  const el = $("f_" + key), rows = el.querySelector(".pk-rows");
+  const r = await fetch("/api/browse?" + new URLSearchParams({ path }), { headers: { "X-Sindex-Token": TOKEN } });
+  const res = await r.json().catch(() => ({ error: "unexpected answer from the server" }));
+  if (!r.ok) { rows.innerHTML = ""; const d = document.createElement("div"); d.className = "pk-empty"; d.textContent = res.error; rows.append(d); return; }
+  Object.assign(pickers[key], { cwd: res.path, parent: res.parent });
+  el.querySelector(".pk-path").textContent = res.path || "This computer";
+  el.querySelector(".pk-up").disabled = res.parent === null;
+  rows.innerHTML = "";
+  for (const f of res.folders) {
+    const row = document.createElement("div"); row.className = "pk-row";
+    const box = document.createElement("input"); box.type = "checkbox"; box.dataset.path = f.path;
+    box.checked = pickers[key].items.some(i => pathKey(i) === pathKey(f.path));
+    box.onchange = () => toggle(key, f.path, box.checked);
+    const name = document.createElement("span"); name.className = "name"; name.textContent = f.name; name.title = f.path;
+    const go = document.createElement("span"); go.className = "go"; go.innerHTML = "&rsaquo;";
+    name.onclick = go.onclick = () => browse(key, f.path);
+    row.append(box, name, go); rows.append(row);
+  }
+  if (!res.folders.length) { const d = document.createElement("div"); d.className = "pk-empty"; d.textContent = "No subfolders."; rows.append(d); }
+  if (res.truncated) { const d = document.createElement("div"); d.className = "pk-empty"; d.textContent = "Only the first folders are shown; type the path instead."; rows.append(d); }
+}
+
+function toggle(key, path, on) {
+  const items = pickers[key].items, at = items.findIndex(i => pathKey(i) === pathKey(path));
+  if (on && at < 0) items.push(path);
+  if (!on && at >= 0) items.splice(at, 1);
+  clearErrors(); renderPicker(key);
+}
+
+function renderPicker(key) {
+  const el = $("f_" + key), items = pickers[key].items, list = el.querySelector(".pk-list");
+  if (!el.querySelector(".pk-title")) return;  // not built yet
+  el.querySelector(".pk-title").textContent = `Chosen (${items.length})`;
+  list.innerHTML = "";
+  if (!items.length) { const d = document.createElement("div"); d.className = "pk-empty"; d.textContent = "Nothing chosen."; list.append(d); }
+  for (const path of items) {
+    const row = document.createElement("div"); row.className = "pk-row chosen";
+    const text = document.createElement("span"); text.className = "path"; text.textContent = path;
+    const x = document.createElement("button"); x.type = "button"; x.className = "plain"; x.title = "Remove"; x.innerHTML = "&times;";
+    x.onclick = () => toggle(key, path, false);
+    row.append(text, x); list.append(row);
+  }
+  el.querySelectorAll(".pk-rows input[type=checkbox]").forEach(b => b.checked = items.some(i => pathKey(i) === pathKey(b.dataset.path)));
+}
+
+// ---- storage, health and maintenance --------------------------------------------------------
+
+const STATUS_INFO = {
+  error: ["Could not be read", "Damaged, password-protected, or a format the reader does not handle."],
+  too_big: ["Too big", "Larger than the size limit for their type (see Size limits above); raise it and retry."],
+  binary: ["Not text", "They looked like text by their name but contain binary data."],
+  truncated: ["Cut short", "Only the first part was indexed: they are longer than the limit for characters per file."],
+  empty: ["No text", "Nothing to index was found in them."],
+};
+let health = { status: null, offset: 0 };
+
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+}
+
+async function loadHealth() {
+  const q = new URLSearchParams({ offset: health.offset });
+  if (health.status) q.set("status", health.status);
+  const res = await fetch("/api/health?" + q).then(r => r.json()).catch(() => null);
+  if (!res || res.error) return;
+  const counts = res.counts;
+  if (!health.status || !counts[health.status]) {  // first look, or the list emptied: open the first with files
+    const first = Object.keys(STATUS_INFO).find(s => counts[s]);
+    if (first !== health.status) { health = { status: first || null, offset: 0 }; if (first) return loadHealth(); }
+  }
+  $("healthTabs").innerHTML = Object.entries(STATUS_INFO).map(([s, [label]]) =>
+    `<button type="button" data-status="${s}" class="${s === health.status ? "on" : ""}" ${counts[s] ? "" : "disabled"}>${label} (${counts[s].toLocaleString()})</button>`).join("");
+  $("healthTabs").querySelectorAll("button").forEach(b => b.onclick = () => { health = { status: b.dataset.status, offset: 0 }; loadHealth(); });
+  const files = res.files;
+  $("healthWhy").textContent = health.status ? STATUS_INFO[health.status][1] : "All files were indexed completely.";
+  $("healthFiles").innerHTML = files.map((f, i) => `<tr><td><b>${esc(f.name)}</b><br><span class="hint">${esc(f.dir)}</span>` +
+    `${f.error ? `<br><span class="hint">${esc(f.error)}</span>` : ""}</td><td>${fmtSize(f.size)}</td>` +
+    `<td><button type="button" class="plain" data-i="${i}">Retry</button></td></tr>`).join("");
+  $("healthFiles").querySelectorAll("button").forEach(b => b.onclick = async () => {
+    toast((await post("/api/reindex", { path: files[+b.dataset.i].path })).ok ? "Retry queued" : "Failed");
+  });
+  const pager = $("healthPager"); pager.innerHTML = "";
+  const total = health.status ? counts[health.status] : 0;
+  const step = (label, to) => { const b = document.createElement("button"); b.className = "plain"; b.textContent = label;
+    b.onclick = () => { health.offset = to; loadHealth(); }; pager.append(b); };
+  if (health.offset > 0) step("← Previous", Math.max(0, health.offset - res.limit));
+  if (health.offset + res.limit < total) step("Next →", health.offset + res.limit);
+  const act = $("healthAct"); act.innerHTML = "";
+  if (health.status && total) {
+    act.innerHTML = `<button type="button" class="plain" id="retryAll">Retry all ${total.toLocaleString()}</button>`;
+    $("retryAll").onclick = async () => toast((await post("/api/retry", { status: health.status })).ok ? "Retry queued" : "Failed");
+  }
+}
+
+async function refresh() {
+  const s = await fetch("/api/status").then(r => r.json()).catch(() => null);
+  const idx = s && s.index;
+  if (idx) {
+    $("dbPath").textContent = idx.db_path;
+    $("dbSize").textContent = idx.db_mb.toLocaleString() + " MB";
+    const last = idx.last_maintenance, wait = idx.maintenance_pending || [];
+    $("maintInfo").textContent = (wait.length ? `Waiting for the queue to empty: ${wait.join(", ")}. ` : "") +
+      (last ? `Last: ${last.action} on ${new Date(last.at * 1000).toLocaleString()}, ${last.seconds} s, ${last.mb_before} MB → ${last.mb_after} MB.` : "");
+  }
+}
+
+async function request(path, body, done, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  toast((await post(path, body)).ok ? done : "Failed");
+  setTimeout(refresh, 1500);
+}
+$("rebuildBtn").onclick = () => request("/api/rebuild", {}, "Rebuild queued",
+  "Read every indexed file again? This takes as long as the first indexing and writes as much to the disk.");
+$("optimizeBtn").onclick = () => request("/api/maintenance", { action: "optimize" }, "Optimize queued (runs when the queue is empty)");
+$("vacuumBtn").onclick = () => request("/api/maintenance", { action: "vacuum" }, "Compacting queued (runs when the queue is empty)",
+  "Compact the database? It needs free disk space as large as the database and cannot be interrupted, so do not stop the service meanwhile.");
+$("reindexBtn").onclick = async () => {
+  const path = $("reindexPath").value.trim(); if (!path) return;
+  toast((await post("/api/reindex", { path })).ok ? "Reindex queued" : "Failed");
+  $("reindexPath").value = "";
+};
+
+$("save").onclick = save;
+showTab(location.hash.slice(1));
+load(); loadHealth(); refresh();
+</script>
+</body>
+</html>

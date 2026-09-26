@@ -4,74 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sindex search</title>
-<style>
-  :root {
-    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
-    --accent: #2f5fd0; --mark: #ffe58a; --danger: #b3261e; --ok: #1f7a3f;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #151514; --panel: #1f1f1d; --text: #e9e8e4; --muted: #9a9993; --line: #33332f;
-      --accent: #8fb0ff; --mark: #6b5a12; --danger: #ff8a80; --ok: #7ad19a;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 15px/1.5 "Segoe UI", system-ui, sans-serif; }
-  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-  #state { color: var(--muted); font-size: 13px; }
-  #statusBox { margin-bottom: 16px; }
-  #statusBox > summary { display: flex; align-items: baseline; gap: 12px; cursor: pointer; list-style: none; }
-  #statusBox > summary::-webkit-details-marker { display: none; }
-  #statusBox > summary::after { content: ""; width: 6px; height: 6px; align-self: center; margin-left: -2px;
-    border: solid var(--muted); border-width: 0 2px 2px 0; transform: rotate(-45deg); transition: transform .15s; }
-  #statusBox[open] > summary::after { transform: rotate(45deg); }
-  .panel { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
-  form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  input, button { font: inherit; color: inherit; }
-  input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
-  input[type=checkbox] { padding: 0; margin: 0; accent-color: var(--accent); }
-  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  #q { flex: 1 1 320px; font-size: 16px; }
-  .check { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 14px; cursor: pointer; }
-  .filters { margin-top: 10px; }
-  .filters label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
-  .filters input { font-size: 14px; }
-  #path { width: 280px; } #ext { width: 140px; }
-  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px; padding: 7px 16px; cursor: pointer; }
-  button.plain { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 3px 10px; font-size: 13px; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  #summary { color: var(--muted); margin: 18px 2px 8px; font-size: 14px; }
-  .err { color: var(--danger); }
-  ol { list-style: none; padding: 0; margin: 0; }
-  li.hit { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
-  .name { font-weight: 600; word-break: break-all; }
-  .dir { color: var(--muted); font-size: 13px; word-break: break-all; }
-  .meta { color: var(--muted); font-size: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
-  .snip { margin-top: 6px; font-size: 14px; overflow-wrap: anywhere; }
-  mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
-  .pager { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
-  table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
-  td { padding: 2px 14px 2px 0; vertical-align: top; }
-  td:first-child { color: var(--muted); }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
-  .dot.on { background: var(--ok); }
-  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
-           padding: 6px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
-</style>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <main>
+  <a class="gear" href="/settings" title="Settings">&#9881; Settings</a>
   <details id="statusBox">
-    <summary><h1>sindex</h1><span id="state"><span class="dot"></span>…</span></summary>
+    <summary><h1>sindex</h1><span class="ver">v{{VERSION}}</span><span id="state"><span class="dot"></span>…</span></summary>
     <div class="panel">
       <table id="statusTable"></table>
       <div class="row" style="margin-top:10px">
         <button type="button" class="plain" id="pauseBtn">Pause</button>
         <input id="reindexPath" placeholder="File or folder to reindex" style="flex:1 1 260px">
         <button type="button" class="plain" id="reindexBtn">Reindex</button>
+        <a class="plain" href="/log">Log</a>
       </div>
     </div>
   </details>

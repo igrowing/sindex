@@ -27,10 +27,31 @@ def test_markup_extensions_are_all_indexed(cfg):
     assert MARKUP_EXTS <= cfg.text_exts, "an extension that gets tag stripping but is never indexed is dead"
 
 
-def test_extra_extensions_from_config(cfg):
+def test_the_text_extensions_are_the_ones_in_the_config(cfg):
     assert kind_of("weird", cfg) is None
-    cfg.extra_text_extensions = [".weird", "Other"]
+    cfg.text_extensions = [*cfg.text_extensions, ".weird", "Other"]
     assert kind_of("weird", cfg) == "text" and kind_of("other", cfg) == "text"
+    cfg.text_extensions = ["weird"]  # everything else is taken out again
+    assert kind_of("txt", cfg) is None and kind_of("weird", cfg) == "text"
+    assert kind_of("pdf", cfg) == "pdf"  # the readers of other formats do not depend on the list
+
+
+def test_a_new_config_lists_every_built_in_text_extension(tmp_path):
+    from sindex import config
+
+    cfg = config.load(tmp_path)
+
+    assert cfg.text_exts == config.TEXT_EXTS and cfg.text_extensions == sorted(config.TEXT_EXTS)
+
+
+def test_the_old_extra_text_extensions_key_is_carried_over(tmp_path):
+    from sindex import config
+
+    (tmp_path / "config.toml").write_text('[index]\nextra_text_extensions = [".Weird", "other"]\n', encoding="utf-8")
+
+    cfg = config.load(tmp_path)
+
+    assert cfg.text_exts == config.TEXT_EXTS | {"weird", "other"}
 
 
 @pytest.mark.parametrize("ext", ["svg", "xaml", "fb2", "csproj", "rss"])

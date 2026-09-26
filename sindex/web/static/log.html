@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sindex log</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  header a { color: var(--accent); font-size: 13px; text-decoration: none; }
+  .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .bar label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+  .bar input[type=checkbox] { margin: 0; accent-color: var(--accent); }
+  select { font: inherit; font-size: 14px; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+  #filter { flex: 1 1 200px; font-size: 14px; }
+  #meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; min-height: 1.4em; }
+  #log { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin: 0; padding: 10px 12px;
+         height: calc(100vh - 230px); min-height: 300px; overflow: auto; font: 12px/1.5 Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+  #log .WARNING { color: #b7791f; }
+  #log .ERROR, #log .CRITICAL { color: var(--danger); }
+  @media (prefers-color-scheme: dark) { #log .WARNING { color: #f0c05a; } }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>sindex</h1><span class="ver">v{{VERSION}}</span><span>Log</span><a href="/">&larr; Back to search</a></header>
+  <div class="bar">
+    <select id="name" title="Which log">
+      <option value="indexer">Indexer</option>
+      <option value="service">Service and web UI</option>
+      <option value="indexer-stderr">Indexer errors (stderr)</option>
+    </select>
+    <select id="kb" title="How much of the end of the log to show">
+      <option value="64">last 64 KB</option>
+      <option value="256" selected>last 256 KB</option>
+      <option value="1024">last 1 MB</option>
+    </select>
+    <input id="filter" type="search" placeholder="Show only lines containing…" spellcheck="false">
+    <label><input id="follow" type="checkbox" checked> Follow</label>
+  </div>
+  <div id="meta"></div>
+  <pre id="log"></pre>
+</main>
+
+<script>
+const TOKEN = {{TOKEN}};
+const $ = (id) => document.getElementById(id);
+let lines = [];
+
+function render() {
+  const needle = $("filter").value.toLowerCase();
+  const box = $("log");
+  const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const frag = document.createDocumentFragment();
+  for (const line of lines) {
+    if (needle && !line.toLowerCase().includes(needle)) continue;
+    const span = document.createElement("span");
+    const level = /^\S+ \S+ \S+ (WARNING|ERROR|CRITICAL) /.exec(line);  // "date time name[pid] LEVEL logger: message"
+    if (level) span.className = level[1];
+    span.textContent = line + "\n";
+    frag.append(span);
+  }
+  box.replaceChildren(frag);
+  if (atEnd || render.first) box.scrollTop = box.scrollHeight;
+  render.first = false;
+}
+render.first = true;
+
+async function load() {
+  const q = new URLSearchParams({ name: $("name").value, kb: $("kb").value });
+  const r = await fetch("/api/log?" + q, { headers: { "X-Sindex-Token": TOKEN } }).catch(() => null);
+  const res = r && await r.json().catch(() => null);
+  if (!res || !r.ok) { $("meta").textContent = "Cannot read the log: " + ((res && res.error) || "no answer from the server"); return; }
+  const key = res.name + "|" + res.size;
+  if (key === load.last) return;  // nothing new since the last look
+  load.last = key;
+  lines = res.text ? res.text.replace(/\r?\n$/, "").split(/\r?\n/) : [];  // Windows logs end lines with CRLF
+  const size = res.size < 1024 ? res.size + " B" : Math.round(res.size / 1024).toLocaleString() + " KB";
+  $("meta").textContent = res.size ? `${res.name}.log, ${size}` + (res.truncated ? ", showing the end" : "") : `${res.name}.log does not exist yet.`;
+  render();
+}
+
+$("name").onchange = () => { render.first = true; load(); };
+$("kb").onchange = () => { load.last = null; load(); };
+$("filter").oninput = render;
+setInterval(() => { if ($("follow").checked && !document.hidden) load(); }, 3000);
+load();
+</script>
+</body>
+</html>

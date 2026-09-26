@@ -50,7 +50,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
                         if attrs & A_DIRECTORY:
                             if not filt.skip_dir_entry(e.path, e.name, attrs):
                                 stack.append(e.path)
-                        elif not filt.skip_file_entry(attrs) and kind_of(file_ext(e.name), cfg):
+                        elif kind_of(file_ext(e.name), cfg) and not filt.skip_file_entry(e.path, e.name, attrs):
                             seen[e.name.lower()] = (e.name, st.st_size, st.st_mtime_ns)
             except (FileNotFoundError, NotADirectoryError):
                 pass  # gone: every file we know here gets queued (and then removed)

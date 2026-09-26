@@ -1,4 +1,8 @@
+import json
+import socket
 import threading
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -7,6 +11,7 @@ import pytest
 from sindex import config
 from sindex.extract import Context
 from sindex.throttle import Throttle
+from sindex.web.server import WebServer
 
 
 @pytest.fixture
@@ -18,6 +23,33 @@ def cfg(tmp_path: Path) -> config.Config:
     c.pause_when_cpu_busy_percent = 0
     c.extract_workers = 0  # parse in the test process; the tests of the worker pool ask for processes
     return c
+
+
+@pytest.fixture
+def web(cfg):
+    """The web UI on a free port, with the token "secret"."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        cfg.web_port = s.getsockname()[1]
+    cfg.token = "secret"
+    server = WebServer(cfg)
+    server.start()
+    yield cfg
+    server.stop()
+
+
+def call(cfg, path: str, body: dict | list | None = None, token: str | None = None):
+    """(status, body bytes) of a GET, or of a POST when `body` is given."""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Sindex-Token"] = token
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(f"http://127.0.0.1:{cfg.web_port}{path}", data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
 
 
 @pytest.fixture

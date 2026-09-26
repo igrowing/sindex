@@ -44,6 +44,7 @@ from .usn import (
 log = logging.getLogger(__name__)
 
 EXIT_OK = 0
+EXIT_CONFIG = 2  # the configuration cannot be used; restarting does not help until it is fixed
 EXIT_RECYCLE = 3
 DIR_REASONS = REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_DELETE
 QUEUE_BATCH = 50  # queue rows looked at per round
@@ -90,6 +91,7 @@ class Indexer:
         self.requests_dir = cfg.data_dir / "requests"
         self.status_path = cfg.data_dir / "status.json"
         self.volumes: list[Volume] = []
+        self._pending_rules: dict | None = None  # indexing rules to remember once the rescan they caused is done
         self.files_done = 0
         self.dirty = False
         self.runner = make_runner(cfg, self.throttle, self.paused_flag)
@@ -185,13 +187,9 @@ class Indexer:
     def _take_requests(self) -> None:
         if not self.requests_dir.is_dir():
             return
-        for entry in os.scandir(self.requests_dir):
+        for entry in sorted(os.scandir(self.requests_dir), key=lambda e: e.name):
             try:
-                req = json.loads(Path(entry.path).read_text(encoding="utf-8"))
-                path = os.path.normpath(req["path"])
-                stage = db.STAGE_DIR if os.path.isdir(path) else db.STAGE_TEXT
-                db.enqueue(self.conn, path, stage, reason="force", priority=db.PRIORITY_FORCED)
-                log.info("reindex requested: %s", path)
+                self._handle_request(json.loads(Path(entry.path).read_text(encoding="utf-8")))
             except (OSError, ValueError, KeyError, TypeError) as e:
                 log.warning("bad request %s: %s", entry.name, e)
             try:
@@ -200,11 +198,79 @@ class Indexer:
                 # the request was already handled; a leftover file only means it is redone once
                 log.debug("cannot remove request %s: %s", entry.name, e)
 
+    def _handle_request(self, req: dict) -> None:
+        if "status" in req:
+            self._retry_status(req["status"])
+        elif req.get("rebuild"):
+            self._begin()
+            for root in self.filter.roots:
+                db.enqueue(self.conn, root, db.STAGE_DIR, reason="force", priority=db.PRIORITY_FORCED)
+            log.info("rebuild requested: every file under %s is read again", ", ".join(self.filter.roots))
+        elif "maintenance" in req:
+            action = req["maintenance"]
+            if action not in control.MAINTENANCE_ACTIONS:
+                raise ValueError(f"unknown maintenance action {action!r}")
+            pending = db.get_meta(self.conn, "maintenance_pending", [])
+            if action not in pending:
+                db.set_meta(self.conn, "maintenance_pending", [*pending, action])
+            log.info("maintenance requested: %s (runs when the queue is empty)", action)
+        else:
+            path = os.path.normpath(req["path"])
+            stage = db.STAGE_DIR if os.path.isdir(path) else db.STAGE_TEXT
+            db.enqueue(self.conn, path, stage, reason="force", priority=db.PRIORITY_FORCED)
+            log.info("reindex requested: %s", path)
+
+    def _retry_status(self, status: str) -> None:
+        """Queue every file that ended with `status` for another attempt (a limit or a rule may have changed)."""
+        if status not in control.RETRY_STATUSES:
+            raise ValueError(f"cannot retry files with status {status!r}")
+        self._begin()
+        cursor = self.conn.execute("SELECT dir, name FROM files WHERE status = ?", (status,))
+        count = 0
+        while rows := cursor.fetchmany(500):
+            for d, name in rows:
+                db.enqueue(self.conn, os.path.join(d, name), db.STAGE_TEXT, reason="force")
+            count += len(rows)
+        log.info("retry requested: %d files with status %s", count, status)
+
+    def _run_maintenance(self) -> bool:
+        """Do one pending maintenance job; only called when the queue is empty and nothing is uncommitted.
+
+        These rewrite much of the database (SSD writes) and cannot be interrupted, so they are only run on
+        request. The request is dropped before the work starts: a job that kills the process must not be
+        retried forever.
+        """
+        pending = db.get_meta(self.conn, "maintenance_pending", [])
+        if not pending:
+            return False
+        action = pending[0]
+        db.set_meta(self.conn, "maintenance_pending", pending[1:])
+        self._status("maintenance", action, force=True)
+        mb_before, started = control.db_size_bytes(self.cfg) / 1048576, time.monotonic()
+        log.info("maintenance: %s (database is %.0f MB)", action, mb_before)
+        if action == "optimize":
+            self.conn.execute("INSERT INTO chunks(chunks) VALUES ('optimize')")  # one segment: smaller and faster
+        else:
+            self.conn.execute("VACUUM")
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        mb_after, seconds = control.db_size_bytes(self.cfg) / 1048576, round(time.monotonic() - started, 1)
+        db.set_meta(self.conn, "last_maintenance", {"action": action, "at": time.time(), "seconds": seconds,
+                                                    "mb_before": round(mb_before, 1), "mb_after": round(mb_after, 1)})
+        log.info("maintenance %s done in %.1f s: %.0f MB -> %.0f MB", action, seconds, mb_before, mb_after)
+        return True
+
     # ---- main loop -----------------------------------------------------
 
     def run(self) -> int:
         if self.limits:
             apply_process_limits(self.cfg)
+        try:
+            db.check_location(self.cfg.db_path)
+        except db.DbLocationError as e:
+            log.error("%s", e)
+            self._status("error", str(e), force=True)
+            self.runner.close()
+            return EXIT_CONFIG
         self.conn = db.connect(self.cfg.db_path, wal_pages=self.cfg.wal_autocheckpoint_pages,
                                cache_mb=self.cfg.sqlite_cache_mb)
         db.init(self.conn)
@@ -250,6 +316,8 @@ class Indexer:
                 return EXIT_RECYCLE
             if not did:
                 self._commit()
+                if self._run_maintenance():
+                    continue
                 if self.until_idle:
                     return EXIT_OK
                 self._idle()
@@ -289,6 +357,18 @@ class Indexer:
         if removed:
             log.info("removed %d files outside the configured roots", removed)
 
+    def _rules(self) -> dict:
+        """What decides which files are in the index, apart from the roots (those are compared on their own)."""
+        c = self.cfg
+        return {
+            "exclude_paths": sorted(p.lower() for p in c.builtin_exclude_paths() + c.exclude_paths),
+            "exclude_dir_names": sorted(n.lower() for n in c.exclude_dir_names),
+            "exclude_extensions": sorted(c.excluded_exts),
+            "exclude_globs": sorted(g.lower() for g in c.exclude_globs),
+            "index_hidden": c.index_hidden,
+            "text_extensions": sorted(c.text_exts),
+        }
+
     def _load_volumes(self) -> None:
         groups: dict[str, list[str]] = {}
         for root in self.filter.roots:
@@ -318,6 +398,13 @@ class Indexer:
             if sorted(r.lower() for r in roots) != sorted(r.lower() for r in v.scanned_roots):
                 v.needs_scan = True
             self.volumes.append(v)
+        rules = self._rules()
+        if db.get_meta(self.conn, "rules") != rules:
+            # files that are excluded now must leave the index, and files that are allowed now must enter it
+            log.info("indexing rules changed; rescanning")
+            self._pending_rules = rules
+            for v in self.volumes:
+                v.needs_scan = True
 
     def _save_volume(self, v: Volume) -> None:
         self.conn.execute(
@@ -352,6 +439,9 @@ class Indexer:
             v.needs_scan = False
             self._save_volume(v)
             did = True
+        if self._pending_rules is not None and not any(v.needs_scan for v in self.volumes):
+            db.set_meta(self.conn, "rules", self._pending_rules)  # the scans have queued everything that follows
+            self._pending_rules = None
         return did
 
     def _wanted(self, name: str, reason: int, *, is_dir: bool) -> bool:

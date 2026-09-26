@@ -29,6 +29,8 @@ def file_ext(path: str) -> str:
 
 
 def kind_of(ext: str, cfg: Config) -> str | None:
+    if cfg.exclude_extensions and ext in cfg.excluded_exts:
+        return None
     if ext in PDF_EXTS:
         return "pdf"
     if ext in RTF_EXTS:

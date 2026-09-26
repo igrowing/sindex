@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import struct
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
@@ -90,6 +91,12 @@ def fixed_drives() -> list[str]:
     n = kernel32.GetLogicalDriveStringsW(len(buf), buf)
     drives = [d for d in buf[:n].split("\0") if d]
     return [d for d in drives if kernel32.GetDriveTypeW(d) == DRIVE_FIXED]
+
+
+def is_local_folder(path: str) -> bool:
+    """Whether `path` is on a fixed local drive (not a network share, removable or optical drive)."""
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    return bool(drive) and kernel32.GetDriveTypeW(drive + "\\") == DRIVE_FIXED
 
 
 def fs_type(letter: str) -> str:

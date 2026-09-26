@@ -3,11 +3,12 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from sindex.throttle import Throttle
+from sindex.throttle import Throttle, in_schedule
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -119,3 +120,44 @@ def test_waiting_for_others_is_not_work(cfg, slept):
     throttle.resume_clock()
     throttle.checkpoint()
     assert naps == []
+
+
+@pytest.mark.parametrize("windows,at,expected", [
+    ([], "12:00", True),  # no schedule: always
+    (["09:00-17:00"], "09:00", True),
+    (["09:00-17:00"], "16:59", True),
+    (["09:00-17:00"], "17:00", False),  # the end is exclusive
+    (["09:00-17:00"], "03:00", False),
+    (["22:00-06:00"], "23:30", True),  # a window may pass midnight
+    (["22:00-06:00"], "00:00", True),
+    (["22:00-06:00"], "05:59", True),
+    (["22:00-06:00"], "06:00", False),
+    (["22:00-06:00"], "12:00", False),
+    (["06:00-08:00", "22:00-23:00"], "22:30", True),
+    (["06:00-08:00", "22:00-23:00"], "12:00", False),
+])
+def test_in_schedule(windows, at, expected):
+    hour, minute = map(int, at.split(":"))
+
+    assert in_schedule(windows, datetime(2026, 1, 5, hour, minute)) is expected
+
+
+def _window(minutes_from_now_start: int, minutes_from_now_end: int) -> str:
+    now = datetime.now()
+    m = now.hour * 60 + now.minute
+
+    def clock(offset: int) -> str:
+        return f"{(m + offset) % 1440 // 60:02d}:{(m + offset) % 60:02d}"
+
+    return f"{clock(minutes_from_now_start)}-{clock(minutes_from_now_end)}"
+
+
+def test_the_indexer_pauses_outside_its_schedule(cfg):
+    throttle = Throttle(cfg, threading.Event())
+    assert throttle.pause_reason() is None
+
+    cfg.schedule_windows = [_window(60, 120)]  # opens in an hour
+    assert throttle.pause_reason() == "outside the schedule"
+
+    cfg.schedule_windows = [_window(-60, 60)]  # open now
+    assert throttle.pause_reason() is None
