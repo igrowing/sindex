@@ -250,9 +250,12 @@ def _ext_pattern_item(text: str) -> str:
 
 def _glob_item(text: str) -> str:
     pattern = text.replace("/", "\\")
-    # a dot between wildcards (e.g. "*.*") is not real content either: it still matches almost every
-    # file, just like a plain "*" or "?*" would, so treat * ? . \ alone as "no literal name given"
-    if re.search(r"[*?]", pattern) and not re.search(r"[^*?.\\]", pattern):
+    # what is left after the wildcards and path separators is the actual name being matched. Empty (e.g.
+    # "*", "?*", "*\*"), or a bare "." not anchored at the very start (e.g. "*.*", the old DOS "every
+    # file" wildcard), means the pattern matches almost any name; ".*" itself is kept, it is the
+    # documented way to exclude dotfiles (it only matches names that literally start with a dot).
+    literal = re.sub(r"[*?\\]", "", pattern)
+    if not literal or (literal == "." and not pattern.startswith(".")):
         raise ValueError(f"{text!r} would exclude almost every file; name a folder or a narrower pattern instead")
     return pattern
 
