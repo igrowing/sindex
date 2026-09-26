@@ -106,7 +106,7 @@ class _Handler(BaseHTTPRequestHandler):
             exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
             result = search(conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
                             after=q.get("after") or None, before=q.get("before") or None,
-                            offset=max(0, int(q.get("offset", 0) or 0)), limit=20)
+                            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1")
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         finally:

@@ -169,3 +169,61 @@ def test_build_match_escapes_fts_syntax():
     assert build_match("***") is None
     assert build_match("-only") is None
     assert build_match("OR OR") is None
+
+
+def test_build_match_syntax():
+    assert build_match("a b") == '"a" "b"'
+    assert build_match("a b OR c* -d") == '("a" "b" OR "c"*) NOT ("d")'
+    assert build_match('"x y" OR') == '"x y"'
+    assert build_match("OR a OR OR b") == '"a" OR "b"'
+
+
+@pytest.fixture
+def named(cfg, tmp_path):
+    root = tmp_path / "docs"
+    (root / "Invoices2024").mkdir(parents=True)
+    (root / "Invoices2024" / "scan.txt").write_bytes(b"\x00\x01binary")  # no text at all
+    (root / "Invoices2024" / "notes.txt").write_text("the word zebra", encoding="utf-8")
+    (root / "café menu.txt").write_text("nothing special", encoding="utf-8")
+    (root / "Мой отчёт.txt").write_text("nothing special", encoding="utf-8")
+    (root / "zebra-plan.txt").write_text("plan", encoding="utf-8")
+    run_index(cfg, root)
+    return cfg
+
+
+def test_names_are_not_searched_by_default(named):
+    assert names(named, "invoices2024") == set()
+    assert names(named, "menu") == set()
+
+
+def test_names_finds_folder_and_file_names(named):
+    assert names(named, "invoices2024", names=True) == {"scan.txt", "notes.txt"}
+    assert names(named, "menu", names=True) == {"café menu.txt"}
+
+
+def test_names_ignore_case_and_accents(named):
+    assert names(named, "CAFE", names=True) == {"café menu.txt"}
+    assert names(named, "отчёт", names=True) == {"Мой отчёт.txt"}
+    assert names(named, "ОТЧЕТ", names=True) == {"Мой отчёт.txt"}
+
+
+def test_names_use_the_query_syntax(named):
+    # all words must be in the path (a word may sit in the folder and another in the file)
+    assert names(named, "invoices2024 scan", names=True) == {"scan.txt"}
+    assert names(named, '"café menu"', names=True) == {"café menu.txt"}
+    assert names(named, "menu OR scan", names=True) == {"café menu.txt", "scan.txt"}
+    assert names(named, "invoices2024 -scan", names=True) == {"notes.txt"}
+    assert names(named, "menu*", names=True) == {"café menu.txt"}
+
+
+def test_names_come_after_content_matches_and_respect_filters(named):
+    conn = db.connect(named.db_path, readonly=True)
+    res = search(conn, "zebra", names=True)
+    assert [(r["name"], r["hits"]) for r in res["results"]] == [("notes.txt", 1), ("zebra-plan.txt", 0)]
+    assert res["results"][0]["snippet"] and not res["results"][1]["snippet"]
+    assert res["total"] == 2
+    root = min(r[0] for r in conn.execute("SELECT dir FROM files"))  # the parent of the other folders
+    only_txt = search(conn, "zebra", exts=["txt"], path=root, names=True)
+    assert {r["name"] for r in only_txt["results"]} == {"notes.txt", "zebra-plan.txt"}
+    assert {r["name"] for r in search(conn, "zebra", exts=["pdf"], names=True)["results"]} == set()
+

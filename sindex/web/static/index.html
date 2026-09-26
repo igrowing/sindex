@@ -19,15 +19,23 @@
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.5 "Segoe UI", system-ui, sans-serif; }
   main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
-  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
   #state { color: var(--muted); font-size: 13px; }
+  #statusBox { margin-bottom: 16px; }
+  #statusBox > summary { display: flex; align-items: baseline; gap: 12px; cursor: pointer; list-style: none; }
+  #statusBox > summary::-webkit-details-marker { display: none; }
+  #statusBox > summary::after { content: ""; width: 6px; height: 6px; align-self: center; margin-left: -2px;
+    border: solid var(--muted); border-width: 0 2px 2px 0; transform: rotate(-45deg); transition: transform .15s; }
+  #statusBox[open] > summary::after { transform: rotate(45deg); }
+  .panel { margin-top: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
   form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   input, button { font: inherit; color: inherit; }
   input { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
+  input[type=checkbox] { padding: 0; margin: 0; accent-color: var(--accent); }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   #q { flex: 1 1 320px; font-size: 16px; }
+  .check { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 14px; cursor: pointer; }
   .filters { margin-top: 10px; }
   .filters label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
   .filters input { font-size: 14px; }
@@ -45,8 +53,6 @@
   .snip { margin-top: 6px; font-size: 14px; overflow-wrap: anywhere; }
   mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
   .pager { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
-  details { margin-top: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
-  summary { cursor: pointer; font-weight: 600; }
   table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
   td { padding: 2px 14px 2px 0; vertical-align: top; }
   td:first-child { color: var(--muted); }
@@ -58,13 +64,24 @@
 </head>
 <body>
 <main>
-  <header><h1>sindex</h1><span id="state"><span class="dot"></span>…</span></header>
+  <details id="statusBox">
+    <summary><h1>sindex</h1><span id="state"><span class="dot"></span>…</span></summary>
+    <div class="panel">
+      <table id="statusTable"></table>
+      <div class="row" style="margin-top:10px">
+        <button type="button" class="plain" id="pauseBtn">Pause</button>
+        <input id="reindexPath" placeholder="File or folder to reindex" style="flex:1 1 260px">
+        <button type="button" class="plain" id="reindexBtn">Reindex</button>
+      </div>
+    </div>
+  </details>
 
   <form id="form" autocomplete="off">
     <div class="row">
       <input id="q" type="search" placeholder="Search file contents…" autofocus>
       <button type="submit">Search</button>
     </div>
+    <label class="check"><input id="names" type="checkbox"> Also in folder- and file-names</label>
     <div class="row filters">
       <label>In folder <input id="path" placeholder="D:\Documents"></label>
       <label>Extensions <input id="ext" placeholder="pdf docx"></label>
@@ -78,15 +95,6 @@
   <ol id="results"></ol>
   <div class="pager" id="pager"></div>
 
-  <details id="statusBox">
-    <summary>Indexer status</summary>
-    <table id="statusTable"></table>
-    <div class="row" style="margin-top:10px">
-      <button type="button" class="plain" id="pauseBtn">Pause</button>
-      <input id="reindexPath" placeholder="File or folder to reindex" style="flex:1 1 260px">
-      <button type="button" class="plain" id="reindexBtn">Reindex</button>
-    </div>
-  </details>
 </main>
 <div id="toast"></div>
 
@@ -115,6 +123,7 @@ async function copy(text) {
 function params() {
   const p = new URLSearchParams({ q: $("q").value, offset });
   for (const k of ["path", "ext", "after", "before"]) if ($(k).value) p.set(k, $(k).value);
+  if ($("names").checked) p.set("names", "1");
   return p;
 }
 
@@ -137,6 +146,7 @@ async function runSearch() {
       <div class="meta">
         <span>${fmtSize(r.size)}</span><span>${fmtDate(r.mtime)}</span>
         ${r.status !== "ok" ? `<span>${esc(r.status)}</span>` : ""}
+        ${r.hits === 0 ? `<span>folder or file name match</span>` : ""}
         <button class="plain" data-copy="${i}" data-what="path">Copy path</button>
         <button class="plain" data-copy="${i}" data-what="dir">Copy folder</button>
       </div>
@@ -184,6 +194,7 @@ async function refreshStatus() {
 }
 
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
+$("names").onchange = () => { offset = 0; runSearch(); };
 $("pauseBtn").onclick = async () => {
   await post($("pauseBtn").dataset.paused ? "resume" : "pause"); refreshStatus();
 };
@@ -195,6 +206,7 @@ $("reindexBtn").onclick = async () => {
 
 const init = new URLSearchParams(location.search);
 for (const k of ["q", "path", "ext", "after", "before"]) if (init.get(k)) $(k).value = init.get(k);
+$("names").checked = init.get("names") === "1";
 offset = +(init.get("offset") || 0);
 if (init.get("q")) runSearch();
 refreshStatus(); setInterval(refreshStatus, 5000);

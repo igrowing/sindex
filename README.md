@@ -27,6 +27,8 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 # index a folder once, in recycled indexer processes like the service uses, then exit
 .venv\Scripts\sindex --data-dir .\data index --root D:\Download
 .venv\Scripts\sindex --data-dir .\data search "sample" --ext csv
+# --names also matches folder and file names (a scan of the file list, so slower)
+.venv\Scripts\sindex --data-dir .\data search "invoice" --names
 
 # or run everything (indexer + web UI at http://127.0.0.1:8765/) until Ctrl+C
 .venv\Scripts\sindex --data-dir .\data run --root D:\Download
@@ -41,6 +43,10 @@ Reading the USN journal needs administrator rights. Without them, sindex falls b
 .venv\Scripts\sindex start
 start http://127.0.0.1:8765/
 ```
+
+`sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
+(`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over
+plain HTTP, not HTTPS.
 
 The service keeps its data in `%ProgramData%\sindex`:
 

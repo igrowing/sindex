@@ -25,3 +25,28 @@ def test_index_command_recycles_in_fresh_processes(tmp_path):
     log = (data / "logs" / "indexer.log").read_text(encoding="utf-8")
     pids = set(re.findall(r"indexer\[(\d+)\]", log))
     assert len(pids) >= 3, f"10 files with a recycle every 3 should take at least 3 processes, saw {pids}"
+
+
+def test_shortcuts_are_created_in_every_folder_and_removed_again(tmp_path):
+    desktop, menu = tmp_path / "Desktop", tmp_path / "Start Menu" / "Programs"  # the second does not exist yet
+
+    made = cli.create_shortcuts("http://127.0.0.1:8765/", [desktop, menu])
+
+    assert made == [desktop / cli.SHORTCUT_NAME, menu / cli.SHORTCUT_NAME]
+    for shortcut in made:
+        text = shortcut.read_text(encoding="utf-8")
+        assert text.splitlines() == ["[InternetShortcut]", "URL=http://127.0.0.1:8765/"]
+
+    cli.remove_shortcuts([desktop, menu])
+    cli.remove_shortcuts([desktop, menu])  # already gone: not an error
+    assert not any(s.exists() for s in made)
+
+
+def test_shortcut_folders_are_the_all_users_desktop_and_start_menu(monkeypatch, tmp_path):
+    monkeypatch.setenv("PUBLIC", str(tmp_path / "Public"))
+    monkeypatch.setenv("ProgramData", str(tmp_path / "PD"))
+
+    desktop, menu = cli._shortcut_dirs()
+
+    assert desktop == tmp_path / "Public" / "Desktop"
+    assert menu == tmp_path / "PD" / "Microsoft" / "Windows" / "Start Menu" / "Programs"

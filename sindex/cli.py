@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from . import config, control, db
 from .search import search
 
 SERVICE_DIR_NAME = "sindex-service"
+SHORTCUT_NAME = "sindex search.url"
 
 
 def _cfg(args) -> config.Config:
@@ -70,7 +72,8 @@ def cmd_index(args) -> int:
 def cmd_search(args) -> int:
     cfg = _cfg(args)
     conn = db.connect(cfg.db_path, readonly=True)
-    res = search(conn, " ".join(args.query), path=args.path, exts=args.ext, limit=args.limit)
+    res = search(conn, " ".join(args.query), path=args.path, exts=args.ext, limit=args.limit,
+                 names=args.names)
     if res["error"]:
         print(res["error"], file=sys.stderr)
         return 1
@@ -142,6 +145,27 @@ def _prepare_service_host() -> Path:
     return target / "pythonservice.exe"
 
 
+def _shortcut_dirs() -> list[Path]:
+    """All-users Desktop and Start menu: the service is installed for the whole machine, so are its shortcuts."""
+    return [Path(os.environ["PUBLIC"]) / "Desktop",
+            Path(os.environ["ProgramData"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs"]
+
+
+def create_shortcuts(url: str, dirs: list[Path]) -> list[Path]:
+    made = []
+    for folder in dirs:
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / SHORTCUT_NAME
+        target.write_text(f"[InternetShortcut]\nURL={url}\n", encoding="utf-8")
+        made.append(target)
+    return made
+
+
+def remove_shortcuts(dirs: list[Path]) -> None:
+    for folder in dirs:
+        (folder / SHORTCUT_NAME).unlink(missing_ok=True)
+
+
 def cmd_install(args) -> int:
     if not _is_admin():
         print("run this from an elevated (administrator) prompt", file=sys.stderr)
@@ -153,7 +177,7 @@ def cmd_install(args) -> int:
 
     from .service import PROJECT_ROOT, SERVICE_NAME, SindexService
 
-    config.load()  # creates %ProgramData%\sindex\config.toml with a fresh token
+    cfg = config.load()  # creates %ProgramData%\sindex\config.toml with a fresh token
     exe = _prepare_service_host()
     win32serviceutil.InstallService(
         "sindex.service.SindexService", SERVICE_NAME, SindexService._svc_display_name_,
@@ -164,6 +188,8 @@ def cmd_install(args) -> int:
     with key:
         winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [f"PYTHONPATH={PROJECT_ROOT}"])
     print(f"installed service '{SERVICE_NAME}' (host: {exe}); start it with: sindex start")
+    for shortcut in create_shortcuts(f"http://{cfg.web_host}:{cfg.web_port}/", _shortcut_dirs()):
+        print(f"created shortcut {shortcut}")
     return 0
 
 
@@ -177,6 +203,7 @@ def cmd_remove(args) -> int:
     except pywintypes.error as e:
         print(f"note: could not stop the service first ({e.strerror}); removing it anyway")
     win32serviceutil.RemoveService(SERVICE_NAME)
+    remove_shortcuts(_shortcut_dirs())
     print("removed")
     return 0
 
@@ -216,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--path")
     p.add_argument("--ext", action="append")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--names", action="store_true", help="also match folder and file names")
     p.set_defaults(func=cmd_search)
     sub.add_parser("status", help="show indexer status").set_defaults(func=cmd_status)
     sub.add_parser("pause", help="pause indexing").set_defaults(func=cmd_pause)
