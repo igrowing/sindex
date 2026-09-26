@@ -48,9 +48,10 @@ PDF_EXTS = frozenset({"pdf"})
 # Folder names that hold caches, trash and tool state: the start of exclude_globs in a new config
 DEFAULT_EXCLUDE_DIR_NAMES = [
     "$recycle.bin", "system volume information", "recovery", "config.msi",
-    "node_modules", ".git", ".svn", ".hg", "__pycache__", ".venv", "venv", ".tox",
-    ".mypy_cache", ".pytest_cache", ".gradle", ".idea", ".vs", ".cache",
+    "node_modules", "__pycache__", "venv", ".*",
 ]
+# Executables and keys/certificates: never useful to search, and the latter should not be read at all
+DEFAULT_EXCLUDE_EXTENSIONS = ["exe", "com", "bin", "dll", "msi*", "cer", "pem", "crt"]
 
 
 @dataclass
@@ -58,7 +59,8 @@ class Config:
     # [index]
     roots: list[str] = field(default_factory=list)  # empty = all fixed drives
     exclude_paths: list[str] = field(default_factory=list)  # in addition to built-ins
-    exclude_extensions: list[str] = field(default_factory=list)  # never indexed, whatever the folder; may hold * and ?
+    # never indexed, whatever the folder; may hold * and ?
+    exclude_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_EXTENSIONS))
     # names and patterns of files and folders that are never indexed (see filters.py for what they match)
     exclude_globs: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_DIR_NAMES))
     index_hidden: bool = False

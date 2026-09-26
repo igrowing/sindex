@@ -132,9 +132,10 @@ three; a tab with a rejected value is marked and opened. It covers:
   The first list holds names and patterns, one per line (`exclude_globs`): a name (`node_modules`) or a pattern for
   names (`.*`, `tmp*`, `*.bak`) skips every file and folder with such a name, wherever it is; a pattern with a
   backslash is matched against the whole path (`*\.ssh\*`, `D:\Private\*`). `*` is any text, `?` one character, and
-  case is ignored. It starts with the usual cache and trash folders (`node_modules`, `.git`, `.venv`, ...). The
-  file types list takes extensions with or without a dot, separated by spaces, commas or lines, and may use the
-  wildcards too (`env pem msi*`). Saving a change to these rules makes the indexer rescan, so files that are
+  case is ignored. It starts with the usual cache and trash folders (`node_modules`, `__pycache__`, `venv`, ...) and
+  dotfiles (`.*`). The file types list takes extensions with or without a dot, separated by spaces, commas or lines,
+  and may use the wildcards too (`env pem msi*`); it starts with a few binary and key/certificate extensions
+  (`exe com bin dll msi* cer pem crt`). Saving a change to these rules makes the indexer rescan, so files that are
   excluded now leave the index and files that are allowed now enter it. An old `exclude_dir_names` entry in
   `config.toml` is merged into the patterns.
 - **Index storage:** where `index.db` is and how big it is. To move it, stop the service, move the `index.db*` files,

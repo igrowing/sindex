@@ -227,4 +227,5 @@ def test_excluded_extensions_may_hold_wildcards():
 
     assert [cfg.ext_excluded(e) for e in ("pem", "msi", "msix", "tmp", "top", "temp", "pe", "txt")] == [
         True, True, True, True, True, False, False, False]
-    assert not config.Config().ext_excluded("pem")
+    assert config.Config().ext_excluded("pem")  # a default install already excludes keys and certificates
+    assert not config.Config().ext_excluded("txt")

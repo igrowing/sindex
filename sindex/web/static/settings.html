@@ -9,6 +9,7 @@
   header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
   header a { color: var(--accent); font-size: 13px; text-decoration: none; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
   h2 { font-size: 16px; margin: 0 0 4px; }
   .lead { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
   .presets { display: grid; gap: 6px; margin-bottom: 14px; }
@@ -113,10 +114,11 @@
     <p class="lead">Windows, Program Files, ProgramData and the index folder itself are never indexed. Files that
       are excluded here also disappear from the index at the next scan, which starts when you save.</p>
     <div id="f-roots"></div>
-    <div id="f-skip"></div>
-    <div class="pair"><div id="f-globs"></div><div id="f-exts"></div></div>
     <div id="f-text"></div>
     <div id="f-index"></div>
+    <hr>
+    <div id="f-skip"></div>
+    <div class="pair"><div id="f-globs"></div><div id="f-exts"></div></div>
     <details>
       <summary>Size limits</summary>
       <p class="lead" style="margin-top:8px">Bigger files are listed as <i>too big</i> under Indexing health.</p>

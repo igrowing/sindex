@@ -78,6 +78,7 @@ def index(cfg, root: Path) -> set[str]:
 
 def test_everything_is_indexed_without_rules(cfg, tree):
     cfg.index_hidden = True
+    cfg.exclude_globs = []  # the default already skips dotfolders like .ssh; this tests having none at all
     assert index(cfg, tree) == {"plan.txt", "server.log", "secret-note.txt", "diary.txt", "config.txt"}
 
 
@@ -91,6 +92,7 @@ def test_excluded_files_are_not_indexed(cfg, tree):
 
 def test_a_new_rule_removes_what_was_indexed_before_and_only_rescans_when_rules_change(cfg, tree, caplog):
     cfg.index_hidden = True
+    cfg.exclude_globs = []  # start from no rules, so the change below is the only thing that removes files
     assert len(index(cfg, tree)) == 5
 
     cfg.exclude_globs = ["*\\Private\\*"]
