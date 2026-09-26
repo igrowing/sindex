@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from ctypes import wintypes
 from pathlib import Path
 
 from . import config, control, db
@@ -19,6 +20,7 @@ from .search import search
 
 SERVICE_DIR_NAME = "sindex-service"
 SHORTCUT_NAME = "sindex search.url"
+ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
 
 
 def _cfg(args) -> config.Config:
@@ -54,9 +56,10 @@ def cmd_index(args) -> int:
     the service this runs the indexer as a child and starts a fresh one for every recycle.
     """
     from .indexer import EXIT_RECYCLE
+    from .service import indexer_command
 
     cfg = _cfg(args)
-    cmd = [sys.executable, "-m", "sindex.indexer", "--data-dir", str(cfg.data_dir), "--until-idle", "--console"]
+    cmd = indexer_command("--data-dir", str(cfg.data_dir), "--until-idle", "--console")
     for root in args.root or []:
         cmd += ["--root", root]
     if args.no_limits:
@@ -166,31 +169,107 @@ def remove_shortcuts(dirs: list[Path]) -> None:
         (folder / SHORTCUT_NAME).unlink(missing_ok=True)
 
 
-def cmd_install(args) -> int:
-    if not _is_admin():
-        print("run this from an elevated (administrator) prompt", file=sys.stderr)
+def _relaunch_elevated(params: list[str]) -> int:
+    """Run this executable again with the given arguments after a UAC prompt, in a window of its own."""
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                      wintypes.LPCWSTR, ctypes.c_int]
+    shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+    result = int(shell32.ShellExecuteW(None, "runas", sys.executable, subprocess.list2cmdline(params), None, 1) or 0)
+    if result <= 32:  # ShellExecute reports failure as a value up to 32
+        print(f"could not ask for administrator rights (ShellExecute error {result}, "
+              f"WinError {ctypes.get_last_error()})", file=sys.stderr)
         return 1
-    import winreg
+    return 0
 
-    import win32service
+
+def _install_service(*, start: bool) -> int:
+    import pywintypes
     import win32serviceutil
 
-    from .service import PROJECT_ROOT, SERVICE_NAME, SindexService
+    from . import service
 
     cfg = config.load()  # creates %ProgramData%\sindex\config.toml with a fresh token
-    exe = _prepare_service_host()
-    win32serviceutil.InstallService(
-        "sindex.service.SindexService", SERVICE_NAME, SindexService._svc_display_name_,
-        startType=win32service.SERVICE_AUTO_START, exeName=str(exe),
-        description=SindexService._svc_description_, delayedstart=True)
-    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}",
-                         0, winreg.KEY_SET_VALUE)
-    with key:
-        winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [f"PYTHONPATH={PROJECT_ROOT}"])
-    print(f"installed service '{SERVICE_NAME}' (host: {exe}); start it with: sindex start")
-    for shortcut in create_shortcuts(f"http://{cfg.web_host}:{cfg.web_port}/", _shortcut_dirs()):
+    if service.frozen():
+        target = service.program_dir()
+        print(f"stopping the service if it runs, then copying the program to {target} ...")
+        service.stop_service()
+        service.copy_program(Path(sys.executable).parent, target)
+        exe = target / Path(sys.executable).name
+        existed = service.install_executable_service(exe)
+        print(f"{'updated' if existed else 'installed'} service '{service.SERVICE_NAME}' (program: {exe})")
+    else:
+        import winreg
+
+        import win32service
+
+        exe = _prepare_service_host()
+        win32serviceutil.InstallService(
+            "sindex.service.SindexService", service.SERVICE_NAME, service.SindexService._svc_display_name_,
+            startType=win32service.SERVICE_AUTO_START, exeName=str(exe),
+            description=service.SindexService._svc_description_, delayedstart=True)
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             rf"SYSTEM\CurrentControlSet\Services\{service.SERVICE_NAME}", 0, winreg.KEY_SET_VALUE)
+        with key:
+            winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [f"PYTHONPATH={service.PROJECT_ROOT}"])
+        print(f"installed service '{service.SERVICE_NAME}' (host: {exe})")
+    url = f"http://{cfg.web_host}:{cfg.web_port}/"
+    for shortcut in create_shortcuts(url, _shortcut_dirs()):
         print(f"created shortcut {shortcut}")
+    if start:
+        try:
+            win32serviceutil.StartService(service.SERVICE_NAME)
+            print(f"service started; the web UI is at {url}")
+        except pywintypes.error as e:
+            print(f"could not start the service: {e.strerror}", file=sys.stderr)
+            return 1
+    else:
+        print("start it with: sindex start")
     return 0
+
+
+def cmd_install(args) -> int:
+    from .service import frozen
+
+    if not _is_admin():
+        if frozen():  # a self-installing program asks for the rights it needs
+            return _relaunch_elevated(["install", *(["--start"] if args.start else []), "--wait"])
+        print("run this from an elevated (administrator) prompt", file=sys.stderr)
+        return 1
+    code = _install_service(start=args.start)
+    if args.wait:  # in a window of its own that would close before the messages can be read
+        try:
+            input("Press Enter to close this window ")
+        except EOFError:
+            pass  # no console to wait on
+    return code
+
+
+def cmd_service(args) -> int:
+    """What the service control manager runs: host the service in this process."""
+    import pywintypes
+    import servicemanager
+
+    from .service import SindexService
+
+    servicemanager.Initialize()
+    servicemanager.PrepareToHostSingle(SindexService)
+    try:
+        servicemanager.StartServiceCtrlDispatcher()
+    except pywintypes.error as e:
+        if e.winerror != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT:
+            raise
+        print("this command is run by Windows when the service starts; to run in a console use: sindex run",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_indexer(args) -> int:
+    """An indexer process, started by the service (the executable's stand-in for `python -m sindex.indexer`)."""
+    from .indexer import main as indexer_main
+
+    return indexer_main(args.rest)
 
 
 def cmd_remove(args) -> int:
@@ -224,6 +303,9 @@ def cmd_stop(args) -> int:
     return 0
 
 
+INTERNAL_COMMANDS = {"service": cmd_service, "indexer": cmd_indexer}
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -251,12 +333,21 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("reindex", help="re-extract files or folders")
     p.add_argument("paths", nargs="+")
     p.set_defaults(func=cmd_reindex)
-    for name, func, help_ in (("install", cmd_install, "install the Windows service (admin)"),
-                              ("remove", cmd_remove, "remove the Windows service (admin)"),
+    p = sub.add_parser("install", help="install the Windows service (admin)")
+    p.add_argument("--start", action="store_true", help="start the service after installing it")
+    p.add_argument("--wait", action="store_true", help="wait for Enter at the end (for a window that closes)")
+    p.set_defaults(func=cmd_install)
+    for name, func, help_ in (("remove", cmd_remove, "remove the Windows service (admin)"),
                               ("start", cmd_start, "start the service"),
                               ("stop", cmd_stop, "stop the service")):
         sub.add_parser(name, help=help_).set_defaults(func=func)
 
+    if argv is None:
+        argv = sys.argv[1:]
+        if not argv and getattr(sys, "frozen", False):
+            argv = ["install", "--start", "--wait"]  # the executable was opened by a double click: install it
+    if argv and argv[0] in INTERNAL_COMMANDS:  # run by Windows or by the service, not typed: not in --help
+        return INTERNAL_COMMANDS[argv[0]](argparse.Namespace(rest=argv[1:]))
     args = ap.parse_args(argv)
     return args.func(args)
 

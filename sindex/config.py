@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+import functools
 import importlib.metadata
 import json
 import logging
@@ -43,6 +45,7 @@ OFFICE_EXTS = frozenset("""
 RTF_EXTS = frozenset({"rtf"})
 PDF_EXTS = frozenset({"pdf"})
 
+# Folder names that hold caches, trash and tool state: the start of exclude_globs in a new config
 DEFAULT_EXCLUDE_DIR_NAMES = [
     "$recycle.bin", "system volume information", "recovery", "config.msi",
     "node_modules", ".git", ".svn", ".hg", "__pycache__", ".venv", "venv", ".tox",
@@ -55,9 +58,9 @@ class Config:
     # [index]
     roots: list[str] = field(default_factory=list)  # empty = all fixed drives
     exclude_paths: list[str] = field(default_factory=list)  # in addition to built-ins
-    exclude_dir_names: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_DIR_NAMES))
-    exclude_extensions: list[str] = field(default_factory=list)  # never indexed, whatever the folder
-    exclude_globs: list[str] = field(default_factory=list)  # see filters.py for what they match
+    exclude_extensions: list[str] = field(default_factory=list)  # never indexed, whatever the folder; may hold * and ?
+    # names and patterns of files and folders that are never indexed (see filters.py for what they match)
+    exclude_globs: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_DIR_NAMES))
     index_hidden: bool = False
     text_extensions: list[str] = field(default_factory=lambda: sorted(TEXT_EXTS))  # read as plain text or markup
     max_text_mb: int = 50
@@ -107,6 +110,11 @@ class Config:
     @property
     def excluded_exts(self) -> frozenset[str]:
         return frozenset(e.lower().lstrip(".") for e in self.exclude_extensions)
+
+    def ext_excluded(self, ext: str) -> bool:
+        """Whether files with this extension (lower case, no dot) are excluded; entries may hold * and ?."""
+        literals, wild = _ext_matcher(tuple(sorted(self.excluded_exts)))
+        return ext in literals or (wild is not None and wild.match(ext) is not None)
 
     def builtin_exclude_paths(self) -> list[str]:
         paths = [str(self.data_dir), str(self.db_path.parent)]
@@ -160,8 +168,7 @@ class Spec:
 
 SPECS: dict[str, Spec] = {
     "roots": Spec(list, items="root"), "exclude_paths": Spec(list, items="path"),
-    "exclude_dir_names": Spec(list, items="name"), "exclude_extensions": Spec(list, items="ext"),
-    "exclude_globs": Spec(list, items="glob"),
+    "exclude_extensions": Spec(list, items="extpat"), "exclude_globs": Spec(list, items="glob"),
     "index_hidden": Spec(bool), "text_extensions": Spec(list, items="ext"),
     "max_text_mb": Spec(int, 1, 100_000), "max_office_mb": Spec(int, 1, 100_000),
     "max_pdf_mb": Spec(int, 1, 100_000), "max_chars_per_file": Spec(int, 1000, 2_000_000_000),
@@ -189,6 +196,15 @@ class ConfigError(ValueError):
 
 _WINDOW = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
 _EXT = re.compile(r"[\w+~-]+")
+_EXT_PATTERN = re.compile(r"[\w+~*?-]+")
+
+
+@functools.lru_cache(maxsize=8)
+def _ext_matcher(entries: tuple[str, ...]) -> tuple[frozenset[str], re.Pattern | None]:
+    """Split excluded extensions into plain ones (a set lookup) and patterns (one regular expression)."""
+    literals = frozenset(e for e in entries if not re.search(r"[*?]", e))
+    wild = [fnmatch.translate(e) for e in entries if re.search(r"[*?]", e)]
+    return literals, re.compile("|".join(wild), re.IGNORECASE) if wild else None
 
 
 def parse_window(text: str) -> tuple[int, int]:
@@ -223,22 +239,27 @@ def _ext_item(text: str) -> str:
     return ext
 
 
-def _name_item(text: str) -> str:
-    if "\\" in text or "/" in text or "*" in text or "?" in text:
-        raise ValueError("must be one folder name, not a path or a pattern (use the pattern list for those)")
-    return text
+def _ext_pattern_item(text: str) -> str:
+    ext = text.lower().removeprefix("*").lstrip(".") if text.startswith(("*.", ".")) else text.lower()
+    if not _EXT_PATTERN.fullmatch(ext):
+        raise ValueError(f"{text!r} is not a file extension (write it like pdf, .pdf or msi*)")
+    if not re.search(r"[^*?]", ext):
+        raise ValueError("would exclude every file")
+    return ext
 
 
 def _glob_item(text: str) -> str:
     pattern = text.replace("/", "\\")
-    if not re.search(r"[^*?\\]", pattern):
-        raise ValueError("would exclude everything")
+    # a dot between wildcards (e.g. "*.*") is not real content either: it still matches almost every
+    # file, just like a plain "*" or "?*" would, so treat * ? . \ alone as "no literal name given"
+    if re.search(r"[*?]", pattern) and not re.search(r"[^*?.\\]", pattern):
+        raise ValueError(f"{text!r} would exclude almost every file; name a folder or a narrower pattern instead")
     return pattern
 
 
 _ITEM_CHECKS: dict[str, Callable[[str], str]] = {
     "text": lambda text: text, "root": _path_item, "path": _path_item, "ext": _ext_item,
-    "name": _name_item, "glob": _glob_item, "window": _window_item,
+    "extpat": _ext_pattern_item, "glob": _glob_item, "window": _window_item,
 }
 
 
@@ -253,7 +274,7 @@ def _check(key: str, value: object, *, check_paths: bool = False) -> object:
     if spec.kind is list:
         if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
             raise ConfigError({key: "must be a list of non-empty texts"})
-        if spec.items == "ext":  # extensions may be typed separated by spaces, commas or lines
+        if spec.items in ("ext", "extpat"):  # extensions may be typed separated by spaces, commas or lines
             value = [word for text in value for word in re.split(r"[\s,;]+", text) if word]
         items: list[str] = []
         for text in value:
@@ -313,13 +334,12 @@ CONFIG_TEMPLATE = """\
 roots = {roots}
 # Extra folders to skip (Windows, Program Files and ProgramData are always skipped).
 exclude_paths = {exclude_paths}
-# Folders with these names are skipped wherever they are.
-exclude_dir_names = {exclude_dir_names}
-# Files with these extensions (no dot) are never indexed, for example ["env", "pem", "key"].
+# Files with these extensions (no dot) are never indexed, for example ["env", "pem", "msi*"]; * and ?
+# stand for any text and any one character.
 exclude_extensions = {exclude_extensions}
-# Files and folders matching these patterns are never indexed. * matches any text, ? one character,
-# case is ignored. A pattern without a backslash is matched against the name only ("*.env",
-# "secret*"); one with a backslash against the whole path ("*\\.ssh\\*", "D:\\Private\\*").
+# Files and folders with these names are never indexed, wherever they are. An entry is a name
+# ("node_modules"), a pattern for names (".*", "secret*", "*.bak"), or, with a backslash, a pattern for
+# the whole path ("*\\.ssh\\*", "D:\\Private\\*"). * matches any text, ? one character, case is ignored.
 exclude_globs = {exclude_globs}
 index_hidden = {index_hidden}
 # Files with these extensions are indexed as text (HTML and XML-like ones without their tags). Add your
@@ -470,6 +490,11 @@ def load(data_dir: Path | None = None) -> Config:
             log.info("config.toml: extra_text_extensions is now part of text_extensions")
         else:
             log.warning("config.toml: extra_text_extensions ignored, text_extensions is already there")
+    if "exclude_dir_names" in flat:  # the old way: folder names apart from the patterns
+        names = flat.pop("exclude_dir_names")
+        globs = flat.get("exclude_globs", [])
+        flat["exclude_globs"] = [*names, *(g for g in globs if g.lower() not in {n.lower() for n in names})]
+        log.info("config.toml: exclude_dir_names is now part of exclude_globs")
     known = {f.name for f in fields(Config)} - {"data_dir"}
     for key in flat.keys() - known:
         log.warning("unknown config key %r ignored", key)

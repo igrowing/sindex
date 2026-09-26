@@ -39,8 +39,9 @@ moves, or deletes them.
 Some locations are skipped by default: the Windows and Program Files
 folders, `ProgramData`, the recycle bin, `System Volume Information`, common
 developer cache folders (`node_modules`, `.git`, `.venv`, ...), and sindex's
-own data folder. You can add more with `exclude_paths` and
-`exclude_dir_names` in `config.toml`.
+own data folder. You can add more (folders, names,
+patterns such as `*.pem`, and file extensions) on the Settings page or with `exclude_paths`, `exclude_globs`
+and `exclude_extensions` in `config.toml`.
 
 Password-protected PDFs that require a password are skipped.
 

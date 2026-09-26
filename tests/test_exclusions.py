@@ -13,9 +13,11 @@ from sindex.search import search
 
 
 def test_a_pattern_without_backslash_is_about_names_and_one_with_is_about_paths():
-    by_name, by_path = compile_globs(["*.ENV", "secret*", "*/.ssh/*", "D:\\Private\\*"])
+    names, by_name, by_path = compile_globs(["*.ENV", "secret*", "*/.ssh/*", "D:\\Private\\*", "Node_Modules", ".*"])
 
-    assert len(by_name) == 2 and len(by_path) == 2
+    assert names == {"node_modules"}  # a plain name needs no regular expression
+    assert len(by_name) == 3 and len(by_path) == 2
+    assert by_name[2].match(".git") and by_name[2].match(".hidden.txt") and not by_name[2].match("a.txt")
     assert by_name[0].match("prod.env") and by_name[0].match("PROD.Env") and not by_name[0].match("env.txt")
     assert by_name[1].match("secret-notes.txt") and not by_name[1].match("my-secret.txt")
     assert by_path[0].match("C:\\Users\\me\\.ssh\\id_rsa") and not by_path[0].match("C:\\Users\\me\\ssh\\x")
@@ -127,3 +129,21 @@ def test_an_interrupted_rescan_is_repeated(cfg, tree, monkeypatch):
     assert db.get_meta(conn, "rules") != indexer._rules()
     conn.close()
     assert "server.log" not in index(cfg, tree)
+
+
+def test_a_wildcard_in_a_name_skips_files_and_folders_of_that_kind(cfg):
+    cfg.exclude_globs = [".*", "tmp*"]
+    cfg.index_hidden = True
+    filt = PathFilter(cfg, ["D:\\"])
+
+    assert filt.skip_dir_entry("D:\\Docs\\.git", ".git", 0) and filt.skip_dir_entry("D:\\Docs\\tmp1", "tmp1", 0)
+    assert filt.skip_file_entry("D:\\Docs\\.env", ".env", 0)
+    assert filt.dir_excluded("D:\\Docs\\tmp1\\deeper") and not filt.dir_excluded("D:\\Docs\\Temp")
+    assert filt.file_kind("D:\\Docs\\.notes.txt") is None and filt.file_kind("D:\\Docs\\notes.txt") == "text"
+
+
+def test_wildcard_extensions_are_not_indexed(cfg, tree):
+    cfg.index_hidden = True
+    cfg.exclude_extensions = ["lo*"]  # log
+
+    assert "server.log" not in index(cfg, tree) and "plan.txt" in index(cfg, tree)

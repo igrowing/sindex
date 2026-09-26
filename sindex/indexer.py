@@ -362,7 +362,6 @@ class Indexer:
         c = self.cfg
         return {
             "exclude_paths": sorted(p.lower() for p in c.builtin_exclude_paths() + c.exclude_paths),
-            "exclude_dir_names": sorted(n.lower() for n in c.exclude_dir_names),
             "exclude_extensions": sorted(c.excluded_exts),
             "exclude_globs": sorted(g.lower() for g in c.exclude_globs),
             "index_hidden": c.index_hidden,

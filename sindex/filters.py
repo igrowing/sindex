@@ -41,19 +41,23 @@ def dedupe_roots(roots: list[str]) -> list[str]:
     return kept
 
 
-def compile_globs(patterns: list[str]) -> tuple[list[re.Pattern], list[re.Pattern]]:
-    r"""Split exclude patterns into (matched against the name, matched against the whole path).
+def compile_globs(patterns: list[str]) -> tuple[frozenset[str], list[re.Pattern], list[re.Pattern]]:
+    r"""Split exclude entries into (plain names, patterns for the name, patterns for the whole path).
 
     A pattern with a backslash is a path pattern, one without is about the name alone, so that "*.env"
     and "secret*" work in every folder. `*` also matches across backslashes: "*\.ssh\*" is everything
     below any .ssh folder.
     """
+    names: set[str] = set()  # a plain name is a set lookup, not a regular expression
     by_name: list[re.Pattern] = []
     by_path: list[re.Pattern] = []
     for pattern in patterns:
         pattern = pattern.replace("/", "\\")
-        (by_path if "\\" in pattern else by_name).append(re.compile(fnmatch.translate(pattern), re.IGNORECASE))
-    return by_name, by_path
+        if not re.search(r"[*?\[\\]", pattern):
+            names.add(pattern.lower())
+        else:
+            (by_path if "\\" in pattern else by_name).append(re.compile(fnmatch.translate(pattern), re.IGNORECASE))
+    return frozenset(names), by_name, by_path
 
 
 class PathFilter:
@@ -64,8 +68,7 @@ class PathFilter:
         self.roots = dedupe_roots(roots)
         self._root_prefixes = [_with_sep(r).lower() for r in self.roots]
         self._excluded = [_with_sep(norm(p)).lower() for p in cfg.builtin_exclude_paths() + cfg.exclude_paths]
-        self._names = {n.lower() for n in cfg.exclude_dir_names}
-        self._name_globs, self._path_globs = compile_globs(cfg.exclude_globs)
+        self._names, self._name_globs, self._path_globs = compile_globs(cfg.exclude_globs)
         self._hidden_cache: dict[str, bool] = {}
 
     def root_of(self, path: str) -> str | None:
@@ -80,7 +83,7 @@ class PathFilter:
         return any(low.startswith(p) for p in self._excluded)
 
     def _glob_excluded(self, path: str, name: str, *, is_dir: bool) -> bool:
-        if any(g.match(name) for g in self._name_globs):
+        if name.lower() in self._names or any(g.match(name) for g in self._name_globs):
             return True
         if not self._path_globs:
             return False
@@ -90,7 +93,7 @@ class PathFilter:
 
     def skip_dir_entry(self, path: str, name: str, attrs: int) -> bool:
         """For the scanner: a subdirectory found while walking."""
-        if attrs & A_REPARSE or name.lower() in self._names:
+        if attrs & A_REPARSE:
             return True
         if attrs & A_HIDDEN and not self.cfg.index_hidden:
             return True
@@ -126,9 +129,7 @@ class PathFilter:
         if not rel:
             return False
         parts = rel.split("\\")
-        if any(p.lower() in self._names for p in parts):
-            return True
-        globs = bool(self._name_globs or self._path_globs)
+        globs = bool(self._names or self._name_globs or self._path_globs)
         if globs or not self.cfg.index_hidden:
             current = root
             for p in parts:

@@ -114,8 +114,8 @@
       are excluded here also disappear from the index at the next scan, which starts when you save.</p>
     <div id="f-roots"></div>
     <div id="f-skip"></div>
-    <div class="pair"><div id="f-names"></div><div id="f-exts"></div></div>
-    <div class="pair"><div id="f-globs"></div><div id="f-text"></div></div>
+    <div class="pair"><div id="f-globs"></div><div id="f-exts"></div></div>
+    <div id="f-text"></div>
     <div id="f-index"></div>
     <details>
       <summary>Size limits</summary>
@@ -215,15 +215,12 @@ const GROUPS = {
   "f-skip": {
     exclude_paths: ["Folders to skip", "Tick the folders to leave out. Everything below them is skipped."],
   },
-  "f-names": {
-    exclude_dir_names: ["Folder names to skip anywhere", "One name per line, like node_modules."],
+  "f-globs": {
+    exclude_globs: ["Files and folders to skip anywhere",
+      "One per line. A name (node_modules), or a pattern for names (.*, tmp*, *.bak), skips every file and folder with such a name. With a backslash it is a pattern for the whole path (*\\.ssh\\*, D:\\Private\\*). * is any text, ? one character."],
   },
   "f-exts": {
-    exclude_extensions: ["File types to skip", "Like env pem key, separated by spaces, commas or lines. Good for keys and secrets."],
-  },
-  "f-globs": {
-    exclude_globs: ["Patterns to skip",
-      "One per line. * matches any text, ? one character. Without a backslash it is matched against the name (*.env, secret*); with one, against the whole path (*\\.ssh\\*, D:\\Private\\*)."],
+    exclude_extensions: ["File types to skip", "Like env pem msi*, separated by spaces, commas or lines; * and ? are wildcards. Good for keys and secrets."],
   },
   "f-text": {
     text_extensions: ["File types to read as text",
@@ -241,7 +238,7 @@ const GROUPS = {
 };
 const KEYS = Object.values(GROUPS).flatMap(g => Object.keys(g));
 const PICKERS = ["roots", "exclude_paths"];  // lists of folders, chosen in a folder browser
-const TALL = ["exclude_globs", "text_extensions", "exclude_dir_names", "exclude_extensions"];  // these four boxes are equally tall
+const TALL = ["exclude_globs", "exclude_extensions", "text_extensions"];  // these boxes are equally tall
 const PRESET_KEYS = ["efficiency_mode", "background_io", "duty_factor", "read_mb_per_sec", "cpu_rate_percent"];
 
 let state = null;  // what GET /api/settings returned
@@ -261,14 +258,14 @@ function setField(key, value) {
   const el = $("f_" + key), kind = state.specs[key].kind;
   if (PICKERS.includes(key)) { pickers[key].items = [...value]; renderPicker(key); }
   else if (kind === "bool") el.checked = value;
-  else if (kind === "list") el.value = value.join(state.specs[key].items === "ext" ? " " : "\n");
+  else if (kind === "list") el.value = value.join(state.specs[key].items.startsWith("ext") ? " " : "\n");
   else el.value = value;
 }
 function getField(key) {
   const el = $("f_" + key), kind = state.specs[key].kind;
   if (PICKERS.includes(key)) return [...pickers[key].items];
   if (kind === "bool") return el.checked;
-  if (kind === "list" && state.specs[key].items === "ext")  // spaces, commas or lines; a dot or *. in front is optional
+  if (kind === "list" && state.specs[key].items.startsWith("ext"))  // spaces, commas or lines; a dot or *. in front is optional
     return [...new Set(el.value.split(/[\s,;]+/).map(w => w.toLowerCase().replace(/^\*?\.+/, "")).filter(Boolean))];
   if (kind === "list") return el.value.split("\n").map(l => l.trim()).filter(Boolean);
   return el.value === "" ? NaN : Number(el.value);

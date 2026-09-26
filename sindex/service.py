@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,6 +25,22 @@ log = logging.getLogger(__name__)
 SERVICE_NAME = "sindex"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CREATE_NO_WINDOW = 0x08000000
+
+
+def frozen() -> bool:
+    """Whether this runs from the PyInstaller executable instead of from a Python environment."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def indexer_command(*args: str) -> list[str]:
+    """Command line that starts an indexer process.
+
+    The executable has no python.exe to run `-m sindex.indexer` with, so it carries the indexer as its own
+    `indexer` command.
+    """
+    if frozen():
+        return [sys.executable, "indexer", *args]
+    return [python_exe(), "-m", "sindex.indexer", *args]
 
 
 def python_exe() -> str:
@@ -54,10 +71,10 @@ class Supervisor:
         return self.proc is not None and self.proc.poll() is None
 
     def _spawn(self) -> subprocess.Popen:
-        cmd = [python_exe(), "-m", "sindex.indexer", "--data-dir", str(self.cfg.data_dir),
-               "--stdin-stop", *self.extra_args]
+        cmd = indexer_command("--data-dir", str(self.cfg.data_dir), "--stdin-stop", *self.extra_args)
         env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PROJECT_ROOT), env.get("PYTHONPATH")]))
+        if not frozen():
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(PROJECT_ROOT), env.get("PYTHONPATH")]))
         stderr = open(self.cfg.data_dir / "logs" / "indexer-stderr.log", "ab")
         try:
             return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr,
@@ -138,6 +155,77 @@ class Supervisor:
             if self._wait_before_restart(backoff):
                 return
             backoff = min(backoff * 2, 900.0)
+
+
+PROGRAM_DIR_NAME = "sindex"
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
+
+
+def program_dir() -> Path:
+    """Where the executable installs itself: the service must not depend on the folder it was downloaded to."""
+    return Path(os.environ["ProgramFiles"]) / PROGRAM_DIR_NAME
+
+
+def copy_program(src: Path, dst: Path) -> None:
+    """Replace the program folder `dst` by a copy of `src` (the folder with sindex.exe and its files)."""
+    if src.resolve() == dst.resolve():
+        return
+    if dst.exists():
+        shutil.rmtree(dst)  # not a merge: files of an older version would stay behind
+    shutil.copytree(src, dst)
+
+
+def install_executable_service(exe: Path) -> bool:
+    """Register `exe service` with the service control manager, or point an existing entry at it.
+
+    Returns whether the service was there before. Needs administrator rights.
+    """
+    import pywintypes
+
+    command = f'"{exe}" service'
+    scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
+    try:
+        existed = True
+        try:
+            svc = win32service.OpenService(scm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+            win32service.ChangeServiceConfig(
+                svc, win32service.SERVICE_NO_CHANGE, win32service.SERVICE_AUTO_START, win32service.SERVICE_NO_CHANGE,
+                command, None, 0, None, None, None, SindexService._svc_display_name_)
+        except pywintypes.error as e:
+            if e.winerror != ERROR_SERVICE_DOES_NOT_EXIST:
+                raise
+            existed = False
+            svc = win32service.CreateService(
+                scm, SERVICE_NAME, SindexService._svc_display_name_, win32service.SERVICE_ALL_ACCESS,
+                win32service.SERVICE_WIN32_OWN_PROCESS, win32service.SERVICE_AUTO_START,
+                win32service.SERVICE_ERROR_NORMAL, command, None, 0, None, None, None)
+        try:
+            win32service.ChangeServiceConfig2(svc, win32service.SERVICE_CONFIG_DESCRIPTION,
+                                              SindexService._svc_description_)
+            win32service.ChangeServiceConfig2(svc, win32service.SERVICE_CONFIG_DELAYED_AUTO_START_INFO, True)
+        finally:
+            win32service.CloseServiceHandle(svc)
+    finally:
+        win32service.CloseServiceHandle(scm)
+    return existed
+
+
+def stop_service(timeout: float = 60.0) -> bool:
+    """Stop the service if it exists and runs, and wait for it; True if it was running."""
+    import pywintypes
+
+    try:
+        state = win32serviceutil.QueryServiceStatus(SERVICE_NAME)[1]
+    except pywintypes.error as e:
+        if e.winerror == ERROR_SERVICE_DOES_NOT_EXIST:
+            return False
+        raise
+    if state == win32service.SERVICE_STOPPED:
+        return False
+    if state != win32service.SERVICE_STOP_PENDING:
+        win32serviceutil.StopService(SERVICE_NAME)
+    win32serviceutil.WaitForServiceStatus(SERVICE_NAME, win32service.SERVICE_STOPPED, int(timeout))
+    return True
 
 
 def run_core(cfg: config.Config, stop: threading.Event, extra_args: list[str] | None = None) -> None:

@@ -140,7 +140,8 @@ def test_detect_preset(tmp_path):
     ("text_extensions", ["txt, .md;py", "  LOG\tnfo\n*.ini "], ["txt", "md", "py", "log", "nfo", "ini"]),
     ("exclude_extensions", [".pem .key,env"], ["pem", "key", "env"]),
     ("exclude_globs", ["*/.ssh/*", "*.env"], [r"*\.ssh\*", "*.env"]),
-    ("exclude_dir_names", ["Temp", "node_modules"], ["Temp", "node_modules"]),
+    ("exclude_globs", ["Temp", ".*", "tmp?", "*/Private/*"], ["Temp", ".*", "tmp?", "*\\Private\\*"]),
+    ("exclude_extensions", ["msi*", "*.p?m", "  .KE* "], ["msi*", "p?m", "ke*"]),
     ("exclude_paths", ["D:/Private/"], [r"D:\Private"]),
     ("roots", [r"D:\Docs\..\Work"], [r"D:\Work"]),
     ("schedule_windows", ["22:00-06:00", "7:30 - 9:05"], ["22:00-06:00", "07:30-09:05"]),
@@ -154,8 +155,13 @@ def test_list_entries_are_normalized(key, given, expected):
     ("exclude_extensions", [r"a\b"]),
     ("exclude_globs", ["*"]),
     ("exclude_globs", [r"*\*"]),
-    ("exclude_dir_names", [r"a\b"]),
-    ("exclude_dir_names", ["*.tmp"]),
+    ("exclude_globs", ["*.*"]),  # looks like "everything" (old DOS wildcard), not just files with a dot
+    ("exclude_globs", ["?*"]),
+    ("exclude_globs", [r"*\*.*"]),
+    ("exclude_extensions", ["*"]),
+    ("exclude_extensions", ["?*"]),
+    ("exclude_extensions", ["*.*"]),
+    ("text_extensions", ["md*"]),  # only the skip list takes patterns: a text type must be a real extension
     ("exclude_paths", ["Private"]),
     ("roots", ["docs"]),
     ("schedule_windows", ["22-06"]),
@@ -191,3 +197,34 @@ def test_the_index_folder_defaults_to_the_data_folder_and_is_never_indexed(tmp_p
 
     assert cfg.db_path == tmp_path / "elsewhere" / "index.db"
     assert str(tmp_path / "elsewhere") in cfg.builtin_exclude_paths()
+
+
+def test_a_new_config_skips_the_usual_cache_folders_by_name_and_pattern(tmp_path):
+    cfg = config.load(tmp_path)
+
+    assert cfg.exclude_globs == config.DEFAULT_EXCLUDE_DIR_NAMES
+    assert "exclude_dir_names" not in config.render(cfg)
+
+
+def test_the_old_exclude_dir_names_key_is_merged_into_the_patterns(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[index]\nexclude_dir_names = ["Cache", "node_modules"]\nexclude_globs = ["*.bak", "node_modules"]\n',
+        encoding="utf-8")
+
+    cfg = config.load(tmp_path)
+
+    assert cfg.exclude_globs == ["Cache", "node_modules", "*.bak"]  # names first, no duplicate
+
+
+def test_the_old_exclude_dir_names_key_alone_replaces_the_defaults_as_it_did_before(tmp_path):
+    (tmp_path / "config.toml").write_text('[index]\nexclude_dir_names = ["Cache"]\n', encoding="utf-8")
+
+    assert config.load(tmp_path).exclude_globs == ["Cache"]
+
+
+def test_excluded_extensions_may_hold_wildcards():
+    cfg = config.Config(exclude_extensions=["pem", "MSI*", ".t?p"])
+
+    assert [cfg.ext_excluded(e) for e in ("pem", "msi", "msix", "tmp", "top", "temp", "pe", "txt")] == [
+        True, True, True, True, True, False, False, False]
+    assert not config.Config().ext_excluded("pem")

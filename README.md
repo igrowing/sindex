@@ -32,7 +32,8 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 .venv\Scripts\sindex --data-dir .\data search "invoice" --names
 
 # or run everything (indexer + web UI at http://127.0.0.1:8765/) until Ctrl+C
-.venv\Scripts\sindex --data-dir .\data run --root D:\Download
+.venv\Scripts\sindex --data-dir .\data run --root D:\Download  # for scanning of specific folder
+.venv\Scripts\sindex --data-dir .\data run   # for scanning using data/config.toml
 ```
 
 Reading the USN journal needs administrator rights. Without them, sindex falls back to periodic rescans.
@@ -60,6 +61,39 @@ The service keeps its data in `%ProgramData%\sindex`:
 
 To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
 while the service is installed.
+
+## Windows executable (no Python needed)
+
+Build it once on a machine that has the project (Python 3.12+):
+
+```powershell
+.venv\Scripts\pip install -e ".[build]"
+.venv\Scripts\python packaging\build.py       # -> dist\sindex\sindex.exe (a folder of about 25 MB)
+```
+
+Copy the whole `dist\sindex` folder to the target machine and **double-click `sindex.exe`** (or run
+`sindex.exe install --start`). It asks for administrator rights and then installs itself as the service: it copies
+the program to `%ProgramFiles%\sindex`, registers the `sindex` service (automatic, delayed start, LocalSystem),
+creates the Desktop and Start menu shortcuts, and starts the service. The web UI is at `http://127.0.0.1:8765/`.
+
+- **Update:** run the new `sindex.exe` the same way. It stops the service, replaces the program folder (settings and
+  index in `%ProgramData%\sindex` stay), and starts the service again.
+- **Remove:** `"%ProgramFiles%\sindex\sindex.exe" remove` from an administrator prompt, then delete the folder
+  `%ProgramFiles%\sindex`. Delete `%ProgramData%\sindex` too if you do not want to keep the index and settings.
+- **Everything else works as with the Python install:** `sindex.exe status`, `search`, `pause`, `run` (in a console,
+  with `--data-dir` for a test folder), and so on.
+- **If the self-install does not work** (for example, a policy blocks the UAC prompt), copy the folder to
+  `C:\Program Files\sindex` yourself and register it from an administrator prompt:
+
+  ```powershell
+  sc.exe create sindex binPath= "\"C:\Program Files\sindex\sindex.exe\" service" start= delayed-auto DisplayName= "sindex content indexer"
+  sc.exe start sindex
+  ```
+
+It is a folder, not a single file, on purpose: Windows expects a service to answer within seconds of starting, and a
+one-file build unpacks itself into a temporary folder first, every time. The service starts `sindex.exe service`, which
+starts the indexer as `sindex.exe indexer` and the parsing workers as further copies of `sindex.exe`; you will see
+several `sindex.exe` processes.
 
 ## How it stays light
 
@@ -93,12 +127,16 @@ three; a tab with a rejected value is marked and opened. It covers:
 - **Schedule and freshness:** `schedule_windows` (for example `22:00-06:00`; the indexer pauses outside them),
   `rescan_hours` and `usn_poll_seconds`.
 - **What to index:** roots and folders to skip (picked in a folder browser, with the chosen folders listed beside it;
-  the browser lists folders of this computer and needs the web token), folder names to skip anywhere and file
-  extensions to skip (side by side), patterns to skip and the file types read as text (side by side; extensions can be
-  typed separated by spaces, commas or lines, with or without the dot), hidden files, and the size limits. A pattern without a backslash is matched against the name
-  (`*.env`, `secret*`), one with a backslash against the whole path (`*\.ssh\*`, `D:\Private\*`); `*` also matches
-  across folders and case is ignored. Saving a change to these rules makes the indexer rescan, so files that are
-  excluded now leave the index and files that are allowed now enter it.
+  the browser lists folders of this computer and needs the web token), then *Files and folders to skip anywhere* and
+  *File types to skip* (side by side), the file types read as text, hidden files, and the size limits.
+  The first list holds names and patterns, one per line (`exclude_globs`): a name (`node_modules`) or a pattern for
+  names (`.*`, `tmp*`, `*.bak`) skips every file and folder with such a name, wherever it is; a pattern with a
+  backslash is matched against the whole path (`*\.ssh\*`, `D:\Private\*`). `*` is any text, `?` one character, and
+  case is ignored. It starts with the usual cache and trash folders (`node_modules`, `.git`, `.venv`, ...). The
+  file types list takes extensions with or without a dot, separated by spaces, commas or lines, and may use the
+  wildcards too (`env pem msi*`). Saving a change to these rules makes the indexer rescan, so files that are
+  excluded now leave the index and files that are allowed now enter it. An old `exclude_dir_names` entry in
+  `config.toml` is merged into the patterns.
 - **Index storage:** where `index.db` is and how big it is. To move it, stop the service, move the `index.db*` files,
   set `db_dir` in `config.toml` and start the service. The folder must exist and be on a local fixed drive (SQLite's
   write-ahead log does not work on network shares); otherwise the indexer refuses to start and says why in its status.
