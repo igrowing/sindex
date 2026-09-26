@@ -67,7 +67,8 @@ class Config:
     pause_on_battery: bool = True
     pause_when_cpu_busy_percent: int = 70  # 0 disables
     recycle_after_files: int = 1000
-    recycle_rss_mb: int = 150
+    recycle_rss_mb: int = 150  # also applies to each extraction worker
+    extract_workers: int = 3  # processes that parse files in parallel; 0 = parse in the indexer itself
     # write batching (SSD wear): commit after this many files or seconds, whichever is first
     commit_every_files: int = 200
     commit_every_seconds: int = 60
@@ -121,26 +122,31 @@ max_chars_per_file = 5000000
 # 2x slower and background_io about 1.5x; idle_priority costs nothing until something else
 # wants the CPU, so it is the one to keep.
 efficiency_mode = false
-background_io = true
+background_io = false
 idle_priority = true
 # Hard CPU cap for the indexer, percent of the whole machine (0 = off). Note that on a
 # machine with few cores 10% of the whole machine is less than one core.
-cpu_rate_percent = 10
+cpu_rate_percent = 0
 # Hard memory cap for the indexer process in MB (0 = off).
-memory_limit_mb = 256
+memory_limit_mb = 512
 # After working for t seconds, sleep duty_factor * t seconds.
-duty_factor = 1.0
-read_mb_per_sec = 4.0
+duty_factor = 0.1
+read_mb_per_sec = 0
 pause_on_battery = false
-pause_when_cpu_busy_percent = 70
-recycle_after_files = 1000
-recycle_rss_mb = 150
+pause_when_cpu_busy_percent = 80
+recycle_after_files = 5000
+recycle_rss_mb = 250
+# Files are parsed (PDFs are slow) by this many worker processes in parallel, while the indexer
+# itself only writes the results to the database. 0 = parse in the indexer, one file at a time.
+# Each worker costs some RAM (about 40-100 MB) and, with duty_factor, its own share of CPU;
+# cpu_rate_percent caps all of them together and read_mb_per_sec is divided between them.
+extract_workers = 3
 # Writes are batched to reduce SSD wear: the index is committed after this many
 # files or seconds, whichever comes first (or when the batch fills the page cache).
 # New results appear in search after a commit. A bigger cache allows bigger batches.
-commit_every_files = 200
-commit_every_seconds = 60
-sqlite_cache_mb = 8
+commit_every_files = 1000
+commit_every_seconds = 120
+sqlite_cache_mb = 64
 wal_autocheckpoint_pages = 4000
 usn_poll_seconds = 300
 rescan_hours = 24
@@ -197,4 +203,9 @@ def setup_logging(data_dir: Path, name: str, *, console: bool = False) -> None:
         handlers=handlers,
         force=True,
     )
+    quiet_third_party_logs()
+
+
+def quiet_third_party_logs() -> None:
+    # pypdf warns about every PDF quirk (a missing fontTools alone once filled the log)
     logging.getLogger("pypdf").setLevel(logging.ERROR)

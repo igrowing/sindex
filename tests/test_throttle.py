@@ -110,3 +110,12 @@ def test_read_rate_limit_off(cfg, slept):
     cfg.read_mb_per_sec = 0
     throttle.consume(500 * 1024 * 1024)
     assert naps == []
+
+
+def test_waiting_for_others_is_not_work(cfg, slept):
+    throttle, naps = slept
+    cfg.duty_factor = 1.0
+    throttle._work_start = time.monotonic() - 5.0  # five seconds since the last sleep, all of them spent waiting
+    throttle.resume_clock()
+    throttle.checkpoint()
+    assert naps == []

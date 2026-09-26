@@ -3,6 +3,8 @@
 import pytest
 
 from sindex import db
+from sindex.extract import pool
+from sindex.extract.job import Chunk
 from sindex.indexer import Indexer
 from sindex.search import search
 from sindex.throttle import Stopped
@@ -65,25 +67,24 @@ def test_batch_is_committed_when_idle(cfg, small_tree):
 
 def test_interrupted_file_is_removed_and_redone(cfg, small_tree, monkeypatch):
     cfg.commit_every_files = 10_000
-    real = Indexer._store_text
+    real = pool.run_job
     calls = {"n": 0}
 
-    def interrupted(self, file_id, path, kind, ctx):
+    def interrupted(task, cfg, throttle):
         calls["n"] += 1
         if calls["n"] == 3:
-            self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, 'partial', 'text')",
-                              (file_id << db.CHUNK_BITS,))
+            yield Chunk(task.job, "partial")  # stored, then the process is stopped in the middle of the file
             raise Stopped
-        return real(self, file_id, path, kind, ctx)
+        yield from real(task, cfg, throttle)
 
-    monkeypatch.setattr(Indexer, "_store_text", interrupted)
+    monkeypatch.setattr(pool, "run_job", interrupted)
     assert run(cfg, small_tree) == 0  # Stopped is a clean exit
     files, queued = counts(cfg)
     assert files == 2, "finished files are committed, the interrupted one is not left behind"
     assert queued == 28, "the interrupted file and the unprocessed ones are still queued"
     assert found(cfg, "partial") == set()
 
-    monkeypatch.setattr(Indexer, "_store_text", real)
+    monkeypatch.setattr(pool, "run_job", real)
     assert run(cfg, small_tree) == 0
     assert counts(cfg) == (30, 0)
     assert found(cfg, "kumquat29") == {"f29.txt"}

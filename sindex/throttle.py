@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import _winapi
 import ctypes
 import logging
+import msvcrt
 import threading
 import time
 from collections.abc import Callable
@@ -110,9 +112,12 @@ def _check(ok, what: str) -> bool:
     return bool(ok)
 
 
-def apply_process_limits(cfg: Config) -> None:
-    """Make the current process a polite background citizen (see the [throttle] config)."""
-    global _job_handle
+def apply_process_priority(cfg: Config) -> None:
+    """Priority, I/O mode and EcoQoS of the current process (see the [throttle] config).
+
+    Extraction workers call this on their own: background I/O mode and EcoQoS are not inherited
+    from the parent, only the priority class is.
+    """
     proc = kernel32.GetCurrentProcess()
     # Measured on an idle machine, indexing the same files: EcoQoS about 2x slower, background
     # I/O mode about 1.5x, idle CPU priority no cost until something else wants the CPU.
@@ -130,8 +135,16 @@ def apply_process_limits(cfg: Config) -> None:
     _check(kernel32.SetProcessInformation(proc, ProcessPowerThrottling, ctypes.byref(eco), ctypes.sizeof(eco)),
            "EcoQoS")
 
+
+def apply_process_limits(cfg: Config) -> None:
+    """Make the current process a polite background citizen, and cap it (and its children) in a Job Object."""
+    global _job_handle
+    apply_process_priority(cfg)
+    proc = kernel32.GetCurrentProcess()
     if cfg.memory_limit_mb <= 0 and cfg.cpu_rate_percent <= 0:
         return
+    # extraction workers are started after this, so they join the job: the CPU cap is shared by all of
+    # them, the memory cap applies to each process on its own
     job = kernel32.CreateJobObjectW(None, None)
     if not _check(job, "CreateJobObject"):
         return
@@ -148,6 +161,20 @@ def apply_process_limits(cfg: Config) -> None:
                                                 ctypes.byref(rate), ctypes.sizeof(rate)), "job CPU cap")
     if _check(kernel32.AssignProcessToJobObject(job, proc), "AssignProcessToJobObject"):
         _job_handle = job
+
+
+def stdin_closed() -> bool:
+    """Whether the writing end of our stdin pipe is closed: the supervisor asked us to stop, or is gone.
+
+    This peeks instead of blocking in a read. A thread parked in a synchronous read on the pipe stalls
+    the start-up of every process this one spawns: the extraction workers never got as far as running
+    Python.
+    """
+    try:
+        _winapi.PeekNamedPipe(msvcrt.get_osfhandle(0), 0)
+    except OSError:  # BrokenPipeError: nobody can write to it any more
+        return True
+    return False
 
 
 def rss_bytes() -> int:
@@ -213,6 +240,10 @@ class Throttle:
         if self.stop.wait(seconds):
             raise Stopped
         self._work_start = time.monotonic()  # sleeping is not work
+
+    def resume_clock(self) -> None:
+        """Time spent waiting for other processes is not work: count from now on."""
+        self._work_start = time.monotonic()
 
     def checkpoint(self) -> None:
         if self.stop.is_set():

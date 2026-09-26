@@ -24,10 +24,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, db, scanner, textnorm
-from .extract import Context, ExtractError, NotText, extract, file_ext, kind_of, max_bytes
+from . import config, control, db, scanner
+from .extract import file_ext, kind_of, max_bytes
+from .extract.job import Chunk, Result, Task
+from .extract.pool import make_runner
 from .filters import SKIP_FILE_ATTRS, PathFilter
-from .throttle import Stopped, Throttle, apply_process_limits, rss_bytes
+from .throttle import Stopped, Throttle, apply_process_limits, rss_bytes, stdin_closed
 from .usn import (
     REASON_DELETE,
     REASON_RENAME_NEW,
@@ -44,6 +46,10 @@ log = logging.getLogger(__name__)
 EXIT_OK = 0
 EXIT_RECYCLE = 3
 DIR_REASONS = REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_DELETE
+QUEUE_BATCH = 50  # queue rows looked at per round
+PROGRESS_EVERY = 1000  # log a progress line after this many indexed files
+STDIN_POLL_SECONDS = 1.0  # how often the supervisor's stdin pipe is checked
+MAX_CHUNKS = (1 << db.CHUNK_BITS) - 1  # chunks of one file: the rowid range reserved for it
 
 
 @dataclass
@@ -58,6 +64,16 @@ class Volume:
     scanned_roots: list[str] = field(default_factory=list)
     needs_scan: bool = False
     next_poll: float = 0.0
+
+
+@dataclass(slots=True)
+class _Job:
+    """A file whose text is being extracted (by the runner) and stored (by us, chunk by chunk)."""
+
+    file_id: int  # also the job id: unique among the files in flight
+    path: str
+    kind: str
+    seq: int = 0  # chunks stored so far
 
 
 class Indexer:
@@ -76,9 +92,11 @@ class Indexer:
         self.volumes: list[Volume] = []
         self.files_done = 0
         self.dirty = False
+        self.runner = make_runner(cfg, self.throttle, self.paused_flag)
+        self.jobs: dict[int, _Job] = {}  # files being extracted right now, by file id
+        self._progress_at = time.monotonic()
         # write batching: one transaction spans many files (see _commit)
         self.in_txn = False
-        self.in_file = False  # mid-file: not a safe point to commit
         self.batch_files = 0
         self.batch_chars = 0
         self.batch_started = 0.0
@@ -94,7 +112,7 @@ class Indexer:
         return "paused by user" if self.paused_flag.exists() else None
 
     def _on_pause(self, reason: str | None) -> None:
-        if reason and not self.in_file:
+        if reason and not self.jobs:
             self._commit()  # do not sit on uncommitted work while paused
         self._status("paused" if reason else "working", reason or "", force=True)
 
@@ -106,15 +124,18 @@ class Indexer:
     # is committed when it holds enough work, is old enough, or the indexer goes
     # idle, is paused, recycles or stops. A file's queue row is deleted in the same
     # transaction as its index rows, so a crash loses at most the uncommitted batch,
-    # which is simply redone from the queue: never half a file.
+    # which is simply redone from the queue: never half a file. Files are extracted in
+    # parallel, so a commit waits until the files in flight are complete (_settle): a
+    # committed half file would be visible to searches until it is finished.
     #
     # Two things must hold for this to save writes (measured, see README):
     #  - no SAVEPOINT per file: FTS5 flushes to a new segment at every savepoint, which
-    #    brings the small-segment write amplification straight back. An interrupted file
-    #    is instead removed again by index_file().
+    #    brings the small-segment write amplification straight back. Interrupted files
+    #    are instead removed again by _abandon_jobs().
     #  - the batch must fit in SQLite's page cache: otherwise dirty pages spill to the
     #    WAL mid-transaction and hot pages get written over and over. batch_max_chars
-    #    is derived from sqlite_cache_mb.
+    #    is derived from sqlite_cache_mb. It is checked before each new file, so the files
+    #    already in flight can overshoot it by their own size.
 
     def _begin(self) -> None:
         if not self.in_txn:
@@ -123,6 +144,7 @@ class Indexer:
             self.batch_started = time.monotonic()
 
     def _commit(self) -> None:
+        assert not self.jobs, "committing while files are still being extracted"
         if self.in_txn:
             self.conn.execute("COMMIT")
             self.in_txn = False
@@ -135,7 +157,7 @@ class Indexer:
             self.conn.execute("ROLLBACK")
 
     def _batch_due(self) -> bool:
-        return (self.batch_files >= self.cfg.commit_every_files
+        return (self.batch_files + len(self.jobs) >= self.cfg.commit_every_files  # files in flight will join it
                 or self.batch_chars >= self.batch_max_chars
                 or time.monotonic() - self.batch_started >= self.cfg.commit_every_seconds)
 
@@ -193,16 +215,19 @@ class Indexer:
             self._load_volumes()
             return self._loop()
         except Stopped:
+            self._abandon_jobs()
             return EXIT_OK
         except KeyboardInterrupt:
+            self._abandon_jobs()
             raise
         except BaseException:
             clean = False  # unexpected (e.g. a database error): do not trust the open batch
             raise
         finally:
+            self.runner.close()
             try:
-                # after a stop the finished files are consistent (index_file() removed the
-                # interrupted one); an unfinished file would just be redone from the queue
+                # after a stop the finished files are consistent (_abandon_jobs() removed the
+                # interrupted ones); an unfinished file would just be redone from the queue
                 self._commit() if clean else self._rollback()
             except sqlite3.Error:
                 log.exception("closing the open batch failed")
@@ -220,6 +245,7 @@ class Indexer:
             did |= self._poll_journals()
             did |= self._process_queue()
             if self._should_recycle():
+                self._drain()  # the files in flight are complete before the process goes away
                 log.info("recycling after %d files (rss %.0f MB)", self.files_done, rss_bytes() / 1048576)
                 return EXIT_RECYCLE
             if not did:
@@ -230,7 +256,8 @@ class Indexer:
 
     def _should_recycle(self) -> bool:
         return (self.files_done >= self.cfg.recycle_after_files
-                or rss_bytes() > self.cfg.recycle_rss_mb * 1048576)
+                or rss_bytes() > self.cfg.recycle_rss_mb * 1048576
+                or self.runner.wants_recycle)
 
     def _idle(self) -> None:
         if self.dirty:
@@ -313,7 +340,7 @@ class Indexer:
                     log.warning("%s USN journal unavailable (%s)", v.letter, e)
                     v.journal.close()
                     v.journal = None
-            self._commit()  # the scanner runs its own transactions
+            self._settle()  # the scanner runs its own transactions
             for root in v.roots:
                 self._status("scanning", root, force=True)
                 scanner.scan(self.conn, root, self.filter, self.throttle,
@@ -355,7 +382,7 @@ class Indexer:
                     continue
                 if nxt == v.next_usn:
                     continue
-                self._commit()  # new changes and the journal position are stored atomically
+                self._settle()  # new changes and the journal position are stored atomically
                 self.conn.execute("BEGIN")
                 try:
                     count = 0
@@ -386,43 +413,117 @@ class Indexer:
     # ---- the queue -------------------------------------------------------
 
     def _process_queue(self) -> bool:
-        rows = self.conn.execute(
-            "SELECT path, stage, reason FROM queue ORDER BY priority, enqueued_at LIMIT 50").fetchall()
+        # the files already in flight are still queued: ask for that many more rows and skip them
+        rows = self.conn.execute("SELECT path, stage, reason FROM queue ORDER BY priority, enqueued_at LIMIT ?",
+                                 (QUEUE_BATCH + len(self.jobs),)).fetchall()
+        in_flight = {job.path for job in self.jobs.values()}
+        did = False
         for path, stage, reason in rows:
+            if stage == db.STAGE_TEXT and path in in_flight:
+                continue
+            did = True
             self.throttle.checkpoint()
+            if self.jobs:
+                self._pump(0)  # take finished work now: workers block while their output is not read
+            if self.in_txn and self._batch_due():
+                self._settle()
             if stage == db.STAGE_DIR:
-                self._commit()
+                self._settle()
                 self._status("scanning", path, force=True)
                 scanner.scan(self.conn, path, self.filter, self.throttle, force=reason == "force")
                 self._dequeue(path, stage)
             elif stage == db.STAGE_TEXT:
-                self._status("indexing", path)
-                self._begin()
-                self.in_file = True
-                try:
-                    extracted = self.index_file(path, force=reason == "force")
-                    self._dequeue(path, stage)
-                finally:
-                    self.in_file = False
-                self.dirty = True
-                self.batch_files += 1
-                if extracted:
-                    self.files_done += 1
-                if self._batch_due():
-                    self._commit()
-                if extracted and self._should_recycle():
+                self._start_file(path, force=reason == "force")
+                if self._should_recycle():
                     break
             else:
                 self._dequeue(path, stage)  # stages of later phases
-        return bool(rows)
+        if not did and self.jobs:
+            self._drain()  # nothing new to start: wait for the files in flight
+            did = True
+        return did
 
     def _dequeue(self, path: str, stage: str) -> None:
         self.conn.execute("DELETE FROM queue WHERE path = ? AND stage = ?", (path, stage))
 
-    def index_file(self, path: str, *, force: bool = False) -> bool:
-        """(Re)index one file, or drop it from the index. Runs inside a transaction.
+    # ---- extraction pipeline -----------------------------------------------
+    #
+    # A queued file is prepared here (stat, what to do with it, its `files` row), handed to the
+    # runner, and its chunks are stored as they come back. Up to `extract_workers` files are in
+    # flight, so the runner (not this process) is where the parsing time is spent.
 
-        Returns whether the file's content was read.
+    def _start_file(self, path: str, *, force: bool) -> None:
+        self._status("indexing", path)
+        self._begin()
+        extracted, job = self._prepare_file(path, force=force)
+        if job is None:
+            self._file_done(path, extracted=extracted)
+            return
+        # tracked from here on, even while it waits for a free worker: its `files` row exists, so a
+        # stop must remove it and nothing may commit it half done
+        self.jobs[job.file_id] = job
+        while not self.runner.has_slot():
+            self.throttle.checkpoint()
+            self._pump(1.0)
+        self.runner.submit(Task(job.file_id, path, job.kind, MAX_CHUNKS))
+
+    def _pump(self, timeout: float) -> None:
+        for msg in self.runner.poll(timeout):
+            self._on_message(msg)
+
+    def _drain(self) -> None:
+        """Wait until every file in flight is complete."""
+        while self.jobs:
+            self.throttle.checkpoint()
+            self._pump(1.0)
+
+    def _settle(self) -> None:
+        """Commit at a moment when no file is half done."""
+        self._drain()
+        self._commit()
+
+    def _abandon_jobs(self) -> None:
+        # interrupted: remove the half-indexed files; their queue rows are still there, so they are
+        # redone later. (No savepoint: see the note on write batching.)
+        for file_id in self.jobs:
+            db.delete_file(self.conn, file_id)
+        self.jobs.clear()
+
+    def _on_message(self, msg: Chunk | Result) -> None:
+        job = self.jobs[msg.job]
+        if isinstance(msg, Chunk):
+            self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, ?, 'text')",
+                              ((job.file_id << db.CHUNK_BITS) + job.seq, msg.text))
+            job.seq += 1
+            self.batch_chars += len(msg.text)
+            return
+        del self.jobs[msg.job]
+        self.conn.execute("UPDATE files SET status = ?, encoding = ?, error = ? WHERE id = ?",
+                          (msg.status, msg.encoding, msg.error, job.file_id))
+        self._file_done(job.path, extracted=True)
+
+    def _file_done(self, path: str, *, extracted: bool) -> None:
+        self._dequeue(path, db.STAGE_TEXT)
+        self.dirty = True
+        self.batch_files += 1
+        if extracted:
+            self.files_done += 1
+            if self.files_done % PROGRESS_EVERY == 0:
+                self._log_progress()
+
+    def _log_progress(self) -> None:
+        stats = control.index_stats(self.conn, self.cfg)
+        now = time.monotonic()
+        rate = PROGRESS_EVERY / max(now - self._progress_at, 0.001)
+        self._progress_at = now
+        log.info("progress: %d files indexed, %d files in queue (%.1f files/s)",
+                 stats["total_files"], stats["queued"], rate)
+
+    def _prepare_file(self, path: str, *, force: bool) -> tuple[bool, _Job | None]:
+        """Decide what to do with a queued file and record it as being indexed. Runs inside a transaction.
+
+        Returns whether the file's content is read, and the job that still has to extract its text
+        (None when the file was dropped, is unchanged, or is too big).
         """
         conn = self.conn
         d, name = os.path.split(path)
@@ -435,13 +536,13 @@ class Indexer:
             st = None
         except OSError as e:
             log.debug("cannot stat %s: %s", path, e)
-            return False  # transient (locked, access denied): keep what we have
+            return False, None  # transient (locked, access denied): keep what we have
         if st is None or not os.path.isfile(path) or st.st_file_attributes & SKIP_FILE_ATTRS:
             if row:
                 db.delete_file(conn, row[0])
-            return False
+            return False, None
         if row and not force and row[1] == st.st_size and row[2] == st.st_mtime_ns and row[3] != "indexing":
-            return False  # unchanged ('indexing' is a leftover of an interrupted run: redo)
+            return False, None  # unchanged ('indexing' is a leftover of an interrupted run: redo)
 
         file_id = conn.execute(
             """INSERT INTO files (dir, name, size, mtime_ns, status, indexed_at)
@@ -452,65 +553,18 @@ class Indexer:
                RETURNING id""",
             (d, name, st.st_size, st.st_mtime_ns, time.time())).fetchone()[0]
         db.delete_chunks(conn, file_id)
-
-        status, error, ctx = "ok", None, Context(self.throttle)
         if st.st_size > max_bytes(kind, self.cfg):
-            status = "too_big"
-        else:
-            try:
-                status = self._store_text(file_id, path, kind, ctx)
-            except NotText:
-                status = "binary"
-            except ExtractError as e:
-                status, error = "error", str(e)[:500]
-            except OSError as e:
-                status, error = "error", f"{type(e).__name__}: {e}"[:500]
-            except MemoryError:
-                status, error = "error", "out of memory"
-                self.files_done = self.cfg.recycle_after_files  # recycle the process
-            except (Stopped, KeyboardInterrupt):
-                # interrupted: remove the half-indexed file; its queue row is still there, so
-                # it is redone later. (No savepoint: see the note on write batching.)
-                db.delete_file(conn, file_id)
-                raise
-            except Exception as e:  # a parser bug must not stop the indexer
-                log.exception("unexpected error extracting %s", path)
-                status, error = "error", f"{type(e).__name__}: {e}"[:500]
-        conn.execute("UPDATE files SET status = ?, encoding = ?, error = ? WHERE id = ?",
-                     (status, ctx.encoding, error, file_id))
-        return True
-
-    def _store_text(self, file_id: int, path: str, kind: str, ctx: Context) -> str:
-        pieces = extract(path, kind, ctx)
-        info: dict = {}
-        try:
-            seq = 0
-            base = file_id << db.CHUNK_BITS
-            max_seq = (1 << db.CHUNK_BITS) - 1
-            for chunk in textnorm.chunks(pieces, self.cfg.chunk_chars, self.cfg.max_chars_per_file, info):
-                self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, ?, 'text')",
-                                  (base + seq, textnorm.normalize(chunk)))
-                self.batch_chars += len(chunk)
-                seq += 1
-                if seq >= max_seq:
-                    return "truncated"
-            if seq == 0:
-                return "empty"
-            return "truncated" if info.get("truncated") else "ok"
-        finally:
-            pieces.close()
+            conn.execute("UPDATE files SET status = 'too_big' WHERE id = ?", (file_id,))
+            return True, None
+        return True, _Job(file_id, path, kind)
 
 
 def _stop_on_stdin_eof(stop: threading.Event) -> None:
     def watch() -> None:
-        # raw os.read: a thread blocked in sys.stdin.buffer.read() holds the buffer's
-        # lock and makes interpreter shutdown abort
-        try:
-            while os.read(0, 4096):
-                pass
-        except OSError as e:
-            log.debug("stdin closed: %s", e)  # a broken pipe means the supervisor is gone: stop too
-        stop.set()
+        # polls, see stdin_closed(). Daemon: it holds nothing, and it ends by itself once `stop` is set
+        while not stop.wait(STDIN_POLL_SECONDS):
+            if stdin_closed():
+                stop.set()
     threading.Thread(target=watch, daemon=True, name="stdin-watch").start()
 
 
@@ -534,11 +588,6 @@ def main(argv: list[str] | None = None) -> int:
         code = indexer.run()
     except KeyboardInterrupt:
         code = EXIT_OK
-    if args.stdin_stop:
-        # everything is committed and closed; skip interpreter teardown while the
-        # stdin thread is still blocked in a read
-        logging.shutdown()
-        os._exit(code)
     return code
 
 

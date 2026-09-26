@@ -16,6 +16,7 @@ def cfg(tmp_path: Path) -> config.Config:
     c.read_mb_per_sec = 0
     c.pause_on_battery = False
     c.pause_when_cpu_busy_percent = 0
+    c.extract_workers = 0  # parse in the test process; the tests of the worker pool ask for processes
     return c
 
 

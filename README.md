@@ -48,7 +48,7 @@ The service keeps its data in `%ProgramData%\sindex`:
 |---|---|
 | `config.toml` | settings (roots, exclusions, throttling, web port/token); restart the service after editing |
 | `index.db` | SQLite FTS5 index |
-| `logs\` | `service.log`, `indexer.log`, `indexer-stderr.log` |
+| `logs\` | `service.log`, `indexer.log` (with a `progress: N files indexed, M files in queue` line after every 1000 files), `indexer-stderr.log` |
 | `status.json`, `paused`, `requests\` | control files the web UI and CLI use to talk to the indexer |
 
 To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
@@ -64,6 +64,12 @@ while the service is installed.
   children. PDFs are the heavy part, because pypdf parses whole pages: a page can need 30 to 130 MB while it is
   decoded. After each page the decoded objects are dropped, and a page that does not fit under the 256 MB cap is
   skipped without losing the rest of the document.
+- Parsing runs in `extract_workers` extra processes (3 by default), because a Python process can use one core at most
+  and PDF parsing is where nearly all the time goes. The indexer hands each queued file to a free worker and only
+  stores the text that comes back, so it stays the single writer of the database. Workers are started when first
+  needed, replaced when they grow past `recycle_rss_mb` or after `recycle_after_files` files (and if one dies, only its
+  file is recorded as an error), and end with the indexer, even if the service is killed. `extract_workers = 0`
+  parses in the indexer itself, one file at a time.
 - A duty cycle sleeps as long as it works (`duty_factor`) and reads are rate-limited (`read_mb_per_sec`). Indexing
   pauses on battery, when the system is busy, or when you pause it.
 - Everything is streamed: 64 KB reads, incremental decoders, expat for Office XML, one PDF page at a time, and one
@@ -78,9 +84,10 @@ files on an otherwise idle 8-core machine took 2.8 s unthrottled and 22 s with t
 |---|---|---|
 | `efficiency_mode` (true) | Windows "Efficiency mode" (EcoQoS): low clock speeds, efficiency cores | the biggest: about 2x slower on its own |
 | `background_io` (true) | low I/O and memory priority | about 1.5x slower on its own |
-| `duty_factor` (1.0) | after each 0.1 s of work, sleep this many times as long: CPU share is 1 / (1 + factor) | 1.0 is 50%, 0.5 is 67%, 0.25 is 80% |
-| `read_mb_per_sec` (4) | cap on file reading; only matters for large files | small |
-| `cpu_rate_percent` (10) | hard CPU cap as a percentage of the *whole machine* | rarely binding on 8 cores, but 10% of a 4-core machine is 0.4 of one core |
+| `duty_factor` (1.0) | after each 0.1 s of work, sleep this many times as long: CPU share is 1 / (1 + factor) | 1.0 is 50%, 0.5 is 67%, 0.25 is 80%. Applies to each worker on its own |
+| `read_mb_per_sec` (4) | cap on file reading; only matters for large files | small. Shared by the workers |
+| `cpu_rate_percent` (10) | hard CPU cap as a percentage of the *whole machine*, for the indexer and its workers together | rarely binding on 8 cores, but 10% of a 4-core machine is 0.4 of one core |
+| `extract_workers` (3) | processes that parse files in parallel (0 = in the indexer) | 60 PDFs and 100 other files: 45 s with 0, 35 s with 3 (one 10 s PDF at the end of the queue set the floor). Each worker takes about 50 MB of RAM |
 | `idle_priority` (true) | lowest CPU priority | free on an idle machine; keep it so foreground work always wins |
 | `pause_on_battery`, `pause_when_cpu_busy_percent` (true, 70) | stop entirely instead of running slowly | none while running |
 
@@ -93,7 +100,8 @@ Measured through the real indexer process, same files: defaults 22 s, `duty_fact
 The index is written in batches: one transaction spans up to 200 files (`commit_every_files`) or 60 s
 (`commit_every_seconds`), and it is also committed when the indexer goes idle, pauses, recycles or stops. A file's
 queue entry is removed in the same transaction as its index rows, so a crash loses at most the open batch, which is
-redone from the queue. Never half a file.
+redone from the queue. Never half a file: a commit waits until the files being parsed by the workers are complete,
+and the files in flight count towards the batch size.
 
 Bytes written by the indexer process to build a 56 MB index of 2,506 files (`C:\Python314\Lib`, measured with
 `psutil` write counters, so a proxy for physical writes):
