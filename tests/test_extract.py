@@ -7,7 +7,19 @@ from pypdf.errors import DependencyError
 from sindex.extract import ExtractError, NotText, extract
 from sindex.extract.text import detect_encoding
 
-from .conftest import make_docx, make_encrypted_pdf, make_odt, make_pdf, make_pptx, make_xlsx, make_zip
+from .conftest import (
+    FIXTURES,
+    make_docx,
+    make_encrypted_pdf,
+    make_jpeg,
+    make_jpeg_with_iptc,
+    make_odt,
+    make_pdf,
+    make_png,
+    make_pptx,
+    make_xlsx,
+    make_zip,
+)
 
 RU = ("Съешь же ещё этих мягких французских булок, да выпей чаю. Широкая электрификация южных "
       "губерний даст мощный толчок подъёму сельского хозяйства. В чащах юга жил бы цитрус? Да, но фальшивый "
@@ -264,3 +276,149 @@ def test_pdf_missing_crypto_dependency_is_an_extract_error(tmp_path, ctx, monkey
 def test_codecs_used_exist():
     for _, enc, _ in CASES:
         codecs.lookup(enc)
+
+
+# --- image metadata (Phase 2) ------------------------------------------------------------------
+
+def test_image_with_no_metadata_is_ok_with_no_text(tmp_path, ctx):
+    p = make_jpeg(tmp_path / "plain.jpg", size=(12, 9))
+    out = "".join(extract(str(p), "image", ctx))
+    assert out == ""
+    assert ctx.media.kind == "image"
+    assert (ctx.media.width, ctx.media.height) == (12, 9)
+
+
+@pytest.mark.parametrize("lat,lon", [(40.6892, -74.0445), (-33.8688, 151.2093)])
+def test_image_exif_camera_date_and_gps(tmp_path, ctx, lat, lon):
+    exif = {271: "Canon", 272: "EOS R5", 36867: "2023:06:01 10:00:00"}
+    p = make_jpeg(tmp_path / "photo.jpg", exif=exif, gps=(lat, lon))
+    list(extract(str(p), "image", ctx))
+    media = ctx.media
+    assert media.camera == "Canon EOS R5"
+    assert media.taken_at == "2023-06-01T10:00:00"
+    assert media.lat == pytest.approx(lat, abs=1e-4)
+    assert media.lon == pytest.approx(lon, abs=1e-4)
+
+
+def test_image_exif_user_comment_and_xp_keywords_non_latin(tmp_path, ctx):
+    cyrillic = "Отпуск в горах"
+    exif = {
+        37510: b"UNICODE\x00" + "café at noon".encode("utf-16"),
+        40094: cyrillic.encode("utf-16-le") + b"\x00\x00",
+    }
+    p = make_jpeg(tmp_path / "tagged.jpg", exif=exif)
+    out = "".join(extract(str(p), "image", ctx))
+    assert "café at noon" in out
+    assert cyrillic in out
+
+
+def test_image_xmp_title_description_subject_are_searchable(tmp_path, ctx):
+    xmp = (
+        b'<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b'<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        b'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">\xe6\x9d\xb1\xe4\xba\xac\xe9\x83\xbd'
+        b"</rdf:li></rdf:Alt></dc:title>"
+        b"<dc:subject><rdf:Bag><rdf:li>vacation</rdf:li><rdf:li>mountains</rdf:li></rdf:Bag></dc:subject>"
+        b"</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    )
+    p = make_jpeg(tmp_path / "xmp.jpg", xmp=xmp)
+    out = "".join(extract(str(p), "image", ctx))
+    assert "東京都" in out
+    assert "vacation" in out and "mountains" in out
+
+
+def test_image_iptc_caption_headline_byline_keywords_non_latin(tmp_path, ctx):
+    greek = "Ελλάδα"
+    p = make_jpeg_with_iptc(tmp_path / "iptc.jpg", caption="A caption", headline="A headline",
+                             byline="By Someone", keywords=["one", greek])
+    out = "".join(extract(str(p), "image", ctx))
+    assert "A caption" in out and "A headline" in out and "By Someone" in out
+    assert "one" in out and greek in out
+
+
+def test_png_text_chunks_are_searchable(tmp_path, ctx):
+    p = make_png(tmp_path / "pic.png", text={"Title": "A PNG title", "Keywords": "alpha beta"})
+    out = "".join(extract(str(p), "image", ctx))
+    assert "A PNG title" in out and "alpha beta" in out
+    assert ctx.media.kind == "image"
+
+
+def test_image_never_calls_load(tmp_path, ctx, monkeypatch):
+    from PIL import Image
+
+    def boom(self):
+        raise AssertionError("image metadata extraction must never decode pixels")
+
+    p = make_jpeg(tmp_path / "photo.jpg", exif={271: "Canon"})
+    monkeypatch.setattr(Image.Image, "load", boom)
+    list(extract(str(p), "image", ctx))  # must not raise
+
+
+def test_corrupt_image_is_an_extract_error(tmp_path, ctx):
+    p = tmp_path / "broken.jpg"
+    p.write_bytes(b"not an image at all" * 5)
+    with pytest.raises(ExtractError):
+        list(extract(str(p), "image", ctx))
+
+
+def test_dng_raw_is_read_as_tiff_exif(tmp_path, ctx):
+    # DNG is a TIFF-based container; a plain TIFF stands in for it (Pillow reads both the same way).
+    p = make_jpeg(tmp_path / "raw.dng", exif={271: "Adobe", 272: "DNG Converter"}, size=(6, 5))
+    from PIL import Image
+
+    img = Image.open(p)
+    tiff_path = tmp_path / "as_tiff.tiff"
+    img.save(tiff_path, format="TIFF", exif=img.getexif())
+    list(extract(str(tiff_path), "image", ctx))
+    assert (ctx.media.width, ctx.media.height) == (6, 5)
+    assert ctx.media.camera == "Adobe DNG Converter"
+
+
+@pytest.mark.parametrize("ext", ["cr2", "nef", "arw"])
+def test_unparseable_raw_is_an_extract_error_not_a_crash(tmp_path, ctx, ext):
+    p = tmp_path / f"broken.{ext}"
+    p.write_bytes(b"\x00" * 32 + b"not a real raw file")
+    with pytest.raises(ExtractError):
+        list(extract(str(p), "image", ctx))
+
+
+# --- video metadata (Phase 2) -------------------------------------------------------------------
+
+def test_video_duration_resolution_codec_and_title(ctx):
+    out = "".join(extract(str(FIXTURES / "sample.mp4"), "video", ctx))
+    media = ctx.media
+    assert (media.width, media.height) == (16, 16)
+    assert media.duration_s == pytest.approx(0.04, abs=0.05)
+    assert media.codec
+    assert "Test Video" in out and "A test comment" in out
+
+
+def test_video_gps_from_quicktime_xyz_atom(ctx):
+    list(extract(str(FIXTURES / "sample_gps.mov"), "video", ctx))
+    assert ctx.media.lat == pytest.approx(40.6892, abs=1e-4)
+    assert ctx.media.lon == pytest.approx(-74.0445, abs=1e-4)
+
+
+def test_video_uses_the_capped_parse_speed(ctx, monkeypatch):
+    # parse_speed must stay capped: raising it toward 1.0 trades the header-only guarantee away
+    from pymediainfo import MediaInfo
+
+    seen = {}
+    real_parse = MediaInfo.parse.__func__
+
+    def spy(cls, filename, **kwargs):
+        seen.update(kwargs)
+        return real_parse(cls, filename, **kwargs)
+
+    monkeypatch.setattr(MediaInfo, "parse", classmethod(spy))
+    list(extract(str(FIXTURES / "sample.mp4"), "video", ctx))
+    assert seen.get("parse_speed") == pytest.approx(0.3)
+
+
+def test_video_missing_media_info_library_is_an_extract_error(ctx, monkeypatch):
+    from pymediainfo import MediaInfo
+
+    monkeypatch.setattr(MediaInfo, "can_parse", staticmethod(lambda: False))
+    with pytest.raises(ExtractError):
+        list(extract(str(FIXTURES / "sample.mp4"), "video", ctx))

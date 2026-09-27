@@ -100,6 +100,44 @@ def snippet_html(raw: str) -> str:
     return text.replace(textnorm.HL_START, "<mark>").replace(textnorm.HL_END, "</mark>")
 
 
+def _media_condition(*, kind: str | None, camera: str | None, has_gps: bool | None,
+                      min_width: int | None, min_height: int | None,
+                      min_duration_s: float | None, max_duration_s: float | None,
+                      taken_after: str | None, taken_before: str | None) -> tuple[list[str], list]:
+    """SQL fragments (against the `m` alias of `media`) and their params for the given media filters."""
+    where: list[str] = []
+    params: list = []
+    if kind:
+        where.append("m.kind = ?")
+        params.append(kind)
+    if camera:
+        where.append("m.camera LIKE ? ESCAPE '^'")
+        params.append("%" + camera.replace("^", "^^").replace("%", "^%").replace("_", "^_") + "%")
+    if has_gps is not None:
+        where.append("m.lat IS NOT NULL" if has_gps else "m.lat IS NULL")
+    if min_width is not None:
+        where.append("m.width >= ?")
+        params.append(min_width)
+    if min_height is not None:
+        where.append("m.height >= ?")
+        params.append(min_height)
+    if min_duration_s is not None:
+        where.append("m.duration_s >= ?")
+        params.append(min_duration_s)
+    if max_duration_s is not None:
+        where.append("m.duration_s <= ?")
+        params.append(max_duration_s)
+    if taken_after:
+        where.append("m.taken_at >= ?")
+        params.append(taken_after)
+    if taken_before:
+        # taken_at is ISO text ("YYYY-MM-DDTHH:MM:SS"); a lexical range against the next day is correct
+        hi = (datetime.strptime(taken_before, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        where.append("m.taken_at < ?")
+        params.append(hi)
+    return where, params
+
+
 def _date_ns(value: str | None, *, end: bool = False) -> int | None:
     if not value:
         return None
@@ -113,15 +151,19 @@ def _date_ns(value: str | None, *, end: bool = False) -> int | None:
 
 def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
            after: str | None = None, before: str | None = None,
-           offset: int = 0, limit: int = 20, *, names: bool = False) -> dict:
+           offset: int = 0, limit: int = 20, *, names: bool = False,
+           kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
+           min_width: int | None = None, min_height: int | None = None,
+           min_duration_s: float | None = None, max_duration_s: float | None = None,
+           taken_after: str | None = None, taken_before: str | None = None) -> dict:
     """Files whose text matches `query`; with `names`, also files whose folder or file name contains the words.
 
-    Name-only matches come after the content matches and have `hits == 0` and no snippet.
+    Name-only matches come after the content matches and have `hits == 0` and no snippet. `kind` and the
+    other media filters narrow the results to images/videos with matching `media` fields; with an empty
+    `query` and at least one media filter set, this browses by filter alone (no keyword required).
     """
     groups, negatives = _parse(query)
     match = _to_match(groups, negatives)
-    if match is None:
-        return {"results": [], "total": 0, "capped": False, "error": "Type some words to search for."}
 
     where = []
     params: list = []
@@ -140,34 +182,56 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
         where.append("f.mtime_ns < ?")
         params.append(hi)
 
-    sql = (f"SELECT chunks.rowid FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) "
-           f"WHERE {' AND '.join(['chunks MATCH ?', *where])} ORDER BY rank LIMIT {HIT_LIMIT}")
-    try:
-        rowids = [r[0] for r in conn.execute(sql, [match, *params])]
-    except sqlite3.OperationalError as e:
-        return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
+    media_where, media_params = _media_condition(
+        kind=kind, camera=camera, has_gps=has_gps, min_width=min_width, min_height=min_height,
+        min_duration_s=min_duration_s, max_duration_s=max_duration_s,
+        taken_after=taken_after, taken_before=taken_before)
+    media_join = "JOIN media m ON m.file_id = f.id" if media_where else ""
 
-    best: dict[int, int | None] = {}  # file id -> best chunk rowid (None: name match only), in rank order
-    hits: dict[int, int] = {}
-    for rowid in rowids:
-        fid = rowid >> db.CHUNK_BITS
-        best.setdefault(fid, rowid)
-        hits[fid] = hits.get(fid, 0) + 1
-    capped = len(rowids) >= HIT_LIMIT
+    if match is None:
+        if not media_where:
+            return {"results": [], "total": 0, "capped": False, "error": "Type some words to search for."}
+        # no keyword: browse by the media/path/ext/date filters alone, newest first
+        sql = (f"SELECT f.id FROM files f {media_join} "
+               f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT {HIT_LIMIT}")
+        fids = [r[0] for r in conn.execute(sql, [*params, *media_params])]
+        best: dict[int, int | None] = dict.fromkeys(fids)
+        hits: dict[int, int] = {}
+        capped = len(fids) >= HIT_LIMIT
+    else:
+        sql = (f"SELECT chunks.rowid FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) "
+               f"{media_join} WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where])} "
+               f"ORDER BY rank LIMIT {HIT_LIMIT}")
+        try:
+            rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params])]
+        except sqlite3.OperationalError as e:
+            return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
 
-    if names:
-        # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
-        conn.create_function("sindex_key", 1, _name_key, deterministic=True)
-        cond, name_params = _name_condition(groups, negatives)
-        sql = f"SELECT f.id FROM files f WHERE {' AND '.join([cond, *where])} LIMIT {HIT_LIMIT}"
-        by_name = [r[0] for r in conn.execute(sql, [*name_params, *params])]
-        for fid in by_name:
-            best.setdefault(fid, None)
-        capped = capped or len(by_name) >= HIT_LIMIT
+        best = {}  # file id -> best chunk rowid (None: name match only), in rank order
+        hits = {}
+        for rowid in rowids:
+            fid = rowid >> db.CHUNK_BITS
+            best.setdefault(fid, rowid)
+            hits[fid] = hits.get(fid, 0) + 1
+        capped = len(rowids) >= HIT_LIMIT
+
+        if names:
+            # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
+            conn.create_function("sindex_key", 1, _name_key, deterministic=True)
+            cond, name_params = _name_condition(groups, negatives)
+            sql = (f"SELECT f.id FROM files f {media_join} "
+                   f"WHERE {' AND '.join([cond, *where, *media_where])} LIMIT {HIT_LIMIT}")
+            by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params])]
+            for fid in by_name:
+                best.setdefault(fid, None)
+            capped = capped or len(by_name) >= HIT_LIMIT
 
     results = []
     for fid, rowid in list(best.items())[offset:offset + limit]:
-        f = conn.execute("SELECT dir, name, size, mtime_ns, status FROM files WHERE id = ?", (fid,)).fetchone()
+        f = conn.execute(
+            "SELECT f.dir, f.name, f.size, f.mtime_ns, f.status, m.kind, m.width, m.height, m.duration_s, "
+            "m.taken_at, m.camera FROM files f LEFT JOIN media m ON m.file_id = f.id WHERE f.id = ?",
+            (fid,)).fetchone()
         if f is None:
             continue
         snip = None
@@ -180,5 +244,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             "path": os.path.join(f[0], f[1]), "dir": f[0], "name": f[1], "size": f[2],
             "mtime": f[3] / 1e9, "status": f[4], "hits": hits.get(fid, 0),
             "snippet": snippet_html(snip[0]) if snip else "",
+            "media": {"kind": f[5], "width": f[6], "height": f[7], "duration_s": f[8], "taken_at": f[9],
+                      "camera": f[10]} if f[5] else None,
         })
     return {"results": results, "total": len(best), "capped": capped, "error": None}

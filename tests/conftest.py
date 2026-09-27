@@ -1,5 +1,6 @@
 import json
 import socket
+import struct
 import threading
 import urllib.error
 import urllib.request
@@ -12,6 +13,15 @@ from sindex import config
 from sindex.extract import Context
 from sindex.throttle import Throttle
 from sindex.web.server import WebServer
+
+# tests/fixtures/sample.mp4 and sample_gps.mov are tiny (~1.5 KB) real videos, not hand-rolled bytes:
+# MP4/MOV box nesting makes a minimal-bytes builder impractical the way make_pdf() is for PDF. Produced with:
+#   ffmpeg -f lavfi -i color=c=blue:s=16x16:d=0.04 -metadata title="Test Video" \
+#     -metadata comment="A test comment" -metadata artist="Test Camera" -metadata date="2023-06-01T10:00:00" \
+#     -pix_fmt yuv420p -frames:v 1 sample.mp4
+#   ffmpeg -f lavfi -i color=c=green:s=16x16:d=0.04 -metadata location="+40.6892-074.0445/" \
+#     -pix_fmt yuv420p -frames:v 1 -f mov sample_gps.mov
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
@@ -117,6 +127,82 @@ def make_encrypted_pdf(path: Path, lines: list[str], algorithm: str, user_passwo
     writer.encrypt(user_password=user_password, owner_password="owner-secret", algorithm=algorithm)
     with path.open("wb") as f:
         writer.write(f)
+    return path
+
+
+def _gps_ifd(lat: float, lon: float) -> dict[int, object]:
+    def dms(deg: float) -> tuple[float, float, float]:
+        deg = abs(deg)
+        d = int(deg)
+        m = int((deg - d) * 60)
+        s = (deg - d - m / 60) * 3600
+        return (float(d), float(m), s)
+
+    return {1: "N" if lat >= 0 else "S", 2: dms(lat), 3: "E" if lon >= 0 else "W", 4: dms(lon)}
+
+
+def make_jpeg(path: Path, *, exif: dict[int, object] | None = None, gps: tuple[float, float] | None = None,
+              xmp: bytes | None = None, size: tuple[int, int] = (8, 8)) -> Path:
+    """A tiny JPEG, optionally carrying EXIF tags, a GPS IFD (lat, lon) and/or an XMP packet."""
+    from PIL import Image
+
+    img = Image.new("RGB", size, "red")
+    kwargs: dict = {}
+    if exif or gps:
+        e = img.getexif()
+        for tag, value in (exif or {}).items():
+            e[tag] = value
+        if gps:
+            gps_ifd = e.get_ifd(0x8825)
+            gps_ifd.update(_gps_ifd(*gps))
+        kwargs["exif"] = e
+    if xmp is not None:
+        kwargs["xmp"] = xmp
+    img.save(path, format="JPEG", **kwargs)
+    return path
+
+
+def make_jpeg_with_iptc(path: Path, *, caption: str | None = None, headline: str | None = None,
+                         byline: str | None = None, keywords: list[str] | None = None) -> Path:
+    """A tiny JPEG with an IPTC/IIM block in a Photoshop APP13 segment (Pillow cannot write IPTC itself)."""
+    from PIL import Image
+
+    def iptc_field(dataset: int, text: str) -> bytes:
+        data = text.encode("utf-8")
+        return bytes([0x1C, 2, dataset]) + struct.pack(">H", len(data)) + data
+
+    fields = b""
+    if caption:
+        fields += iptc_field(120, caption)
+    if headline:
+        fields += iptc_field(105, headline)
+    if byline:
+        fields += iptc_field(80, byline)
+    for kw in keywords or []:
+        fields += iptc_field(25, kw)
+
+    resource = b"8BIM" + struct.pack(">H", 0x0404) + b"\x00\x00" + struct.pack(">I", len(fields)) + fields
+    if len(fields) % 2:
+        resource += b"\x00"
+    app13 = b"\xff\xed" + struct.pack(">H", len(resource) + 16) + b"Photoshop 3.0\x00" + resource
+
+    buf = path.with_suffix(".tmp")
+    Image.new("RGB", (8, 8), "red").save(buf, format="JPEG")
+    raw = buf.read_bytes()
+    buf.unlink()
+    path.write_bytes(raw[:2] + app13 + raw[2:])
+    return path
+
+
+def make_png(path: Path, *, text: dict[str, str] | None = None, size: tuple[int, int] = (8, 8)) -> Path:
+    """A tiny PNG, optionally with tEXt metadata (Title/Description/Author/Keywords)."""
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+
+    info = PngInfo()
+    for key, value in (text or {}).items():
+        info.add_text(key, value)
+    Image.new("RGB", size, "green").save(path, format="PNG", pnginfo=info)
     return path
 
 

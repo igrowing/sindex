@@ -14,7 +14,7 @@ from sindex.indexer import Indexer
 from sindex.search import search
 from sindex.throttle import Throttle
 
-from .conftest import make_docx, make_pdf
+from .conftest import make_docx, make_jpeg, make_pdf
 
 
 @pytest.fixture
@@ -67,6 +67,15 @@ def test_workers_run_side_by_side(make_pool, tmp_path):
     assert chunks == {1: ["alpha"], 2: ["beta"]}
     assert {r.status for r in results.values()} == {"ok"}
     assert pool.has_slot(), "workers are free again once their results were read"
+
+
+def test_result_media_field_survives_the_process_pool_round_trip(make_pool, tmp_path):
+    pool = make_pool(1)
+    photo = make_jpeg(tmp_path / "photo.jpg", exif={271: "Canon", 272: "EOS R5"}, size=(6, 4))
+    pool.submit(Task(1, str(photo), "image", 10))
+    _, results = collect(pool, 1)
+    media = results[1].media
+    assert media is not None and (media.width, media.height) == (6, 4) and media.camera == "Canon EOS R5"
 
 
 def test_a_worker_takes_the_next_file_after_the_first(make_pool, tmp_path):

@@ -154,6 +154,36 @@ def test_health_api_counts_lists_and_pages(web, root):
     assert call(web, "/api/health?status=error&offset=x")[0] == 400
 
 
+def test_open_file_launches_the_associated_viewer(monkeypatch):
+    seen = []
+    monkeypatch.setattr(control.os, "startfile", lambda path: seen.append(path))
+    control.open_file(r"D:\Docs\report.pdf")
+    assert seen == [r"D:\Docs\report.pdf"]
+
+
+def test_open_file_propagates_the_error(monkeypatch):
+    def boom(path):
+        raise OSError("no application is associated with this file type")
+
+    monkeypatch.setattr(control.os, "startfile", boom)
+    with pytest.raises(OSError, match="associated"):
+        control.open_file(r"D:\Docs\mystery.xyz")
+
+
+def test_open_api_needs_the_token(web, monkeypatch):
+    monkeypatch.setattr(control, "open_file", lambda path: None)
+    assert call(web, "/api/open", {"path": "D:\\Docs\\report.pdf"})[0] == 403
+    assert call(web, "/api/open", {"path": "D:\\Docs\\report.pdf"}, "secret")[0] == 200
+
+
+def test_open_api_reports_a_failure_instead_of_a_generic_error(web, monkeypatch):
+    monkeypatch.setattr(control, "open_file",
+                        lambda path: (_ for _ in ()).throw(OSError("no desktop in this session")))
+    status, body = call(web, "/api/open", {"path": "D:\\Docs\\report.pdf"}, "secret")
+    assert status == 400
+    assert "no desktop in this session" in json.loads(body)["error"]
+
+
 def test_retry_rebuild_and_maintenance_need_the_token_and_queue_requests(web):
     for path, body in (("/api/retry", {"status": "too_big"}), ("/api/rebuild", {}),
                        ("/api/maintenance", {"action": "vacuum"})):
@@ -171,6 +201,7 @@ def test_retry_rebuild_and_maintenance_need_the_token_and_queue_requests(web):
 
 @pytest.mark.parametrize("path,body", [
     ("/api/retry", {"status": "ok"}), ("/api/retry", {}), ("/api/maintenance", {"action": "rm -rf"}),
+    ("/api/open", {}), ("/api/open", {"path": "   "}),
 ])
 def test_bad_actions_are_refused(web, path, body):
     assert call(web, path, body, "secret")[0] == 404

@@ -141,6 +141,17 @@ def list_folders(path: str) -> dict:
             "truncated": len(names) > MAX_FOLDERS}
 
 
+def open_file(path: str) -> None:
+    """Launch `path` in its OS-associated viewer, as a double-click in Explorer would.
+
+    Raises OSError when there is nothing associated with the file type, or when the caller has no desktop to
+    show it on: the installed service runs as LocalSystem in Session 0, which Windows isolates from the
+    interactive desktop, so this only actually shows something when sindex runs in your own session (for
+    example `sindex run` in a console).
+    """
+    os.startfile(path)  # noqa: S606 -- token-gated like every other mutating action; see web/server.py
+
+
 def indexer_status(cfg: Config) -> dict:
     try:
         status = json.loads((cfg.data_dir / "status.json").read_text(encoding="utf-8"))
@@ -156,13 +167,18 @@ def db_size_bytes(cfg: Config) -> int:
     return sum(p.stat().st_size for p in cfg.db_path.parent.glob("index.db*") if p.is_file())
 
 
+def media_stats(conn: sqlite3.Connection) -> dict:
+    return dict(conn.execute("SELECT kind, count(*) FROM media GROUP BY kind").fetchall())
+
+
 def index_stats(conn: sqlite3.Connection, cfg: Config) -> dict:
     by_status = dict(conn.execute("SELECT status, count(*) FROM files GROUP BY status").fetchall())
     queued = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
     return {"files": by_status, "total_files": sum(by_status.values()), "queued": queued,
             "db_mb": round(db_size_bytes(cfg) / 1048576, 1), "db_path": str(cfg.db_path),
             "maintenance_pending": db.get_meta(conn, "maintenance_pending", []),
-            "last_maintenance": db.get_meta(conn, "last_maintenance")}
+            "last_maintenance": db.get_meta(conn, "last_maintenance"),
+            "media": media_stats(conn)}
 
 
 def problem_files(conn: sqlite3.Connection, status: str, *, limit: int = 100, offset: int = 0) -> list[dict]:

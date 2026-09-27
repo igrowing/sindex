@@ -119,8 +119,19 @@ class _Handler(BaseHTTPRequestHandler):
             control.request_maintenance(cfg, body["action"])
         elif path == "/api/reindex" and isinstance(body.get("path"), str) and body["path"].strip():
             control.request_reindex(cfg, body["path"].strip())
+        elif path == "/api/open" and isinstance(body.get("path"), str) and body["path"].strip():
+            return self._open_file(body["path"].strip())
         else:
             return self._json({"error": "unknown action"}, 404)
+        self._json({"ok": True})
+
+    def _open_file(self, path: str) -> None:
+        # only shows something when sindex runs interactively; the installed service has no desktop to use
+        # (LocalSystem in Session 0), so this fails there instead of silently doing nothing
+        try:
+            control.open_file(path)
+        except OSError as e:
+            return self._json({"error": f"could not open {path}: {e}"}, 400)
         self._json({"ok": True})
 
     def _change_settings(self, body: dict) -> None:
@@ -177,9 +188,17 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"results": [], "total": 0, "error": "The index does not exist yet."})
         try:
             exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
-            result = search(conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
-                            after=q.get("after") or None, before=q.get("before") or None,
-                            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1")
+            result = search(
+                conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
+                after=q.get("after") or None, before=q.get("before") or None,
+                offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1",
+                kind=q.get("kind") or None, camera=q.get("camera") or None,
+                has_gps={"1": True, "0": False}.get(q.get("has_gps")),
+                min_width=int(q["min_width"]) if q.get("min_width") else None,
+                min_height=int(q["min_height"]) if q.get("min_height") else None,
+                min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
+                max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
+                taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         finally:

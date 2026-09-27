@@ -5,6 +5,7 @@ import threading
 import pytest
 
 from sindex import textnorm
+from sindex.extract import MediaFields
 from sindex.extract import job as job_module
 from sindex.extract.job import Chunk, Result, Task, run_job
 from sindex.extract.pool import InlineRunner
@@ -83,6 +84,17 @@ def test_out_of_memory_asks_for_a_fresh_process(cfg, tmp_path, monkeypatch):
     monkeypatch.setattr(job_module, "extract", boom)
     result = run(cfg, tmp_path / "a.txt")[-1]
     assert (result.status, result.error, result.recycle) == ("error", "out of memory", True)
+
+
+def test_image_kind_with_no_text_and_media_set_is_ok_not_empty(cfg, tmp_path, monkeypatch):
+    def fake_extract(path, kind, ctx):
+        ctx.media = MediaFields(kind="image", width=8, height=8)
+        return
+        yield
+
+    monkeypatch.setattr(job_module, "extract", fake_extract)
+    result = run(cfg, tmp_path / "photo.jpg", kind="image")[-1]
+    assert result == Result(7, "ok", None, None, False, MediaFields(kind="image", width=8, height=8))
 
 
 def test_stop_is_not_swallowed(cfg, tmp_path):

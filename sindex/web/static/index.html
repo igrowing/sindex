@@ -35,6 +35,25 @@
       <label>Modified before <input id="before" type="date"></label>
     </div>
     <div class="hint">Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
+    <details id="mediaFilters">
+      <summary>Photos &amp; videos</summary>
+      <div class="row filters">
+        <label>Kind
+          <select id="kind"><option value="">Any</option><option value="image">Image</option><option value="video">Video</option></select>
+        </label>
+        <label>Camera <input id="camera" placeholder="Canon"></label>
+        <label>GPS
+          <select id="has_gps"><option value="">Any</option><option value="1">Has location</option><option value="0">No location</option></select>
+        </label>
+        <label>Resolution at least
+          <select id="min_height"><option value="">Any</option><option value="480">480p</option><option value="720">720p</option><option value="1080">1080p</option><option value="2160">4K</option></select>
+        </label>
+        <label>Duration at least (s) <input id="min_duration" type="number" min="0"></label>
+        <label>Duration at most (s) <input id="max_duration" type="number" min="0"></label>
+        <label>Taken after <input id="taken_after" type="date"></label>
+        <label>Taken before <input id="taken_before" type="date"></label>
+      </div>
+    </details>
   </form>
 
   <div id="summary"></div>
@@ -62,19 +81,40 @@ function fmtSize(n) {
   return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
 }
 function fmtDate(sec) { return new Date(sec * 1000).toLocaleString(); }
+function fmtDuration(s) { s = Math.round(s); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
+function fmtMedia(m) {
+  if (!m) return "";
+  const parts = [];
+  if (m.width && m.height) parts.push(`${m.width}×${m.height}`);
+  if (m.duration_s != null) parts.push(fmtDuration(m.duration_s));
+  if (m.camera) parts.push(esc(m.camera));
+  if (m.taken_at) parts.push(esc(m.taken_at.slice(0, 10)));
+  return parts.length ? `<div class="media">${parts.join(" · ")}</div>` : "";
+}
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { prompt("Copy:", text); }
 }
+async function openFile(path) {
+  const r = await fetch("/api/open", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Sindex-Token": TOKEN },
+    body: JSON.stringify({ path }),
+  });
+  const data = await r.json().catch(() => ({}));
+  toast(r.ok ? "Opening…" : (data.error || "Could not open the file"));
+}
+
+const MEDIA_KEYS = ["kind", "camera", "has_gps", "min_height", "min_duration", "max_duration", "taken_after", "taken_before"];
+function hasMediaFilter() { return MEDIA_KEYS.some((k) => $(k).value); }
 
 function params() {
   const p = new URLSearchParams({ q: $("q").value, offset });
-  for (const k of ["path", "ext", "after", "before"]) if ($(k).value) p.set(k, $(k).value);
+  for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
   return p;
 }
 
 async function runSearch() {
-  if (!$("q").value.trim()) { $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; return; }
+  if (!$("q").value.trim() && !hasMediaFilter()) { $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0; return; }
   const p = params();
   history.replaceState(null, "", "?" + p);
   const res = await fetch("/api/search?" + p).then(r => r.json()).catch(e => ({ error: String(e), results: [] }));
@@ -89,24 +129,75 @@ async function runSearch() {
       <div class="name">${esc(r.name)}</div>
       <div class="dir">${esc(r.dir)}</div>
       <div class="snip">${r.snippet}</div>
+      ${fmtMedia(r.media)}
       <div class="meta">
         <span>${fmtSize(r.size)}</span><span>${fmtDate(r.mtime)}</span>
         ${r.status !== "ok" ? `<span>${esc(r.status)}</span>` : ""}
         ${r.hits === 0 ? `<span>folder or file name match</span>` : ""}
+        <button class="plain" data-open="${i}" title="Open in its associated app (only while sindex runs in your own session)">Open</button>
         <button class="plain" data-copy="${i}" data-what="path">Copy path</button>
         <button class="plain" data-copy="${i}" data-what="dir">Copy folder</button>
       </div>
     </li>`).join("");
   $("results").querySelectorAll("[data-copy]").forEach(b =>
     b.onclick = () => copy(res.results[+b.dataset.copy][b.dataset.what]));
-  const pager = $("pager"); pager.innerHTML = "";
-  if (offset > 0) pager.append(pageBtn("← Previous", offset - PAGE));
-  if (offset + PAGE < res.total) pager.append(pageBtn("Next →", offset + PAGE));
+  $("results").querySelectorAll("[data-open]").forEach(b =>
+    b.onclick = () => openFile(res.results[+b.dataset.open].path));
+  lastTotal = res.total;
+  renderPager(res.total);
 }
 function pageBtn(label, to) {
   const b = document.createElement("button"); b.className = "plain"; b.textContent = label;
   b.onclick = () => { offset = to; runSearch(); window.scrollTo(0, 0); }; return b;
 }
+
+let lastTotal = 0;
+
+// A contiguous block of page numbers, always anchored at page 1 and the last page, sized to fit whatever
+// horizontal space #pager actually has (so more pages show up on a wide window, fewer on a narrow one).
+function pageWindow(current, total, slots) {
+  const set = new Set([1, total, current]);
+  for (let radius = 1; set.size < slots; radius++) {
+    const before = set.size;
+    if (current - radius >= 1) set.add(current - radius);
+    if (set.size < slots && current + radius <= total) set.add(current + radius);
+    if (set.size === before) break; // nothing left to add on either side
+  }
+  return [...set].filter((p) => p >= 1 && p <= total).sort((a, b) => a - b);
+}
+
+function renderPager(total) {
+  const pager = $("pager");
+  const totalPages = Math.max(1, Math.ceil(total / PAGE));
+  const current = Math.min(Math.floor(offset / PAGE) + 1, totalPages);
+  pager.innerHTML = "";
+  if (totalPages <= 1) return;
+
+  const hasPrev = current > 1, hasNext = current < totalPages;
+  const reserved = (hasPrev ? 100 : 0) + (hasNext ? 80 : 0);
+  const available = Math.max(0, (pager.clientWidth || document.querySelector("main").clientWidth) - reserved);
+  const slots = Math.max(3, Math.floor(available / 38));
+
+  if (hasPrev) pager.append(pageBtn("← Previous", offset - PAGE));
+  let prev = null;
+  for (const p of pageWindow(current, totalPages, slots)) {
+    if (prev !== null && p - prev > 1) { const s = document.createElement("span"); s.className = "dots"; s.textContent = "…"; pager.append(s); }
+    const b = document.createElement("button");
+    b.className = "plain" + (p === current ? " on" : "");
+    b.textContent = p;
+    if (p === current) b.disabled = true;
+    else b.onclick = () => { offset = (p - 1) * PAGE; runSearch(); window.scrollTo(0, 0); };
+    pager.append(b);
+    prev = p;
+  }
+  if (hasNext) pager.append(pageBtn("Next →", offset + PAGE));
+}
+
+let resizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => renderPager(lastTotal), 150);
+});
 
 async function post(action, body) {
   const r = await fetch("/api/" + action, {
@@ -141,6 +232,7 @@ async function refreshStatus() {
 
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
+for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });
 $("pauseBtn").onclick = async () => {
   await post($("pauseBtn").dataset.paused ? "resume" : "pause"); refreshStatus();
 };
@@ -151,10 +243,10 @@ $("reindexBtn").onclick = async () => {
 };
 
 const init = new URLSearchParams(location.search);
-for (const k of ["q", "path", "ext", "after", "before"]) if (init.get(k)) $(k).value = init.get(k);
+for (const k of ["q", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
 $("names").checked = init.get("names") === "1";
 offset = +(init.get("offset") || 0);
-if (init.get("q")) runSearch();
+if (init.get("q") || hasMediaFilter()) runSearch();
 refreshStatus(); setInterval(refreshStatus, 5000);
 </script>
 </body>

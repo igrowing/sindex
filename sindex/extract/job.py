@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from .. import textnorm
 from ..config import Config
 from ..throttle import Stopped, Throttle
-from . import Context, ExtractError, NotText, extract
+from . import Context, ExtractError, MediaFields, NotText, extract
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ class Result:
     error: str | None = None
     encoding: str | None = None
     recycle: bool = False  # this process should be replaced before it takes another file
+    media: MediaFields | None = None  # set for image/video kinds on a successful header parse
 
 
 def run_job(task: Task, cfg: Config, throttle: Throttle) -> Iterator[Chunk | Result]:
@@ -59,7 +60,7 @@ def run_job(task: Task, cfg: Config, throttle: Throttle) -> Iterator[Chunk | Res
                 info["truncated"] = True
                 break
         if seq == 0:
-            status = "empty"
+            status = "ok" if ctx.media is not None else "empty"
         elif info.get("truncated"):
             status = "truncated"
     except NotText:
@@ -78,4 +79,4 @@ def run_job(task: Task, cfg: Config, throttle: Throttle) -> Iterator[Chunk | Res
     finally:
         if pieces is not None:
             pieces.close()
-    yield Result(task.job, status, error, ctx.encoding, recycle)
+    yield Result(task.job, status, error, ctx.encoding, recycle, ctx.media)

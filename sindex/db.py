@@ -7,6 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .extract import MediaFields
 from .textnorm import BIGRAM_SEP, RUN_END, RUN_START
 from .usn import is_local_folder
 
@@ -23,6 +24,9 @@ PRIORITY_FORCED = 1
 # before the slower formats (PDF, Office, RTF); both stay well short of STAGE_META.
 PRIORITY_TEXT_EASY = PRIORITY[STAGE_TEXT]
 PRIORITY_TEXT_HARD = PRIORITY_TEXT_EASY + 5
+# images/videos (STAGE_META): after easy text, before PDF/Office/RTF. PRIORITY[STAGE_META] (20) stays the
+# stage's nominal priority; media files use this instead, so they sit strictly between the two text tiers.
+PRIORITY_MEDIA = PRIORITY_TEXT_EASY + 2
 
 # A file's chunks live at rowids [file_id << CHUNK_BITS, (file_id + 1) << CHUNK_BITS).
 CHUNK_BITS = 16
@@ -150,6 +154,18 @@ def delete_chunks(conn: sqlite3.Connection, file_id: int, source: str | None = N
         conn.execute("DELETE FROM chunks WHERE rowid BETWEEN ? AND ?", (lo, hi))
     else:
         conn.execute("DELETE FROM chunks WHERE rowid BETWEEN ? AND ? AND source = ?", (lo, hi, source))
+
+
+def upsert_media(conn: sqlite3.Connection, file_id: int, fields: MediaFields) -> None:
+    conn.execute(
+        """INSERT INTO media (file_id, kind, width, height, duration_s, taken_at, camera, lat, lon, codec)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (file_id) DO UPDATE SET
+             kind = excluded.kind, width = excluded.width, height = excluded.height,
+             duration_s = excluded.duration_s, taken_at = excluded.taken_at, camera = excluded.camera,
+             lat = excluded.lat, lon = excluded.lon, codec = excluded.codec""",
+        (file_id, fields.kind, fields.width, fields.height, fields.duration_s, fields.taken_at,
+         fields.camera, fields.lat, fields.lon, fields.codec))
 
 
 def delete_file(conn: sqlite3.Connection, file_id: int) -> None:

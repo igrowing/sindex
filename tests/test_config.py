@@ -21,6 +21,12 @@ def test_presets_and_fresh_install_values_pass_validation():
         assert config.validate_changes(values) == values
 
 
+def test_media_metadata_defaults_off_and_validates():
+    assert config.Config().index_media_metadata is False
+    checked = config.validate_changes({"index_media_metadata": True, "max_media_mb": 200})
+    assert checked == {"index_media_metadata": True, "max_media_mb": 200}
+
+
 def test_fresh_install_starts_from_the_fresh_values(tmp_path):
     cfg = config.load(tmp_path)
 

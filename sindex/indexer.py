@@ -51,6 +51,7 @@ QUEUE_BATCH = 50  # queue rows looked at per round
 PROGRESS_EVERY = 1000  # log a progress line after this many indexed files
 STDIN_POLL_SECONDS = 1.0  # how often the supervisor's stdin pipe is checked
 MAX_CHUNKS = (1 << db.CHUNK_BITS) - 1  # chunks of one file: the rowid range reserved for it
+CHUNK_SOURCE = {db.STAGE_TEXT: "text", db.STAGE_META: "meta"}  # extraction stages this indexer processes
 
 
 @dataclass
@@ -74,6 +75,7 @@ class _Job:
     file_id: int  # also the job id: unique among the files in flight
     path: str
     kind: str
+    stage: str
     seq: int = 0  # chunks stored so far
 
 
@@ -216,8 +218,11 @@ class Indexer:
             log.info("maintenance requested: %s (runs when the queue is empty)", action)
         else:
             path = os.path.normpath(req["path"])
-            stage = db.STAGE_DIR if os.path.isdir(path) else db.STAGE_TEXT
-            db.enqueue(self.conn, path, stage, reason="force", priority=db.PRIORITY_FORCED)
+            if os.path.isdir(path):
+                stage, prio = db.STAGE_DIR, db.PRIORITY_FORCED
+            else:
+                stage, prio = scanner.queue_target(os.path.basename(path), self.cfg, force=True)
+            db.enqueue(self.conn, path, stage, reason="force", priority=prio)
             log.info("reindex requested: %s", path)
 
     def _retry_status(self, status: str) -> None:
@@ -229,7 +234,8 @@ class Indexer:
         count = 0
         while rows := cursor.fetchmany(500):
             for d, name in rows:
-                db.enqueue(self.conn, os.path.join(d, name), db.STAGE_TEXT, reason="force")
+                stage, prio = scanner.queue_target(name, self.cfg, force=True)
+                db.enqueue(self.conn, os.path.join(d, name), stage, reason="force", priority=prio)
             count += len(rows)
         log.info("retry requested: %d files with status %s", count, status)
 
@@ -392,6 +398,7 @@ class Indexer:
             "exclude_globs": sorted(g.lower() for g in c.exclude_globs),
             "index_hidden": c.index_hidden,
             "text_extensions": sorted(c.text_exts),
+            "index_media_metadata": c.index_media_metadata,
         }
 
     def _load_volumes(self) -> None:
@@ -480,8 +487,8 @@ class Indexer:
         if ch.is_dir:
             db.enqueue(self.conn, ch.path, db.STAGE_DIR, reason="usn")
         else:
-            priority = scanner.queue_priority(os.path.basename(ch.path), self.cfg)
-            db.enqueue(self.conn, ch.path, reason="usn", priority=priority)
+            stage, priority = scanner.queue_target(os.path.basename(ch.path), self.cfg)
+            db.enqueue(self.conn, ch.path, stage, reason="usn", priority=priority)
 
     def _poll_journals(self) -> bool:
         did = False
@@ -535,7 +542,7 @@ class Indexer:
         in_flight = {job.path for job in self.jobs.values()}
         did = False
         for path, stage, reason in rows:
-            if stage == db.STAGE_TEXT and path in in_flight:
+            if stage in (db.STAGE_TEXT, db.STAGE_META) and path in in_flight:
                 continue
             did = True
             self.throttle.checkpoint()
@@ -548,8 +555,8 @@ class Indexer:
                 self._status("scanning", path, force=True)
                 scanner.scan(self.conn, path, self.filter, self.throttle, force=reason == "force")
                 self._dequeue(path, stage)
-            elif stage == db.STAGE_TEXT:
-                self._start_file(path, force=reason == "force")
+            elif stage in (db.STAGE_TEXT, db.STAGE_META):
+                self._start_file(path, stage, force=reason == "force")
                 if self._should_recycle():
                     break
             else:
@@ -568,12 +575,12 @@ class Indexer:
     # runner, and its chunks are stored as they come back. Up to `extract_workers` files are in
     # flight, so the runner (not this process) is where the parsing time is spent.
 
-    def _start_file(self, path: str, *, force: bool) -> None:
+    def _start_file(self, path: str, stage: str, *, force: bool) -> None:
         self._status("indexing", path)
         self._begin()
-        extracted, job = self._prepare_file(path, force=force)
+        extracted, job = self._prepare_file(path, stage, force=force)
         if job is None:
-            self._file_done(path, extracted=extracted)
+            self._file_done(path, stage, extracted=extracted)
             return
         # tracked from here on, even while it waits for a free worker: its `files` row exists, so a
         # stop must remove it and nothing may commit it half done
@@ -608,18 +615,20 @@ class Indexer:
     def _on_message(self, msg: Chunk | Result) -> None:
         job = self.jobs[msg.job]
         if isinstance(msg, Chunk):
-            self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, ?, 'text')",
-                              ((job.file_id << db.CHUNK_BITS) + job.seq, msg.text))
+            self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, ?, ?)",
+                              ((job.file_id << db.CHUNK_BITS) + job.seq, msg.text, CHUNK_SOURCE[job.stage]))
             job.seq += 1
             self.batch_chars += len(msg.text)
             return
         del self.jobs[msg.job]
         self.conn.execute("UPDATE files SET status = ?, encoding = ?, error = ? WHERE id = ?",
                           (msg.status, msg.encoding, msg.error, job.file_id))
-        self._file_done(job.path, extracted=True)
+        if msg.media is not None:
+            db.upsert_media(self.conn, job.file_id, msg.media)
+        self._file_done(job.path, job.stage, extracted=True)
 
-    def _file_done(self, path: str, *, extracted: bool) -> None:
-        self._dequeue(path, db.STAGE_TEXT)
+    def _file_done(self, path: str, stage: str, *, extracted: bool) -> None:
+        self._dequeue(path, stage)
         self.dirty = True
         self.batch_files += 1
         if extracted:
@@ -635,7 +644,7 @@ class Indexer:
         log.info("progress: %d files indexed, %d files in queue (%.1f files/s)",
                  stats["total_files"], stats["queued"], rate)
 
-    def _prepare_file(self, path: str, *, force: bool) -> tuple[bool, _Job | None]:
+    def _prepare_file(self, path: str, stage: str, *, force: bool) -> tuple[bool, _Job | None]:
         """Decide what to do with a queued file and record it as being indexed. Runs inside a transaction.
 
         Returns whether the file's content is read, and the job that still has to extract its text
@@ -668,11 +677,11 @@ class Indexer:
                  status = 'indexing', encoding = NULL, error = NULL, indexed_at = excluded.indexed_at
                RETURNING id""",
             (d, name, st.st_size, st.st_mtime_ns, time.time())).fetchone()[0]
-        db.delete_chunks(conn, file_id)
+        db.delete_chunks(conn, file_id, source=CHUNK_SOURCE[stage])
         if st.st_size > max_bytes(kind, self.cfg):
             conn.execute("UPDATE files SET status = 'too_big' WHERE id = ?", (file_id,))
             return True, None
-        return True, _Job(file_id, path, kind)
+        return True, _Job(file_id, path, kind, stage)
 
 
 def _stop_on_stdin_eof(stop: threading.Event) -> None:

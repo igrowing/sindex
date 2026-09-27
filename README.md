@@ -9,6 +9,15 @@ It keeps CPU and memory use low, even if that makes indexing slower.
   `text_extensions` in `config.toml` (Settings shows all of it): take out what you do not want, add your own.
   An old `extra_text_extensions` entry is merged into it. Only text between XML tags is indexed, not attribute values.
   Files are matched by extension, so extension-less files such as `README` or `Makefile` are not indexed.
+- **Photos and videos (off by default):** camera make/model, GPS coordinates, the date taken, and free text
+  (title, description, keywords, author) from EXIF, XMP and IPTC in jpg/jpeg/png/tiff/webp/gif/bmp and RAW
+  cr2/nef/arw/dng, and from container tags in mp4/mov/m4v/mkv/webm/avi/wmv/3gp (via `pymediainfo`, which needs
+  `MediaInfo.dll`; the Windows wheel bundles it). Only headers are read, never pixels or video frames. Turn it on
+  with `index_media_metadata` in `config.toml`, or the *Index photo and video metadata* checkbox on the Settings
+  page's *What to index* tab; like the other rules there, turning it on makes the indexer rescan, so files that
+  were skipped before are picked up without a manual rebuild. The free text is searchable like any other file;
+  camera, GPS, resolution, duration and date taken are filters in the *Photos & videos* section of the search
+  page, which also works with no search words typed at all (browse by filter alone).
 - **Languages and encodings:** it detects BOMs, UTF-8/16, cp125x, KOI8-R, cp866, ISO-8859-x, Shift-JIS, EUC-JP,
   GB18030, Big5 and EUC-KR. Search ignores accents and case: Latin accents, Greek tonos, and Hebrew/Arabic vowel
   marks don't affect matching. CJK text is indexed as bigrams.
@@ -137,7 +146,9 @@ three; a tab with a rejected value is marked and opened. It covers:
   and may use the wildcards too (`env pem msi*`); it starts with a few binary and key/certificate extensions
   (`exe com bin dll msi* cer pem crt`). Saving a change to these rules makes the indexer rescan, so files that are
   excluded now leave the index and files that are allowed now enter it. An old `exclude_dir_names` entry in
-  `config.toml` is merged into the patterns.
+  `config.toml` is merged into the patterns. A separate checkbox, *Index photo and video metadata*, turns on the
+  EXIF/XMP/IPTC and container-tag reading described above, with its own *Skip media files larger than* limit; it
+  is one more rule that triggers a rescan when changed.
 - **Index storage:** where `index.db` is and how big it is. To move it, stop the service, move the `index.db*` files,
   set `db_dir` in `config.toml` and start the service. The folder must exist and be on a local fixed drive (SQLite's
   write-ahead log does not work on network shares); otherwise the indexer refuses to start and says why in its status.

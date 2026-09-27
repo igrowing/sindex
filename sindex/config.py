@@ -44,6 +44,10 @@ OFFICE_EXTS = frozenset("""
 """.split())
 RTF_EXTS = frozenset({"rtf"})
 PDF_EXTS = frozenset({"pdf"})
+# Header-only metadata (Phase 2): EXIF/XMP/IPTC for images (cr2/nef/arw/dng are camera RAW, read as TIFF),
+# container tags for video. Never decoded past the header; see extract/image_meta.py and video_meta.py.
+IMAGE_EXTS = frozenset("jpg jpeg png tiff tif webp gif bmp cr2 nef arw dng".split())
+VIDEO_EXTS = frozenset("mp4 mov m4v mkv webm avi wmv 3gp".split())
 
 # Folder names that hold caches, trash and tool state: the start of exclude_globs in a new config
 DEFAULT_EXCLUDE_DIR_NAMES = [
@@ -70,6 +74,8 @@ class Config:
     max_pdf_mb: int = 100
     max_chars_per_file: int = 5_000_000
     chunk_chars: int = 16_000
+    index_media_metadata: bool = False  # EXIF/XMP/IPTC for photos, container tags for videos; header-only
+    max_media_mb: int = 4000  # size ceiling before the file is even opened; only the header is ever read
     # [throttle]
     # process-level politeness of the indexer (each about as costly as it sounds, see throttle.py)
     efficiency_mode: bool = True  # EcoQoS: Windows runs it on low-power settings ("Efficiency mode")
@@ -175,6 +181,7 @@ SPECS: dict[str, Spec] = {
     "max_text_mb": Spec(int, 1, 100_000), "max_office_mb": Spec(int, 1, 100_000),
     "max_pdf_mb": Spec(int, 1, 100_000), "max_chars_per_file": Spec(int, 1000, 2_000_000_000),
     "chunk_chars": Spec(int, 1000, 1_000_000),
+    "index_media_metadata": Spec(bool), "max_media_mb": Spec(int, 1, 100_000),
     "efficiency_mode": Spec(bool), "background_io": Spec(bool), "idle_priority": Spec(bool),
     "cpu_rate_percent": Spec(int, 0, 100), "memory_limit_mb": Spec(int, 64, 65_536, zero_ok=True),
     "duty_factor": Spec(float, 0, 10), "read_mb_per_sec": Spec(float, 0, 10_000),
@@ -356,6 +363,10 @@ max_pdf_mb = {max_pdf_mb}
 max_chars_per_file = {max_chars_per_file}
 # Text is stored in pieces of about this many characters.
 chunk_chars = {chunk_chars}
+# Read EXIF/XMP/IPTC from photos and container tags from videos (camera, date taken, GPS,
+# title/description/keywords, resolution, duration, codec). Only headers are read, never pixels or frames.
+index_media_metadata = {index_media_metadata}
+max_media_mb = {max_media_mb}
 
 [throttle]
 # How hard the indexer is held back. Each of these slows indexing down; lower/off = faster.

@@ -116,6 +116,7 @@
     <div id="f-roots"></div>
     <div id="f-text"></div>
     <div id="f-index"></div>
+    <div id="f-media"></div>
     <hr>
     <div id="f-skip"></div>
     <div class="pair"><div id="f-globs"></div><div id="f-exts"></div></div>
@@ -220,6 +221,11 @@ const GROUPS = {
   },
   "f-index": {
     index_hidden: ["Index hidden files and folders", ""],
+  },
+  "f-media": {
+    index_media_metadata: ["Index photo and video metadata",
+      "EXIF/XMP/IPTC from photos and container tags from videos (camera, date, GPS, title, resolution, duration). Never reads pixel or frame data."],
+    max_media_mb: ["Skip media files larger than (MB)", "Only the header is ever read regardless of file size; this is a safety ceiling."],
   },
   "f-skip": {
     exclude_paths: ["Folders to skip", "Tick the folders to leave out. Everything below them is skipped."],

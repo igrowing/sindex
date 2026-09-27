@@ -3,7 +3,7 @@
 import pytest
 
 from sindex.config import MARKUP_EXTS
-from sindex.extract import extract, kind_of
+from sindex.extract import extract, kind_of, max_bytes
 
 from .test_index_search import names, run_index
 
@@ -21,6 +21,27 @@ def test_indexed_as_text(cfg, ext):
 @pytest.mark.parametrize("ext", NOT_TEXT)
 def test_binary_formats_are_not_indexed(cfg, ext):
     assert kind_of(ext, cfg) is None
+
+
+@pytest.mark.parametrize("ext", ["jpg", "png", "cr2", "nef", "arw", "dng", "mp4", "mov"])
+def test_media_kinds_require_the_toggle(cfg, ext):
+    assert kind_of(ext, cfg) is None  # index_media_metadata defaults off
+    cfg.index_media_metadata = True
+    assert kind_of(ext, cfg) in ("image", "video")
+
+
+def test_media_kinds_still_respect_exclusions(cfg):
+    cfg.index_media_metadata = True
+    cfg.exclude_extensions = ["jpg"]
+    assert kind_of("jpg", cfg) is None
+    assert kind_of("png", cfg) == "image"
+
+
+def test_media_kinds_use_the_media_size_cap(cfg):
+    cfg.index_media_metadata = True
+    cfg.max_media_mb = 7
+    assert max_bytes("image", cfg) == 7 * 1024 * 1024
+    assert max_bytes("video", cfg) == 7 * 1024 * 1024
 
 
 def test_markup_extensions_are_all_indexed(cfg):

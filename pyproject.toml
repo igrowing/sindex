@@ -4,11 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sindex"
-version = "0.1.0"
+version = "0.2.0"
 description = "Low-footprint full-text indexing service for Windows"
 requires-python = ">=3.12"
 dependencies = [
     "charset-normalizer>=3.3",
+    "Pillow>=10.0",  # header-only EXIF/XMP/IPTC reads for image metadata; never calls .load()
+    "pymediainfo>=6.1",  # container tags for video metadata; needs MediaInfo.dll, bundled in the Windows wheel
     "pypdf[cryptodome]>=4.0",  # cryptodome: AES-encrypted PDFs (+1.6 MB RAM; the `crypto` extra costs +3.4 MB)
     "pywin32>=306",
 ]

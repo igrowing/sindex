@@ -8,13 +8,17 @@ answer within seconds, and a one-file build would first unpack itself into a tem
 """
 
 import importlib.metadata
+import logging
 from pathlib import Path
 
 import PyInstaller.__main__
 
+log = logging.getLogger(__name__)
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BUILD_DIR = ROOT / "build"
+ICON = HERE / "sindex.ico"  # optional; see README's "Windows executable" section for format/size
 
 # version lives only in pyproject.toml (see AGENTS.md); read it the same way the app does at runtime
 _version = importlib.metadata.version("sindex")
@@ -40,11 +44,11 @@ VSVersionInfo(
         StringTable(
           "040904B0",
           [
-            StringStruct("CompanyName", "iGrowing"),
+            StringStruct("CompanyName", "SimplyTools"),
             StringStruct("FileDescription", "sindex content indexer"),
             StringStruct("FileVersion", "{_version}"),
             StringStruct("InternalName", "sindex"),
-            StringStruct("LegalCopyright", "Copyright (c) iGrowing"),
+            StringStruct("LegalCopyright", "SimplyTools"),
             StringStruct("OriginalFilename", "sindex.exe"),
             StringStruct("ProductName", "sindex"),
             StringStruct("ProductVersion", "{_version}"),
@@ -61,6 +65,9 @@ BUILD_DIR.mkdir(exist_ok=True)
 _version_info_path = BUILD_DIR / "version_info.txt"
 _version_info_path.write_text(_VERSION_INFO, encoding="utf-8")
 
+if not ICON.exists():
+    log.warning("no icon at %s; sindex.exe will use PyInstaller's default icon", ICON)
+
 PyInstaller.__main__.run([
     str(HERE / "sindex_exe.py"),
     "--name", "sindex",
@@ -70,6 +77,7 @@ PyInstaller.__main__.run([
     "--specpath", str(BUILD_DIR),
     "--paths", str(ROOT),
     "--version-file", str(_version_info_path),
+    *(["--icon", str(ICON)] if ICON.exists() else []),
     # the web UI is read from files next to the code
     "--add-data", f"{ROOT / 'sindex' / 'web' / 'static'};sindex/web/static",
     # importlib.metadata.version("sindex") needs the package metadata
