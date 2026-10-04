@@ -57,7 +57,21 @@ start http://127.0.0.1:8765/
 
 `sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
 (`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over
-plain HTTP, not HTTPS.
+plain HTTP, not HTTPS. It also wires up three more ways to reach the same search without opening that shortcut:
+
+- **Folder and drive right-click menu:** "Search contents with sindex" on any folder, folder background or drive
+  opens the web UI scoped to that folder (`sindex ui <path>` behind the scenes). On Windows 11 this classic verb
+  lives under "Show more options" (or Shift+right-click) rather than the top-level menu.
+- **Explorer address bar and Win+R:** typing `sindex` followed by words (for example `sindex overdue invoice`)
+  opens the web UI already running that search. This works through the same "App Paths" registry mechanism that
+  lets you type `notepad` or `calc`; typing an actual subcommand name (`sindex status`, `sindex install`, ...)
+  still runs that subcommand instead, exactly as it would in a console.
+- **Explorer search connector:** a "sindex search.searchConnector-ms" file is placed in the installing user's
+  `%USERPROFILE%\Searches` folder. Opening it once adds sindex as a saved search in Explorer's navigation pane;
+  typing in Explorer's search box while it is selected returns real file results (icon, preview, double-click to
+  open) from `/api/search.rss`, an RSS feed generated from the same query language as the web UI's search box.
+
+`sindex remove` undoes all three.
 
 The service keeps its data in `%ProgramData%\sindex`:
 

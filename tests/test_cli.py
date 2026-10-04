@@ -1,4 +1,11 @@
 import re
+import sys
+import uuid
+import winreg
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
 
 from sindex import cli, db
 
@@ -50,3 +57,111 @@ def test_shortcut_folders_are_the_all_users_desktop_and_start_menu(monkeypatch, 
 
     assert desktop == tmp_path / "Public" / "Desktop"
     assert menu == tmp_path / "PD" / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+
+
+def test_context_menu_entries_cover_folder_background_and_drive():
+    exe = Path(r"C:\Program Files\sindex\sindex.exe")
+
+    entries = cli.context_menu_entries(exe)
+
+    assert entries == {
+        "Directory\\shell\\sindex": '"C:\\Program Files\\sindex\\sindex.exe" ui "%1"',
+        "Directory\\Background\\shell\\sindex": '"C:\\Program Files\\sindex\\sindex.exe" ui "%V"',
+        "Drive\\shell\\sindex": '"C:\\Program Files\\sindex\\sindex.exe" ui "%1"',
+    }
+
+
+def test_register_and_remove_context_menu_round_trip():
+    # a private sandbox under HKEY_CURRENT_USER: writing the real Directory/Drive classes here would
+    # actually change the developer's own Explorer right-click menu
+    base = f"Software\\sindex-test-{uuid.uuid4().hex}"
+    exe = Path(r"C:\Program Files\sindex\sindex.exe")
+
+    cli.register_context_menu(exe, root=winreg.HKEY_CURRENT_USER, base=base)
+    try:
+        for subkey, command in cli.context_menu_entries(exe).items():
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{base}\\{subkey}") as key:
+                assert winreg.QueryValueEx(key, None)[0] == cli.CONTEXT_MENU_TEXT
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{base}\\{subkey}\\command") as key:
+                assert winreg.QueryValueEx(key, None)[0] == command
+    finally:
+        cli.remove_context_menu(root=winreg.HKEY_CURRENT_USER, base=base)
+
+    for subkey in cli.context_menu_entries(exe):
+        with pytest.raises(FileNotFoundError):
+            winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{base}\\{subkey}")
+    cli.remove_context_menu(root=winreg.HKEY_CURRENT_USER, base=base)  # already gone: not an error
+
+
+def test_register_and_remove_app_path_round_trip():
+    key = f"Software\\sindex-test-{uuid.uuid4().hex}\\App Paths\\sindex.exe"
+    exe = Path(r"C:\Program Files\sindex\sindex.exe")
+
+    cli.register_app_path(exe, root=winreg.HKEY_CURRENT_USER, key=key)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+        assert winreg.QueryValueEx(k, None)[0] == str(exe)
+        assert winreg.QueryValueEx(k, "Path")[0] == str(exe.parent)
+
+    cli.remove_app_path(root=winreg.HKEY_CURRENT_USER, key=key)
+    with pytest.raises(FileNotFoundError):
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, key)
+    cli.remove_app_path(root=winreg.HKEY_CURRENT_USER, key=key)  # already gone: not an error
+
+
+def test_cli_exe_path_is_the_program_files_copy_when_frozen(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+
+    assert cli._cli_exe_path() == Path(r"C:\Program Files\sindex\sindex.exe")
+
+
+def test_cli_exe_path_is_the_venv_console_script_otherwise(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+
+    assert cli._cli_exe_path() == Path(sys.prefix) / "Scripts" / "sindex.exe"
+
+
+def test_ui_command_opens_the_browser_scoped_to_a_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("SINDEX_HOME", str(tmp_path / "data"))
+    opened = []
+    monkeypatch.setattr("webbrowser.open", opened.append)
+
+    code = cli.main(["ui", str(tmp_path)])
+
+    assert code == 0
+    assert len(opened) == 1
+    url = urlsplit(opened[0])
+    assert url.path == "/"
+    assert parse_qs(url.query)["path"] == [str(tmp_path)]
+
+
+def test_ui_command_with_a_query(tmp_path, monkeypatch):
+    monkeypatch.setenv("SINDEX_HOME", str(tmp_path / "data"))
+    opened = []
+    monkeypatch.setattr("webbrowser.open", opened.append)
+
+    cli.main(["ui", "--query", "invoice 2024"])
+
+    assert parse_qs(urlsplit(opened[0]).query)["q"] == ["invoice 2024"]
+
+
+def test_unknown_subcommand_falls_back_to_a_ui_query(tmp_path, monkeypatch):
+    # typed in the Explorer address bar or Win+R: `sindex` resolves through App Paths and whatever
+    # followed it arrives here as plain argv, with no subcommand of its own (see register_app_path)
+    monkeypatch.setenv("SINDEX_HOME", str(tmp_path / "data"))
+    opened = []
+    monkeypatch.setattr("webbrowser.open", opened.append)
+
+    code = cli.main(["overdue", "invoice"])
+
+    assert code == 0
+    assert len(opened) == 1
+    assert parse_qs(urlsplit(opened[0]).query)["q"] == ["overdue invoice"]
+
+
+def test_a_real_subcommand_name_is_not_treated_as_a_query(tmp_path, monkeypatch):
+    monkeypatch.setenv("SINDEX_HOME", str(tmp_path / "data"))
+
+    code = cli.main(["status"])  # exercises cmd_status, not the ui fallback
+
+    assert code == 0

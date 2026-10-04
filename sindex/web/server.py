@@ -10,11 +10,15 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import re
 import sqlite3
 import threading
+from datetime import UTC, datetime
+from html import unescape as html_unescape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
+from xml.sax.saxutils import escape as xml_escape
 
 from .. import config, control, db
 from ..config import Config
@@ -26,6 +30,8 @@ STATIC = Path(__file__).with_name("static")
 PAGES = {"/": "index.html", "/settings": "settings.html", "/log": "log.html"}
 MAX_BODY = 64 * 1024
 HEALTH_PAGE = 50  # files per page of the health list
+RSS_PAGE = 20  # default number of items per page of the Explorer search connector's RSS feed
+RSS_PAGE_MAX = 100
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -85,6 +91,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._search(q)
         if url.path == "/api/status":
             return self._status()
+        if url.path == "/opensearch.xml":
+            return self._opensearch()
+        if url.path == "/api/search.rss":
+            return self._search_rss(q)
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
@@ -219,6 +229,62 @@ class _Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         self._json(data)
+
+    def _opensearch(self) -> None:
+        # the OpenSearch description Explorer reads from the .searchConnector-ms file (see
+        # cli.create_search_connector); it points Explorer's search box at _search_rss below
+        cfg = self.server.cfg
+        base = f"http://{cfg.web_host}:{cfg.web_port}"
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">\n'
+            "  <ShortName>sindex</ShortName>\n"
+            "  <Description>Search file contents indexed by sindex</Description>\n"
+            f'  <Url type="application/rss+xml" template="{base}/api/search.rss?'
+            'q={searchTerms}&amp;count={count?}&amp;startIndex={startIndex?}"/>\n'
+            "</OpenSearchDescription>\n"
+        )
+        self._send(200, body.encode("utf-8"), "application/opensearchdescription+xml; charset=utf-8")
+
+    def _rss_item(self, r: dict) -> str:
+        link = "file:///" + quote(r["path"].replace("\\", "/"), safe="/:")
+        snippet = re.sub(r"</?mark>", "", html_unescape(r["snippet"])) if r["snippet"] else ""
+        modified = datetime.fromtimestamp(r["mtime"], tz=UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        return (
+            f"<item><title>{xml_escape(r['name'])}</title><link>{link}</link>"
+            f"<description>{xml_escape(snippet)}</description>"
+            f"<A:DateModified>{modified}</A:DateModified><A:Size>{r['size']}</A:Size></item>"
+        )
+
+    def _search_rss(self, q: dict) -> None:
+        # results for the Explorer search connector, as an RSS feed of file:// links Explorer can open,
+        # preview and right-click like any other file; see _opensearch above for the query template
+        conn = self._connect()
+        try:
+            start = max(1, int(q.get("startIndex") or 1))
+            count = max(1, min(int(q.get("count") or RSS_PAGE), RSS_PAGE_MAX))
+        except ValueError as e:
+            return self._send(400, f"bad startIndex/count: {e}".encode(), "text/plain")
+        results: list[dict] = []
+        total = 0
+        if conn is not None:
+            try:
+                result = search(conn, q.get("q", ""), offset=start - 1, limit=count)
+            finally:
+                conn.close()
+            results, total = result["results"], result["total"]
+        items = "".join(self._rss_item(r) for r in results)
+        ns = 'xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"'
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<rss version="2.0" xmlns:A="http://schemas.microsoft.com/windows/2008/propertynamespace" {ns}>\n'
+            "<channel><title>sindex search</title>"
+            f"<opensearch:totalResults>{total}</opensearch:totalResults>"
+            f"<opensearch:startIndex>{start}</opensearch:startIndex>"
+            f"<opensearch:itemsPerPage>{count}</opensearch:itemsPerPage>"
+            f"{items}</channel></rss>\n"
+        )
+        self._send(200, body.encode("utf-8"), "application/rss+xml; charset=utf-8")
 
 
 class _Server(HTTPServer):

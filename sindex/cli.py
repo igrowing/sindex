@@ -14,13 +14,25 @@ import sys
 import threading
 from ctypes import wintypes
 from pathlib import Path
+from urllib.parse import urlencode
 
 from . import config, control, db
 from .search import search
 
 SERVICE_DIR_NAME = "sindex-service"
 SHORTCUT_NAME = "sindex search.url"
+SEARCH_CONNECTOR_NAME = "sindex search.searchConnector-ms"
 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
+
+# Explorer's folder/drive right-click verb (see register_context_menu). %1 is the clicked item's own path
+# (a folder or a drive); %V is the folder currently open, used for the background of a folder window.
+CONTEXT_MENU_VERB = "sindex"
+CONTEXT_MENU_TEXT = "Search contents with sindex"
+CONTEXT_MENU_CLASSES = {"Directory": "%1", "Directory\\Background": "%V", "Drive": "%1"}
+
+# "sindex.exe" under here lets Explorer's address bar and the Win+R box resolve a bare `sindex` to this
+# program, the same way `notepad` or `calc` resolve without being on PATH.
+APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\sindex.exe"
 
 
 def _cfg(args) -> config.Config:
@@ -114,6 +126,28 @@ def cmd_reindex(args) -> int:
     return 0
 
 
+def cmd_ui(args) -> int:
+    """Open the web UI in the default browser: scoped to a folder, or already running a query.
+
+    This is what the folder/drive right-click verb runs (`--path`, see register_context_menu) and what a
+    bare `sindex <words>` falls back to when typed in the Explorer address bar or the Win+R box, through
+    the App Paths registration (see register_app_path and the argv rewrite in main()).
+    """
+    import webbrowser
+
+    cfg = _cfg(args)
+    params = {}
+    if args.path:
+        params["path"] = os.path.abspath(args.path)
+    if args.query:
+        params["q"] = args.query
+    url = f"http://{cfg.web_host}:{cfg.web_port}/"
+    if params:
+        url += "?" + urlencode(params)
+    webbrowser.open(url)
+    return 0
+
+
 # ---- service management ---------------------------------------------------
 
 def _is_admin() -> bool:
@@ -169,6 +203,99 @@ def remove_shortcuts(dirs: list[Path]) -> None:
         (folder / SHORTCUT_NAME).unlink(missing_ok=True)
 
 
+def _cli_exe_path() -> Path:
+    """Where this CLI can be relaunched from once installed, for the context menu and App Paths entries."""
+    from . import service
+
+    if service.frozen():
+        return service.program_dir() / "sindex.exe"
+    return Path(sys.prefix) / "Scripts" / "sindex.exe"
+
+
+def context_menu_entries(exe: Path) -> dict[str, str]:
+    """Registry subkey (under ...\\shell\\sindex, itself under a class in CONTEXT_MENU_CLASSES) -> command."""
+    return {f"{cls}\\shell\\{CONTEXT_MENU_VERB}": f'"{exe}" ui "{placeholder}"'
+            for cls, placeholder in CONTEXT_MENU_CLASSES.items()}
+
+
+def register_context_menu(exe: Path, *, root=None, base: str = r"SOFTWARE\Classes") -> None:
+    """Add "Search contents with sindex" to the folder, folder-background and drive right-click menus.
+
+    `root` (default HKEY_LOCAL_MACHINE, machine-wide like the service itself) and `base` are overridable so
+    tests can point this at a private sandbox instead of the real Explorer menus.
+    """
+    import winreg
+
+    root = winreg.HKEY_LOCAL_MACHINE if root is None else root
+    for subkey, command in context_menu_entries(exe).items():
+        with winreg.CreateKeyEx(root, f"{base}\\{subkey}", 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, None, 0, winreg.REG_SZ, CONTEXT_MENU_TEXT)
+            winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, f'"{exe}",0')
+        with winreg.CreateKeyEx(root, f"{base}\\{subkey}\\command", 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, None, 0, winreg.REG_SZ, command)
+
+
+def remove_context_menu(*, root=None, base: str = r"SOFTWARE\Classes") -> None:
+    import winreg
+
+    root = winreg.HKEY_LOCAL_MACHINE if root is None else root
+    for subkey in context_menu_entries(Path()):  # the command text does not matter for deletion
+        for key in (f"{base}\\{subkey}\\command", f"{base}\\{subkey}"):
+            try:
+                winreg.DeleteKey(root, key)
+            except FileNotFoundError:
+                pass
+
+
+def register_app_path(exe: Path, *, root=None, key: str = APP_PATHS_KEY) -> None:
+    """Let Explorer's address bar and Win+R resolve a bare `sindex` to `exe` (see App Paths in cli.py)."""
+    import winreg
+
+    root = winreg.HKEY_LOCAL_MACHINE if root is None else root
+    with winreg.CreateKeyEx(root, key, 0, winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, str(exe))
+        winreg.SetValueEx(k, "Path", 0, winreg.REG_SZ, str(exe.parent))
+
+
+def remove_app_path(*, root=None, key: str = APP_PATHS_KEY) -> None:
+    import winreg
+
+    root = winreg.HKEY_LOCAL_MACHINE if root is None else root
+    try:
+        winreg.DeleteKey(root, key)
+    except FileNotFoundError:
+        pass
+
+
+def _search_connector_dir() -> Path | None:
+    """The installing user's Searches folder, or None when there is no profile to put it in."""
+    profile = os.environ.get("USERPROFILE")
+    return Path(profile) / "Searches" if profile else None
+
+
+def create_search_connector(opensearch_url: str, folder: Path) -> Path:
+    """A .searchConnector-ms file so Explorer lists sindex as a saved search in the navigation pane."""
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / SEARCH_CONNECTOR_NAME
+    target.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<searchConnectorDescription xmlns="http://schemas.microsoft.com/windows/2009/searchConnector">\n'
+        "  <description>Search file contents indexed by sindex</description>\n"
+        "  <isSearchOnlyItem>false</isSearchOnlyItem>\n"
+        "  <includeInStartMenu>false</includeInStartMenu>\n"
+        "  <iconReference>%SystemRoot%\\System32\\imageres.dll,-1002</iconReference>\n"
+        "  <simpleLocation>\n"
+        f"    <url>{opensearch_url}</url>\n"
+        "  </simpleLocation>\n"
+        "</searchConnectorDescription>\n",
+        encoding="utf-8")
+    return target
+
+
+def remove_search_connector(folder: Path) -> None:
+    (folder / SEARCH_CONNECTOR_NAME).unlink(missing_ok=True)
+
+
 def _relaunch_elevated(params: list[str]) -> int:
     """Run this executable again with the given arguments after a UAC prompt, in a window of its own."""
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -214,8 +341,16 @@ def _install_service(*, start: bool) -> int:
             winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [f"PYTHONPATH={service.PROJECT_ROOT}"])
         print(f"installed service '{service.SERVICE_NAME}' (host: {exe})")
     url = f"http://{cfg.web_host}:{cfg.web_port}/"
+    exe = _cli_exe_path()
+    register_context_menu(exe)
+    register_app_path(exe)
+    print('added "Search contents with sindex" to the folder/drive right-click menu (Windows 11: under '
+          '"Show more options") and registered `sindex` for the Explorer address bar and Win+R')
     for shortcut in create_shortcuts(url, _shortcut_dirs()):
         print(f"created shortcut {shortcut}")
+    if (searches := _search_connector_dir()) is not None:
+        connector = create_search_connector(f"{url}opensearch.xml", searches)
+        print(f"created search connector {connector}")
     if start:
         try:
             win32serviceutil.StartService(service.SERVICE_NAME)
@@ -283,6 +418,10 @@ def cmd_remove(args) -> int:
         print(f"note: could not stop the service first ({e.strerror}); removing it anyway")
     win32serviceutil.RemoveService(SERVICE_NAME)
     remove_shortcuts(_shortcut_dirs())
+    remove_context_menu()
+    remove_app_path()
+    if (searches := _search_connector_dir()) is not None:
+        remove_search_connector(searches)
     print("removed")
     return 0
 
@@ -333,6 +472,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("reindex", help="re-extract files or folders")
     p.add_argument("paths", nargs="+")
     p.set_defaults(func=cmd_reindex)
+    p = sub.add_parser("ui", help="open the web UI in the browser (folder context menu / address-bar fallback)")
+    p.add_argument("path", nargs="?", help="folder to scope the search to")
+    p.add_argument("--query", help="search words to run at once")
+    p.set_defaults(func=cmd_ui)
     p = sub.add_parser("install", help="install the Windows service (admin)")
     p.add_argument("--start", action="store_true", help="start the service after installing it")
     p.add_argument("--wait", action="store_true", help="wait for Enter at the end (for a window that closes)")
@@ -348,6 +491,11 @@ def main(argv: list[str] | None = None) -> int:
             argv = ["install", "--start", "--wait"]  # the executable was opened by a double click: install it
     if argv and argv[0] in INTERNAL_COMMANDS:  # run by Windows or by the service, not typed: not in --help
         return INTERNAL_COMMANDS[argv[0]](argparse.Namespace(rest=argv[1:]))
+    if argv and not argv[0].startswith("-") and argv[0] not in sub.choices:
+        # not a known subcommand: typed as a query in the Explorer address bar or Win+R (see
+        # register_app_path), where whatever follows "sindex" arrives here as plain argv with no way to
+        # mark it as a query. A real typo of a subcommand name falls into this too; --help lists them.
+        argv = ["ui", "--query", " ".join(argv)]
     args = ap.parse_args(argv)
     return args.func(args)
 
