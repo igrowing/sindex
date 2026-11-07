@@ -164,3 +164,43 @@ def test_an_exclusion_next_to_a_word_also_drops_the_words_found_inside_others(ky
 def test_an_exclusion_alone_needs_the_scan(kyo):
     # the Explorer connector goes without the scan and has no way to answer "everything but"
     assert results(kyo, "-kyo", contains=False)["error"] == "Type some words to search for."
+
+
+@pytest.fixture
+def punct(cfg, tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    for name, text in {
+        "url.txt": "see http://www.nasdaq.com/symbol/kyo for the quote",
+        "paren.txt": "the code beegee-tokyo) was listed",
+        "word.txt": "plain kyo) at the end",
+        "cpp.txt": "I write c++ every day",
+        "c.txt": "the c language is old",
+        "cafe.txt": "un café (noir) s'il vous plaît",
+        "cafe2.txt": "un café au lait",
+    }.items():
+        (root / name).write_text(text, encoding="utf-8")
+    run_index(cfg, root)
+    return cfg
+
+
+def test_punctuation_in_the_query_must_be_in_the_text(punct):
+    # the word index drops the ")" and would find the URL that ends in the word kyo
+    assert names(punct, "kyo)") == {"paren.txt", "word.txt"}
+    assert names(punct, "c++") == {"cpp.txt"}  # not every file that has the letter c
+
+
+def test_punctuation_is_found_inside_other_words_too(punct):
+    assert names(punct, "tokyo)") == {"paren.txt"}
+    assert names(punct, "okyo)") == {"paren.txt"}
+
+
+def test_a_word_without_punctuation_still_ignores_accents_next_to_a_punctuated_one(punct):
+    assert names(punct, "cafe (noir") == {"cafe.txt"}
+    assert names(punct, "cafe") == {"cafe.txt", "cafe2.txt"}
+
+
+def test_punctuation_hits_get_a_snippet_around_the_text_that_matched(punct):
+    by_name = {r["name"]: r for r in results(punct, "kyo)")["results"]}
+
+    assert "<mark>kyo)</mark>" in by_name["word.txt"]["snippet"]

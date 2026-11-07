@@ -148,6 +148,15 @@ def _user_regex(pattern: str, *, case_sensitive: bool, multiline: bool) -> regex
         raise ValueError(f"Invalid regular expression: {e}") from e
 
 
+def _has_punctuation(text: str) -> bool:
+    """Whether a term holds a character the word index throws away (anything but letters, digits, marks, wildcards).
+
+    The index would find the bare words of "kyo)" or "c++", so what it returns has to be checked against the text.
+    """
+    return any(unicodedata.category(ch)[0] not in "LNM" and not ch.isspace() and ch not in "*?"
+               for ch in textnorm.fold(text))
+
+
 def _term_pattern(text: str) -> str:
     """Regular expression for one query term: the letters as typed, `*` any word characters, `?` one."""
     out: list[str] = []
@@ -179,9 +188,15 @@ class _ChunkMatcher:
 
     @classmethod
     def for_terms(cls, groups: list[list[tuple[str, bool]]], negatives: list[str], *,
-                  case_sensitive: bool) -> _ChunkMatcher:
+                  case_sensitive: bool, only_punctuated: bool = False) -> _ChunkMatcher:
+        """`only_punctuated` leaves the other terms unchecked (they match anything): it is the second look at what
+        the word index found, which already compared those without case and accents."""
         flags = 0 if case_sensitive else regex.IGNORECASE
-        return cls([[regex.compile(_term_pattern(text), flags) for text, _ in group] for group in groups],
+
+        def pattern(text: str) -> regex.Pattern[str]:
+            return regex.compile("" if only_punctuated and not _has_punctuation(text) else _term_pattern(text), flags)
+
+        return cls([[pattern(text) for text, _ in group] for group in groups],
                    [regex.compile(_term_pattern(text), flags) for text in negatives])
 
     @staticmethod
@@ -353,6 +368,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
     hits: dict[int, int] = {}
     indexed: set[int] = set()  # the rowids in `best` that the word index found, so snippet() can show them
     capped = False
+    literal = False  # the word index's answer has to be checked against the text (see below)
 
     if not has_query:
         if not media_where:
@@ -401,6 +417,11 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_chunk", 1, matcher, deterministic=True)
         conn.create_function("sindex_clean", 1, matcher.lacks_negatives, deterministic=True)
+        # what the index found for a term with punctuation is only a guess: "kyo)" is the word kyo to it
+        literal = not regex and any(_has_punctuation(text) for g in groups for text, _ in g)
+        if literal:
+            conn.create_function("sindex_literal", 1, _ChunkMatcher.for_terms(
+                groups, negatives, case_sensitive=case_sensitive, only_punctuated=True), deterministic=True)
         seen: set[int] = set()
 
         def add(rowid: int, *, from_index: bool) -> None:
@@ -423,6 +444,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             # the word index cannot tell "kyo" from "tokyo", so what it found is checked against the exclusions
             # on the stored text; the same text keeps the letters as they were written for case sensitivity
             exact = (["sindex_chunk(chunks.body)"] if case_sensitive
+                     else ["sindex_literal(chunks.body)"] if literal
                      else ["sindex_clean(chunks.body)"] if negatives else [])
             sql = (f"SELECT chunks.rowid {chunk_join} "
                    f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where, *exact])} ORDER BY rank LIMIT ?")
@@ -494,7 +516,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             continue
         snippet = ""
         if rowid is not None:
-            if rowid in indexed and not case_sensitive:
+            if rowid in indexed and not case_sensitive and not literal:
                 row = conn.execute(
                     f"SELECT snippet(chunks, 0, ?, ?, '…', {SNIPPET_TOKENS}) FROM chunks "
                     "WHERE chunks MATCH ? AND rowid = ?",

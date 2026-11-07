@@ -66,6 +66,10 @@ the search box shows that one is running. A search has three steps, in this orde
    up to about 8 s for a complicated regular expression, growing in step with the index;
 3. folder and file names, only if the names box is ticked.
 
+Punctuation in a word is part of the search: `kyo)` finds only text that has those four characters, and `c++` does
+not find every `c`. (The word index itself throws punctuation away, so what it finds for such a word is checked
+against the stored text.) To search for a `*` or `?` itself, tick Use RegEx and write `\*` or `\?`.
+
 An exclusion (`-kyo`) drops every file whose text has the term, also inside other words (`tokyo`, `kyoto`), and
 `-kyo` alone lists the files with indexed text that do not have it, newest first, without snippets (the names box
 also excludes files with it in their path). Files without indexed text (binary, too big, failed) are left out of
