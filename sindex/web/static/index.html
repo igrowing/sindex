@@ -171,7 +171,7 @@ async function runSearch() {
       <div class="meta">
         <span>${fmtSize(r.size)}</span><span>${fmtDate(r.mtime)}</span>
         ${r.status !== "ok" ? `<span>${esc(r.status)}</span>` : ""}
-        ${r.hits === 0 ? `<span>folder or file name match</span>` : ""}
+        ${r.hits === 0 && !res.negative_only ? `<span>folder or file name match</span>` : ""}
         <button class="plain" data-open="${i}" title="Open in its associated app (only while sindex runs in your own session)">Open</button>
         <button class="plain" data-copy="${i}" data-what="path">Copy path</button>
         <button class="plain" data-copy="${i}" data-what="dir">Copy folder</button>

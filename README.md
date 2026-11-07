@@ -66,6 +66,11 @@ the search box shows that one is running. A search has three steps, in this orde
    up to about 8 s for a complicated regular expression, growing in step with the index;
 3. folder and file names, only if the names box is ticked.
 
+An exclusion (`-kyo`) drops every file whose text has the term, also inside other words (`tokyo`, `kyoto`), and
+`-kyo` alone lists the files with indexed text that do not have it, newest first, without snippets (the names box
+also excludes files with it in their path). Files without indexed text (binary, too big, failed) are left out of
+that list, because it is not known what they contain.
+
 Three independent checkboxes sit under the search box: **Also in folder- and file-names**, **Use RegEx** and **Case
 sensitive** (`sindex search --names --regex --case` on the command line). Names adds the folder and file names to the
 search. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`).

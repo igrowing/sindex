@@ -118,3 +118,49 @@ def test_total_and_capping_count_files(kyo, monkeypatch):
     res = results(kyo, "kyo")
 
     assert res["capped"] and res["total"] == 4
+
+
+NO_KYO = {"a7.txt", "a8.txt", "kyo_name.txt"}  # the files whose text has no "kyo" in it, in any case or word
+
+
+def test_an_exclusion_alone_lists_the_files_without_it(kyo):
+    assert names(kyo, "-kyo") == NO_KYO  # not "Type some words": tokyo, kyoto and Kyo are excluded too
+    assert results(kyo, "-kyo")["error"] is None
+
+
+def test_an_exclusion_alone_can_have_several_terms(kyo):
+    assert names(kyo, "-kyo -cafe") == {"a8.txt", "kyo_name.txt"}
+
+
+def test_an_exclusion_alone_with_case_sensitive_excludes_only_the_exact_letters(kyo):
+    # "kyo" is inside a1, a4, a5 and "Tokyo" (a6); KYO and Kyo are different letters
+    assert names(kyo, "-kyo", case_sensitive=True) == NO_KYO | {"a2.txt", "a3.txt"}
+
+
+def test_an_exclusion_alone_also_excludes_names_when_asked(kyo):
+    assert names(kyo, "-kyo", names=True) == {"a7.txt", "a8.txt"}  # kyo_name.txt has it in its name
+
+
+def test_an_exclusion_alone_marks_its_results_as_having_no_hit(kyo):
+    res = results(kyo, "-kyo")
+
+    assert res["negative_only"] is True
+    assert all(r["hits"] == 0 and r["snippet"] == "" for r in res["results"])
+    assert results(kyo, "kyo")["negative_only"] is False
+
+
+def test_an_exclusion_alone_respects_the_other_filters(kyo, tmp_path):
+    assert names(kyo, "-kyo", exts=["txt"], path=str(tmp_path / "docs")) == NO_KYO
+    assert names(kyo, "-kyo", path=str(tmp_path / "elsewhere")) == set()
+
+
+def test_an_exclusion_next_to_a_word_also_drops_the_words_found_inside_others(kyo):
+    # every file that has "visit" also has kyo, tokyo or kyoto
+    assert names(kyo, "-kyo visit") == set()
+    assert names(kyo, "visit -tokyo") == {"a1.txt", "a2.txt", "a3.txt", "a5.txt"}  # a6 says "Tokyo" but no "visit"
+    assert names(kyo, "-kyo visit", case_sensitive=True) == {"a2.txt", "a3.txt"}
+
+
+def test_an_exclusion_alone_needs_the_scan(kyo):
+    # the Explorer connector goes without the scan and has no way to answer "everything but"
+    assert results(kyo, "-kyo", contains=False)["error"] == "Type some words to search for."

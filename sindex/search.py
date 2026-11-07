@@ -198,6 +198,18 @@ class _ChunkMatcher:
             self.timed_out = True
             raise
 
+    def lacks_negatives(self, body: str) -> bool:
+        """True when none of the excluded terms is inside the chunk (words found inside words count)."""
+        text = textnorm.decode_display(body)
+        try:
+            return not any(self._search(p, text) for p in self.negatives)
+        except TimeoutError:
+            self.timed_out = True
+            raise
+
+    def has_negative(self, body: str) -> bool:
+        return not self.lacks_negatives(body)
+
     def snippet(self, body: str) -> str:
         """A piece of the chunk around the first hit, with the hits between highlight markers."""
         text = textnorm.decode_display(body)
@@ -296,6 +308,8 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
     """
     hit_limit = HIT_LIMIT  # read here so that a test can lower it
     groups, negatives = _parse(query)
+    # only exclusions ("-kyo"): every file whose text has none of them, which needs the scan to be known
+    negative_only = not regex and not groups and bool(negatives) and (contains or case_sensitive)
     matcher = rx_path = None
     if regex:
         try:
@@ -306,7 +320,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             return {"results": [], "total": 0, "capped": False, "error": str(e)}
         has_query, match = True, None
     else:
-        has_query = bool(groups)
+        has_query = bool(groups) or negative_only
         match = _to_match(groups, negatives)
         if has_query:
             matcher = _ChunkMatcher.for_terms(groups, negatives, case_sensitive=case_sensitive)
@@ -349,9 +363,44 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
         fids = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
         best = dict.fromkeys(fids)
         capped = len(fids) >= hit_limit
+    elif negative_only:
+        assert matcher is not None, "a query has a matcher"
+        conn.create_function("sindex_excluded", 1, matcher.has_negative, deterministic=True)
+        sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
+               f"WHERE {' AND '.join([*where, *media_where, 'sindex_excluded(chunks.body)'])}")
+        try:
+            excluded = {r[0] for r in conn.execute(sql, [*params, *media_params])}
+        except sqlite3.OperationalError:
+            if matcher.timed_out:
+                return {"results": [], "total": 0, "capped": False, "error": "A pattern took too long on some text."}
+            raise  # a cancelled or timed-out search, or a real error
+        if not case_sensitive and (words := _to_match([[(text, False)] for text in negatives], [])) is not None:
+            # the scan compares accents, the word index does not: "-cafe" must drop "café" as a plain search finds it
+            sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
+                   f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where])}")
+            excluded.update(r[0] for r in conn.execute(sql, [words, *params, *media_params]))
+        if names:
+            conn.create_function("sindex_key", 1, _name_key, deterministic=True)
+            cond, name_params = _name_condition([[(text, False)] for text in negatives], [],
+                                                case_sensitive=case_sensitive)
+            sql = f"SELECT f.id FROM files f {media_join} WHERE {' AND '.join([cond, *where, *media_where])}"
+            excluded.update(r[0] for r in conn.execute(sql, [*name_params, *params, *media_params]))
+        # files without indexed text (binary, too big, failed) are not "without kyo", they are unknown
+        sql = (f"SELECT f.id FROM files f {media_join} "
+               f"WHERE {' AND '.join(['f.status IN (?, ?)', *where, *media_where])} ORDER BY f.mtime_ns DESC")
+        fids = []
+        for (fid,) in conn.execute(sql, ["ok", "truncated", *params, *media_params]):
+            if fid in excluded:
+                continue
+            if len(fids) == hit_limit:
+                capped = True
+                break
+            fids.append(fid)
+        best = dict.fromkeys(fids)
     else:
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_chunk", 1, matcher, deterministic=True)
+        conn.create_function("sindex_clean", 1, matcher.lacks_negatives, deterministic=True)
         seen: set[int] = set()
 
         def add(rowid: int, *, from_index: bool) -> None:
@@ -371,8 +420,10 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
                              "make it simpler or more specific."}
 
         if match is not None:
-            # case sensitivity is checked on the stored text, which keeps the letters as they were written
-            exact = ["sindex_chunk(chunks.body)"] if case_sensitive else []
+            # the word index cannot tell "kyo" from "tokyo", so what it found is checked against the exclusions
+            # on the stored text; the same text keeps the letters as they were written for case sensitivity
+            exact = (["sindex_chunk(chunks.body)"] if case_sensitive
+                     else ["sindex_clean(chunks.body)"] if negatives else [])
             sql = (f"SELECT chunks.rowid {chunk_join} "
                    f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where, *exact])} ORDER BY rank LIMIT ?")
             try:
@@ -459,4 +510,5 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             "media": {"kind": f[5], "width": f[6], "height": f[7], "duration_s": f[8], "taken_at": f[9],
                       "camera": f[10]} if f[5] else None,
         })
-    return {"results": results, "total": len(best), "capped": capped, "error": None}
+    return {"results": results, "total": len(best), "capped": capped, "error": None,
+            "negative_only": negative_only}
