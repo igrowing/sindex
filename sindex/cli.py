@@ -501,7 +501,11 @@ def main(argv: list[str] | None = None) -> int:
         # mark it as a query. A real typo of a subcommand name falls into this too; --help lists them.
         argv = ["ui", "--query", " ".join(argv)]
     args = ap.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except config.ConfigError as e:  # a setting that cannot be used: say which, not a traceback
+        print(f"configuration error: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

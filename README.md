@@ -23,6 +23,9 @@ It keeps CPU and memory use low, even if that makes indexing slower.
   marks don't affect matching. CJK text is indexed as bigrams.
 - **Change tracking:** the NTFS USN journal. Volumes without one are rescanned periodically.
 
+The steps below go in this order: set up the environment, try it in a console, optionally build the
+executable, install the service (from Python or from the executable), then search.
+
 ## Setup
 
 ```powershell
@@ -31,7 +34,7 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 .venv\Scripts\python -m pytest    # run tests/test_usn.py from an elevated prompt to test the journal
 ```
 
-## Try it without installing the service
+## Run it in a console (no install)
 
 ```powershell
 # index a folder once, in recycled indexer processes like the service uses, then exit
@@ -47,7 +50,23 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 
 Reading the USN journal needs administrator rights. Without them, sindex falls back to periodic rescans.
 
-## Install as a service (elevated prompt)
+## Build the Windows executable (optional)
+
+Only needed to run sindex on a machine without Python, or to get a self-installing program. Skip it if you
+install from the Python environment below.
+
+Build it once on a machine that has the project (Python 3.12+):
+
+```powershell
+.venv\Scripts\pip install -e ".[build]"
+.venv\Scripts\python packaging\build.py       # -> dist\sindex\sindex.exe (a folder of about 25 MB)
+```
+
+## Install as a service
+
+Pick one. Both register the same Windows service and need administrator rights.
+
+### From the Python environment (elevated prompt)
 
 ```powershell
 .venv\Scripts\sindex install     # auto start (delayed), runs as LocalSystem
@@ -55,7 +74,67 @@ Reading the USN journal needs administrator rights. Without them, sindex falls b
 start http://127.0.0.1:8765/
 ```
 
-**Searching.** A search starts when you press Enter, or by itself `search_complete_after_s` seconds (default 1,
+To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
+while the service is installed.
+
+### From the executable
+
+After the build above, copy the whole `dist\sindex` folder to the target machine and **double-click `sindex.exe`** (or run
+`sindex.exe install --start`). It asks for administrator rights and then installs itself as the service: it copies
+the program to `%ProgramFiles%\sindex`, registers the `sindex` service (automatic, delayed start, LocalSystem),
+creates the Desktop and Start menu shortcuts, and starts the service. The web UI is at `http://127.0.0.1:8765/`.
+
+- **Update:** run the new `sindex.exe` the same way. It stops the service, replaces the program folder (settings and
+  index in `%ProgramData%\sindex` stay), and starts the service again.
+- **Remove:** `"%ProgramFiles%\sindex\sindex.exe" remove` from an administrator prompt, then delete the folder
+  `%ProgramFiles%\sindex`. Delete `%ProgramData%\sindex` too if you do not want to keep the index and settings.
+- **Everything else works as with the Python install:** `sindex.exe status`, `search`, `pause`, `run` (in a console,
+  with `--data-dir` for a test folder), and so on.
+- **If the self-install does not work** (for example, a policy blocks the UAC prompt), copy the folder to
+  `C:\Program Files\sindex` yourself and register it from an administrator prompt:
+
+  ```powershell
+  sc.exe create sindex binPath= "\"C:\Program Files\sindex\sindex.exe\" service" start= delayed-auto DisplayName= "sindex content indexer"
+  sc.exe start sindex
+  ```
+
+It is a folder, not a single file, on purpose: Windows expects a service to answer within seconds of starting, and a
+one-file build unpacks itself into a temporary folder first, every time. The service starts `sindex.exe service`, which
+starts the indexer as `sindex.exe indexer` and the parsing workers as further copies of `sindex.exe`; you will see
+several `sindex.exe` processes.
+
+### What the install sets up
+
+`sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
+(`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over
+plain HTTP, not HTTPS. It also wires up three more ways to reach the same search without opening that shortcut:
+
+- **Folder and drive right-click menu:** "Search contents with sindex" on any folder, folder background or drive
+  opens the web UI scoped to that folder (`sindex ui <path>` behind the scenes). On Windows 11 this classic verb
+  lives under "Show more options" (or Shift+right-click) rather than the top-level menu.
+- **Explorer address bar and Win+R:** typing `sindex` followed by words (for example `sindex overdue invoice`)
+  opens the web UI already running that search. This works through the same "App Paths" registry mechanism that
+  lets you type `notepad` or `calc`; typing an actual subcommand name (`sindex status`, `sindex install`, ...)
+  still runs that subcommand instead, exactly as it would in a console.
+- **Explorer search connector:** a "sindex search.searchConnector-ms" file is placed in the installing user's
+  `%USERPROFILE%\Searches` folder. Opening it once adds sindex as a saved search in Explorer's navigation pane;
+  typing in Explorer's search box while it is selected returns real file results (icon, preview, double-click to
+  open) from `/api/search.rss`, an RSS feed generated from the same query language as the web UI's search box.
+
+`sindex remove` undoes all three.
+
+The service keeps its data in `%ProgramData%\sindex`:
+
+| File | Purpose |
+|---|---|
+| `config.toml` | settings (roots, exclusions, throttling, web port/token); see below for how it is edited |
+| `index.db` | SQLite FTS5 index |
+| `logs\` | `service.log`, `indexer.log` (with a `progress: N files indexed, M files in queue` line after every 1000 files), `indexer-stderr.log` |
+| `status.json`, `paused`, `requests\`, `settings-requests\` | control files the web UI and CLI use to talk to the indexer and the service |
+
+## Searching
+
+A search starts when you press Enter, or by itself `search_complete_after_s` seconds (default 1,
 `[web]`; 0 = Enter only) after your last keystroke. Changing the text stops a running search, and a moving line under
 the search box shows that one is running. A search has three steps, in this order of ranking:
 
@@ -111,69 +190,6 @@ on one path or 1 s on one piece of text is refused with a message) and lets othe
 pattern cannot freeze the service. `requirements.txt` lists every third-party module. The Explorer search connector
 (`/api/search.rss`) asks on every keystroke and therefore uses the word index only, without the scan.
 
-`sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
-(`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over
-plain HTTP, not HTTPS. It also wires up three more ways to reach the same search without opening that shortcut:
-
-- **Folder and drive right-click menu:** "Search contents with sindex" on any folder, folder background or drive
-  opens the web UI scoped to that folder (`sindex ui <path>` behind the scenes). On Windows 11 this classic verb
-  lives under "Show more options" (or Shift+right-click) rather than the top-level menu.
-- **Explorer address bar and Win+R:** typing `sindex` followed by words (for example `sindex overdue invoice`)
-  opens the web UI already running that search. This works through the same "App Paths" registry mechanism that
-  lets you type `notepad` or `calc`; typing an actual subcommand name (`sindex status`, `sindex install`, ...)
-  still runs that subcommand instead, exactly as it would in a console.
-- **Explorer search connector:** a "sindex search.searchConnector-ms" file is placed in the installing user's
-  `%USERPROFILE%\Searches` folder. Opening it once adds sindex as a saved search in Explorer's navigation pane;
-  typing in Explorer's search box while it is selected returns real file results (icon, preview, double-click to
-  open) from `/api/search.rss`, an RSS feed generated from the same query language as the web UI's search box.
-
-`sindex remove` undoes all three.
-
-The service keeps its data in `%ProgramData%\sindex`:
-
-| File | Purpose |
-|---|---|
-| `config.toml` | settings (roots, exclusions, throttling, web port/token); see below for how it is edited |
-| `index.db` | SQLite FTS5 index |
-| `logs\` | `service.log`, `indexer.log` (with a `progress: N files indexed, M files in queue` line after every 1000 files), `indexer-stderr.log` |
-| `status.json`, `paused`, `requests\`, `settings-requests\` | control files the web UI and CLI use to talk to the indexer and the service |
-
-To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
-while the service is installed.
-
-## Windows executable (no Python needed)
-
-Build it once on a machine that has the project (Python 3.12+):
-
-```powershell
-.venv\Scripts\pip install -e ".[build]"
-.venv\Scripts\python packaging\build.py       # -> dist\sindex\sindex.exe (a folder of about 25 MB)
-```
-
-Copy the whole `dist\sindex` folder to the target machine and **double-click `sindex.exe`** (or run
-`sindex.exe install --start`). It asks for administrator rights and then installs itself as the service: it copies
-the program to `%ProgramFiles%\sindex`, registers the `sindex` service (automatic, delayed start, LocalSystem),
-creates the Desktop and Start menu shortcuts, and starts the service. The web UI is at `http://127.0.0.1:8765/`.
-
-- **Update:** run the new `sindex.exe` the same way. It stops the service, replaces the program folder (settings and
-  index in `%ProgramData%\sindex` stay), and starts the service again.
-- **Remove:** `"%ProgramFiles%\sindex\sindex.exe" remove` from an administrator prompt, then delete the folder
-  `%ProgramFiles%\sindex`. Delete `%ProgramData%\sindex` too if you do not want to keep the index and settings.
-- **Everything else works as with the Python install:** `sindex.exe status`, `search`, `pause`, `run` (in a console,
-  with `--data-dir` for a test folder), and so on.
-- **If the self-install does not work** (for example, a policy blocks the UAC prompt), copy the folder to
-  `C:\Program Files\sindex` yourself and register it from an administrator prompt:
-
-  ```powershell
-  sc.exe create sindex binPath= "\"C:\Program Files\sindex\sindex.exe\" service" start= delayed-auto DisplayName= "sindex content indexer"
-  sc.exe start sindex
-  ```
-
-It is a folder, not a single file, on purpose: Windows expects a service to answer within seconds of starting, and a
-one-file build unpacks itself into a temporary folder first, every time. The service starts `sindex.exe service`, which
-starts the indexer as `sindex.exe indexer` and the parsing workers as further copies of `sindex.exe`; you will see
-several `sindex.exe` processes.
-
 ## How it stays light
 
 - The service process only supervises and serves the web UI. A separate child process does all parsing. It runs at
@@ -194,6 +210,18 @@ several `sindex.exe` processes.
   pauses on battery, when the system is busy, or when you pause it.
 - Everything is streamed: 64 KB reads, incremental decoders, expat for Office XML, one PDF page at a time, and one
   directory at a time while scanning. SQLite uses an 8 MB page cache and no mmap.
+
+## Who can open the web UI
+
+The index holds the text of your files, so the web UI listens on `127.0.0.1` only and no other computer can reach
+it. `config.toml` is refused (and the service does not start) if `web_host` is anything but an IPv4 loopback
+address, so a stray `0.0.0.0` cannot put the index on the network. Check it with
+`Get-NetTCPConnection -LocalPort 8765 -State Listen`: `LocalAddress` must be `127.0.0.1`.
+
+What this does not do: every account on this computer, and any program running under one, can still open
+`http://127.0.0.1:8765/`, and the data folder is readable by whatever `%ProgramData%` allows. Pause, resume, reindex,
+settings, the folder browser and the log viewer additionally need the token from `config.toml`. See the security
+model in `architecture.md`.
 
 ## Settings page
 

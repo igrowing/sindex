@@ -459,7 +459,12 @@ class _Server(ThreadingHTTPServer):
         self.search_slots = threading.BoundedSemaphore(SEARCH_SLOTS)
         # POSTs change settings and control files; they ran one at a time before the server was threaded
         self.post_lock = threading.Lock()
+        config.check_web_host(cfg.web_host)  # again: tests and callers may build a Config without config.load()
         super().__init__((cfg.web_host, cfg.web_port), _Handler)
+        host = self.server_address[0]
+        if host != cfg.web_host:  # defence in depth: the socket must be where the configuration says
+            self.server_close()
+            raise config.ConfigError({"web_host": f"the server is bound to {host}, not to {cfg.web_host}"})
 
     def handle_error(self, request, client_address) -> None:
         # the page aborts a search the moment the next keystroke supersedes it, which the server meets as a
@@ -480,7 +485,7 @@ class WebServer:
     def start(self) -> None:
         try:
             self._server = _Server(self.cfg, self.supervisor)
-        except OSError as e:
+        except (OSError, config.ConfigError) as e:
             log.error("web UI unavailable on %s:%d: %s", self.cfg.web_host, self.cfg.web_port, e)
             return
         self._thread = threading.Thread(target=self._server.serve_forever, name="web", daemon=True)

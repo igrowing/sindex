@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import functools
 import importlib.metadata
+import ipaddress
 import json
 import logging
 import math
@@ -426,6 +427,20 @@ search_complete_after_s = {search_complete_after_s}
 """
 
 
+def check_web_host(host: str) -> None:
+    """The web UI shows the text of the indexed files, so it may only listen on this computer.
+
+    Only an IPv4 loopback address is accepted, not a name such as "localhost" (a hosts file can point it
+    anywhere) and not "0.0.0.0" or an address of a network card, which would open it to the network.
+    """
+    try:
+        loopback = ipaddress.IPv4Address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ConfigError({"web_host": f"{host!r} is not a loopback address; the web UI must listen on 127.0.0.1"})
+
+
 def _toml(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -523,6 +538,7 @@ def load(data_dir: Path | None = None) -> Config:
         log.warning("unknown config key %r ignored", key)
     cfg = Config(**{k: v for k, v in flat.items() if k in known})
     cfg.data_dir = data_dir
+    check_web_host(cfg.web_host)
     for window in cfg.schedule_windows:  # a hand-edited typo must not surface later as a crash in the indexer
         try:
             parse_window(window)

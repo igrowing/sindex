@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sindex"
-version = "0.2.5"
+version = "0.2.6"
 description = "Low-footprint full-text indexing service for Windows"
 requires-python = ">=3.12"
 dependencies = [
