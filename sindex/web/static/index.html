@@ -67,7 +67,11 @@
 const TOKEN = {{TOKEN}};
 const $ = (id) => document.getElementById(id);
 const PAGE = 20;
+const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds of typing pause before the full search; 0 = never
+const TYPE_DELAY_MS = 200;  // pause that makes a keystroke worth a quick search
+const TAB = Math.random().toString(36).slice(2, 12);  // lets the server stop this tab's superseded searches
 let offset = 0;
+let seq = 0, inflight = null, typeTimer = null, completeTimer = null, lastQuick = null;
 
 function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
@@ -113,17 +117,36 @@ function params() {
   return p;
 }
 
-async function runSearch() {
+function stopInflight() {
+  if (inflight) inflight.abort();
+  inflight = null; seq++;  // an answer that is still on its way is no longer wanted
+}
+function cancelPending() {
+  clearTimeout(typeTimer); clearTimeout(completeTimer); completeTimer = null;
+  stopInflight();
+}
+
+// quick: a search while typing (the server ranks few hits); otherwise the full one
+async function runSearch({ quick = false } = {}) {
+  if (quick) stopInflight(); else cancelPending();  // a quick search leaves the timer of the full one running
   if (!$("q").value.trim() && !hasMediaFilter()) { $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0; return; }
-  const p = params();
+  const p = params(), mine = seq, ctl = inflight = new AbortController();
   history.replaceState(null, "", "?" + p);
-  const res = await fetch("/api/search?" + p).then(r => r.json()).catch(e => ({ error: String(e), results: [] }));
+  const q = new URLSearchParams(p);
+  q.set("tab", TAB); q.set("seq", mine);
+  if (quick) q.set("quick", "1");
+  const res = await fetch("/api/search?" + q, { signal: ctl.signal }).then(r => r.json())
+    .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
+  if (!res || mine !== seq || res.cancelled) return;  // superseded by a newer search
+  inflight = null;
+  lastQuick = quick ? { key: p.toString(), capped: !!res.capped } : null;
   const sum = $("summary");
   if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
   else if (!res.total) { sum.textContent = "No matches."; }
   else {
     sum.textContent = `${res.total}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
   }
+  if (quick && completeTimer) sum.textContent += " · completing…";
   $("results").innerHTML = res.results.map((r, i) => `
     <li class="hit">
       <div class="name">${esc(r.name)}</div>
@@ -230,6 +253,26 @@ async function refreshStatus() {
   $("pauseBtn").dataset.paused = ix.user_paused ? "1" : "";
 }
 
+// Search as you type: quick searches after a short pause, the full one after COMPLETE_AFTER seconds
+function onType() {
+  cancelPending();
+  offset = 0;
+  const text = $("q").value.trim();
+  if (!text) { runSearch(); return; }  // clears the results
+  if (text.length < 2 && !/\P{ASCII}/u.test(text)) return;  // one ASCII letter matches nearly everything
+  typeTimer = setTimeout(() => runSearch({ quick: true }), TYPE_DELAY_MS);
+  if (COMPLETE_AFTER > 0) completeTimer = setTimeout(completeSearch, COMPLETE_AFTER * 1000);
+}
+function completeSearch() {
+  completeTimer = null;
+  // a quick answer that was not cut short and had no name scan to skip is already the full one
+  if (lastQuick && lastQuick.key === params().toString() && !lastQuick.capped && !$("names").checked) {
+    $("summary").textContent = $("summary").textContent.replace(" · completing…", "");
+    return;
+  }
+  runSearch();
+}
+$("q").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
 for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });

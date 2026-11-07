@@ -1,8 +1,10 @@
-"""Local web UI: a single-threaded stdlib HTTP server bound to localhost.
+"""Local web UI: a threaded stdlib HTTP server bound to localhost.
 
 Reads the index through a read-only SQLite connection opened per request and
 controls the indexer only through files (see control.py), so it never
-competes with the indexer for the write lock.
+competes with the indexer for the write lock. A slow search must not hold up the
+status polling or the next keystroke's search, hence one thread per request,
+with at most SEARCH_SLOTS searches running at once.
 """
 
 from __future__ import annotations
@@ -12,17 +14,19 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 import threading
+import time
 from datetime import UTC, datetime
 from html import unescape as html_unescape
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
 from .. import config, control, db
 from ..config import Config
-from ..search import search
+from ..search import HIT_LIMIT, LIVE_HIT_LIMIT, search
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +36,61 @@ MAX_BODY = 64 * 1024
 HEALTH_PAGE = 50  # files per page of the health list
 RSS_PAGE = 20  # default number of items per page of the Explorer search connector's RSS feed
 RSS_PAGE_MAX = 100
+SEARCH_SLOTS = 2  # searches that run at the same time; each holds a connection and ranks up to HIT_LIMIT hits
+SEARCH_TIMEOUT_S = 30.0  # a query that runs longer is stopped, so an abandoned one cannot hold a slot for ever
+_TAB_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+_PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
+
+
+class SearchTicket:
+    """One running search: it is stopped by a newer search of the same browser tab or when it runs too long."""
+
+    __slots__ = ("cancelled", "deadline", "seq", "timed_out")
+
+    def __init__(self, seq: int, timeout_s: float) -> None:
+        self.seq = seq
+        self.cancelled = False
+        self.timed_out = False
+        self.deadline = time.monotonic() + timeout_s
+
+    @property
+    def stopped(self) -> bool:
+        return self.cancelled or self.timed_out
+
+    def should_stop(self) -> int:
+        """SQLite progress handler: a non-zero return aborts the running statement."""
+        if not self.cancelled and time.monotonic() > self.deadline:
+            self.timed_out = True
+        return 1 if self.stopped else 0
+
+
+class SearchRegistry:
+    """Latest search wins: starting search `seq` of a tab cancels that tab's older running search."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current: dict[str, SearchTicket] = {}
+
+    def begin(self, tab: str | None, seq: int, timeout_s: float = SEARCH_TIMEOUT_S) -> SearchTicket:
+        ticket = SearchTicket(seq, timeout_s)
+        if tab is None:
+            return ticket
+        with self._lock:
+            old = self._current.get(tab)
+            if old is not None and old.seq > seq:
+                ticket.cancelled = True  # a request that overtook this one is already registered
+                return ticket
+            if old is not None:
+                old.cancelled = True
+            self._current[tab] = ticket
+        return ticket
+
+    def end(self, tab: str | None, ticket: SearchTicket) -> None:
+        if tab is None:
+            return
+        with self._lock:
+            if self._current.get(tab) is ticket:
+                del self._current[tab]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -76,6 +135,9 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path in PAGES:
             page = (STATIC / PAGES[url.path]).read_text(encoding="utf-8")
             page = page.replace("{{TOKEN}}", json.dumps(self.server.cfg.token)).replace("{{VERSION}}", config.VERSION)
+            if "{{COMPLETE_AFTER}}" in page:
+                after = config.load(self.server.cfg.data_dir).search_complete_after_s  # as saved, no restart needed
+                page = page.replace("{{COMPLETE_AFTER}}", json.dumps(after))
             return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         if url.path == "/style.css":
             return self._send(200, (STATIC / "style.css").read_bytes(), "text/css; charset=utf-8")
@@ -98,6 +160,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
+        with self.server.post_lock:
+            self._post()
+
+    def _post(self) -> None:
         # the body is read before anything is refused: closing a connection with unread request data makes
         # Windows reset it, and the client then sees a connection error instead of the 403
         length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
@@ -196,24 +262,54 @@ class _Handler(BaseHTTPRequestHandler):
         conn = self._connect()
         if conn is None:
             return self._json({"results": [], "total": 0, "error": "The index does not exist yet."})
+        tab = q["tab"] if _TAB_ID.fullmatch(q.get("tab", "")) else None
+        # "quick" is a search while the user types: few hits, no slow name scan; the page follows it with a
+        # full one once the typing pauses
+        quick = q.get("quick") == "1"
+        searches = self.server.searches
         try:
-            exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
-            result = search(
-                conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
-                after=q.get("after") or None, before=q.get("before") or None,
-                offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1",
-                kind=q.get("kind") or None, camera=q.get("camera") or None,
-                has_gps={"1": True, "0": False}.get(q.get("has_gps")),
-                min_width=int(q["min_width"]) if q.get("min_width") else None,
-                min_height=int(q["min_height"]) if q.get("min_height") else None,
-                min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
-                max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
-                taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
+            ticket = searches.begin(tab, int(q.get("seq", 0) or 0))
+        except ValueError as e:
+            conn.close()
+            return self._json({"results": [], "total": 0, "error": str(e)})
+        result: dict | None = None
+        try:
+            with self.server.search_slots:  # waiting here is cheap: a newer search may cancel this one meanwhile
+                if not ticket.cancelled:
+                    conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
+                    result = self._run_search(conn, q, quick=quick)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
+        except sqlite3.OperationalError:
+            if not ticket.stopped:
+                raise
         finally:
+            searches.end(tab, ticket)
             conn.close()
+        if ticket.cancelled:
+            result = {"results": [], "total": 0, "capped": False, "error": None, "cancelled": True}
+        elif ticket.timed_out:
+            result = {"results": [], "total": 0, "capped": False,
+                      "error": f"The search took longer than {SEARCH_TIMEOUT_S:.0f} s and was stopped. Try more words."}
+        assert result is not None, "a search that was not stopped has a result"
+        result["quick"] = quick
         self._json(result)
+
+    @staticmethod
+    def _run_search(conn: sqlite3.Connection, q: dict, *, quick: bool) -> dict:
+        exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
+        return search(
+            conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
+            after=q.get("after") or None, before=q.get("before") or None,
+            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1" and not quick,
+            hit_limit=LIVE_HIT_LIMIT if quick else HIT_LIMIT,
+            kind=q.get("kind") or None, camera=q.get("camera") or None,
+            has_gps={"1": True, "0": False}.get(q.get("has_gps")),
+            min_width=int(q["min_width"]) if q.get("min_width") else None,
+            min_height=int(q["min_height"]) if q.get("min_height") else None,
+            min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
+            max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
+            taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
 
     def _status(self) -> None:
         cfg = self.server.cfg
@@ -287,13 +383,27 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, body.encode("utf-8"), "application/rss+xml; charset=utf-8")
 
 
-class _Server(HTTPServer):
+class _Server(ThreadingHTTPServer):
+    # a request thread only reads the index or drops a control file (atomically), so ending it with the
+    # process loses nothing; non-daemon threads would hold the service open during a long search
     daemon_threads = True
 
     def __init__(self, cfg: Config, supervisor) -> None:
         self.cfg = cfg
         self.supervisor = supervisor
+        self.searches = SearchRegistry()
+        self.search_slots = threading.BoundedSemaphore(SEARCH_SLOTS)
+        # POSTs change settings and control files; they ran one at a time before the server was threaded
+        self.post_lock = threading.Lock()
         super().__init__((cfg.web_host, cfg.web_port), _Handler)
+
+    def handle_error(self, request, client_address) -> None:
+        # the page aborts a search the moment the next keystroke supersedes it, which the server meets as a
+        # reset connection while it writes the answer; that is expected, anything else is logged in full
+        if isinstance(sys.exception(), ConnectionError):
+            log.debug("client %s went away", client_address)
+        else:
+            log.exception("web request from %s failed", client_address)
 
 
 class WebServer:

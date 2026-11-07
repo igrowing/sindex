@@ -55,6 +55,12 @@ Reading the USN journal needs administrator rights. Without them, sindex falls b
 start http://127.0.0.1:8765/
 ```
 
+The search box searches while you type: after a 0.2 s pause a quick search ranks only the best 200 hits (no file-name
+scan), and `search_complete_after_s` seconds (default 1, `[web]`; 0 = off) after the last keystroke the same query is
+repeated with the full limit of 2000. Enter always runs the full search. The web server answers requests on threads
+(at most two searches at a time); a newer search of the same browser tab cancels the older one inside SQLite, and a
+search that runs longer than 30 s is stopped.
+
 `sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
 (`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over
 plain HTTP, not HTTPS. It also wires up three more ways to reach the same search without opening that shortcut:

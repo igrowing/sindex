@@ -102,6 +102,9 @@ class Config:
     web_host: str = "127.0.0.1"
     web_port: int = 8765
     token: str = ""
+    # while typing, a search looks at few hits to stay quick; this long after the last change the page repeats it
+    # with the full hit limit. 0 = never refine.
+    search_complete_after_s: float = 1.0
     # [storage]
     db_dir: str = ""  # where index.db lives; empty = the data directory
 
@@ -192,6 +195,7 @@ SPECS: dict[str, Spec] = {
     "commit_every_files": Spec(int, 1, 100_000), "commit_every_seconds": Spec(int, 1, 3600),
     "sqlite_cache_mb": Spec(int, 1, 1024), "wal_autocheckpoint_pages": Spec(int, 100, 1_000_000),
     "usn_poll_seconds": Spec(int, 5, 86_400), "rescan_hours": Spec(int, 1, 8760),
+    "search_complete_after_s": Spec(float, 0.5, 60, zero_ok=True),
 }
 
 
@@ -416,6 +420,9 @@ web_host = {web_host}
 web_port = {web_port}
 # Protects the pause/resume/reindex and settings actions of the web UI.
 token = {token}
+# Searching while you type looks at the best few hits only. This many seconds after your last keystroke the
+# search is repeated with the full limit (more files, names too). 0 = never.
+search_complete_after_s = {search_complete_after_s}
 """
 
 

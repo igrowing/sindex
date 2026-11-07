@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from . import db, textnorm
 
 HIT_LIMIT = 2000  # chunk hits considered per query; results are grouped per file
+LIVE_HIT_LIMIT = 200  # the same while the user is still typing: ranking fewer hits is what keeps a keystroke cheap
 SNIPPET_TOKENS = 24
 
 _TERM = re.compile(r'(-?)"([^"]*)"(\*?)|(\S+)')
@@ -151,7 +152,7 @@ def _date_ns(value: str | None, *, end: bool = False) -> int | None:
 
 def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
            after: str | None = None, before: str | None = None,
-           offset: int = 0, limit: int = 20, *, names: bool = False,
+           offset: int = 0, limit: int = 20, *, names: bool = False, hit_limit: int = HIT_LIMIT,
            kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
            min_width: int | None = None, min_height: int | None = None,
            min_duration_s: float | None = None, max_duration_s: float | None = None,
@@ -161,6 +162,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
     Name-only matches come after the content matches and have `hits == 0` and no snippet. `kind` and the
     other media filters narrow the results to images/videos with matching `media` fields; with an empty
     `query` and at least one media filter set, this browses by filter alone (no keyword required).
+    `hit_limit` bounds the chunk hits that are ranked (`capped` says it was reached).
     """
     groups, negatives = _parse(query)
     match = _to_match(groups, negatives)
@@ -193,17 +195,17 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             return {"results": [], "total": 0, "capped": False, "error": "Type some words to search for."}
         # no keyword: browse by the media/path/ext/date filters alone, newest first
         sql = (f"SELECT f.id FROM files f {media_join} "
-               f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT {HIT_LIMIT}")
-        fids = [r[0] for r in conn.execute(sql, [*params, *media_params])]
+               f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT ?")
+        fids = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
         best: dict[int, int | None] = dict.fromkeys(fids)
         hits: dict[int, int] = {}
-        capped = len(fids) >= HIT_LIMIT
+        capped = len(fids) >= hit_limit
     else:
         sql = (f"SELECT chunks.rowid FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) "
                f"{media_join} WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where])} "
-               f"ORDER BY rank LIMIT {HIT_LIMIT}")
+               "ORDER BY rank LIMIT ?")
         try:
-            rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params])]
+            rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params, hit_limit])]
         except sqlite3.OperationalError as e:
             return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
 
@@ -213,18 +215,18 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             fid = rowid >> db.CHUNK_BITS
             best.setdefault(fid, rowid)
             hits[fid] = hits.get(fid, 0) + 1
-        capped = len(rowids) >= HIT_LIMIT
+        capped = len(rowids) >= hit_limit
 
         if names:
             # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
             conn.create_function("sindex_key", 1, _name_key, deterministic=True)
             cond, name_params = _name_condition(groups, negatives)
             sql = (f"SELECT f.id FROM files f {media_join} "
-                   f"WHERE {' AND '.join([cond, *where, *media_where])} LIMIT {HIT_LIMIT}")
-            by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params])]
+                   f"WHERE {' AND '.join([cond, *where, *media_where])} LIMIT ?")
+            by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params, hit_limit])]
             for fid in by_name:
                 best.setdefault(fid, None)
-            capped = capped or len(by_name) >= HIT_LIMIT
+            capped = capped or len(by_name) >= hit_limit
 
     results = []
     for fid, rowid in list(best.items())[offset:offset + limit]:

@@ -87,6 +87,7 @@
     <button type="button" data-tab="speed">Speed</button>
     <button type="button" data-tab="schedule">Schedule</button>
     <button type="button" data-tab="index">What to index</button>
+    <button type="button" data-tab="search">Search</button>
     <button type="button" data-tab="health">Health</button>
     <button type="button" data-tab="maintenance">Maintenance</button>
   </nav>
@@ -125,6 +126,14 @@
       <p class="lead" style="margin-top:8px">Bigger files are listed as <i>too big</i> under Indexing health.</p>
       <div id="f-limits"></div>
     </details>
+  </section>
+
+  <section data-tab="search">
+    <h2>Search</h2>
+    <p class="lead">The search box searches while you type. To keep every keystroke cheap it first looks at the best
+      few hits only; when you pause, it repeats the search with the full limit (more files, and file names if that
+      box is ticked). Pressing Enter always runs the full search.</p>
+    <div id="f-search"></div>
   </section>
 
   <section data-tab="maintenance">
@@ -211,6 +220,10 @@ const GROUPS = {
     schedule_windows: ["Only index during these hours", "One window per line, like 22:00-06:00 (it may pass midnight). Empty = at any time."],
     rescan_hours: ["Full rescan every (hours)", "Only for drives without an NTFS change journal."],
     usn_poll_seconds: ["Look for changes every (seconds)", "How often the NTFS change journal is read."],
+  },
+  "f-search": {
+    search_complete_after_s: ["Complete search after (s)",
+      "Seconds without typing before the full search runs. 0 = only on Enter. Applies the next time the search page is opened."],
   },
   "f-roots": {
     roots: ["Folders to index", "Tick the folders to index; browse into a folder with its name or arrow. Nothing chosen = all fixed drives."],
@@ -308,7 +321,7 @@ function clearErrors() {
 }
 
 // ---- tabs: one group of sections at a time; the choice is kept in the address (#index) ---------
-const SETTING_TABS = ["speed", "schedule", "index"];  // the tabs whose fields the Save button stores
+const SETTING_TABS = ["speed", "schedule", "index", "search"];  // the tabs whose fields the Save button stores
 function showTab(name) {
   if (!document.querySelector(`#pages button[data-tab="${name}"]`)) name = "speed";
   document.querySelectorAll("section[data-tab]").forEach(sec => sec.hidden = sec.dataset.tab !== name);
