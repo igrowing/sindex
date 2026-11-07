@@ -86,6 +86,12 @@
       <summary><span class="lbl">Exclude files with extension(s):</span> <b class="val">NONE</b></summary>
       <div class="panel" id="skipPanel"></div>
     </details>
+    <button type="button" class="plain export" id="exportBtn" disabled
+      title="Save all the files of this search (every page, in the sort order and with the extension filters shown) as a CSV file: path, file name, size, date and time, text found. Available when the search has results.">Export to CSV</button>
+  </div>
+  <div id="exportErr" class="exporterr" role="alert" hidden>
+    <span id="exportErrText"></span>
+    <button type="button" class="plain" id="exportErrClose">OK</button>
   </div>
   <ol id="results"></ol>
   <div class="pager" id="pager"></div>
@@ -101,10 +107,12 @@ const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds without typing before the
 const TAB = Math.random().toString(36).slice(2, 12);  // lets the server stop this tab's superseded searches
 let offset = 0;
 let seq = 0, inflight = null, typeTimer = null;
+let lastParams = null;  // the parameters of the search whose results are on the page
+let exporting = false;
 
-function toast(msg) {
+function toast(msg, ms = 1600) {
   const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
-  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.opacity = 0, 1600);
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.opacity = 0, ms);
 }
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 function fmtSize(n) {
@@ -207,8 +215,10 @@ document.addEventListener("click", (e) => {  // a dropdown closes when the perso
 function clearResults() {
   $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0;
   $("sortBox").hidden = true; $("extBar").hidden = true; clearExtSelection();
+  hideExportError(); syncExport();
 }
-function setBusy(on) { $("progress").hidden = !on; }
+function setBusy(on) { $("progress").hidden = !on; syncExport(); }
+function syncExport() { $("exportBtn").disabled = exporting || !lastTotal || inflight !== null; }
 
 // The search that is running is no longer wanted. Closing the request does not stop the query inside the
 // server, so the server is told as well.
@@ -226,6 +236,7 @@ function stopSearch() {
 // reuse: another sort order or page of the same search, which the server still has; it only re-orders it
 async function runSearch({ reuse = false, keepExt = false } = {}) {
   stopSearch();
+  hideExportError();
   if (!reuse && !keepExt) clearExtSelection();  // a new search has other extensions to choose from
   if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   const p = params(), mine = seq, ctl = new AbortController();
@@ -276,8 +287,63 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
   $("results").querySelectorAll("[data-open-dir]").forEach(b =>
     b.onclick = () => openPath(res.results[+b.dataset.openDir].path, "folder"));
   lastTotal = res.total;
+  lastParams = p;
+  syncExport();
   renderPager(res.total);
 }
+// Export every file of the search on the page (not just the page shown) as a CSV file. The browser does the
+// saving, as for any download: one that is set to ask where to save shows its Save dialog (name and folder), the
+// others put sindex-<search words>-DATE.csv in the Downloads folder. Writing the file from the page (the File System
+// Access API, with a Save dialog of its own) was dropped: a browser can refuse the write into the file the person just chose, and then
+// the person is asked twice. A failure stays on the page until dismissed: it is long and has to be readable.
+function showExportError(e) {
+  console.error("CSV export failed", e);
+  $("exportErrText").textContent = "Export failed: " + e.message;
+  $("exportErr").hidden = false;
+}
+function hideExportError() { $("exportErr").hidden = true; }
+$("exportErrClose").onclick = hideExportError;
+
+async function exportHttpError(r) {
+  const text = (await r.text().catch(() => "")).trim();
+  let detail = text;
+  try { detail = JSON.parse(text).error || text; } catch { /* not JSON: the text is the message */ }
+  if (r.status === 404)
+    return "HTTP 404: the running sindex does not know the export request. It is older than this page: restart sindex "
+      + "(stop and start the service, or run `sindex run` again).";
+  return "HTTP " + r.status + (detail ? ": " + detail.slice(0, 300) : "");
+}
+
+function downloadCsv(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+async function exportCsv() {
+  if (exporting || !lastTotal || !lastParams) return;
+  const btn = $("exportBtn"), count = lastTotal;
+  hideExportError();
+  exporting = true; syncExport(); btn.textContent = "Exporting…";
+  try {
+    const q = new URLSearchParams(lastParams);
+    q.delete("offset"); q.set("tab", TAB); q.set("reuse", "1");  // reuse: the server still has this search
+    let r;
+    try { r = await fetch("/api/export.csv?" + q); }
+    catch (e) { throw new Error("cannot reach sindex (" + e.message + ")"); }
+    if (!r.ok) throw new Error(await exportHttpError(r));
+    // the server names the file after the search words (and has made them safe for a file name)
+    const named = /filename\*=UTF-8''([^;]+)/i.exec(r.headers.get("Content-Disposition") || "");
+    if (!named) throw new Error("the server sent no file name");
+    const name = decodeURIComponent(named[1]);
+    downloadCsv(await r.blob(), name);
+    toast(`Exported ${count} file${count === 1 ? "" : "s"} as ${name}. The browser saves it: in the Downloads folder, `
+      + "or where you choose if it asks.", 7000);
+  } catch (e) { showExportError(e); }
+  finally { exporting = false; btn.textContent = "Export to CSV"; syncExport(); }
+}
+$("exportBtn").onclick = exportCsv;
+
 function pageBtn(label, to) {
   const b = document.createElement("button"); b.className = "plain"; b.textContent = label;
   b.onclick = () => { offset = to; runSearch({ reuse: true }); window.scrollTo(0, 0); }; return b;

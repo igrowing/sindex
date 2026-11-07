@@ -605,6 +605,7 @@ connector, described by `/opensearch.xml`), and the `sindex <words>` shortcut th
 |---|---|---|---|
 | `/`, `/settings`, `/log` and `/style.css` | GET | none | Static pages, with `{{TOKEN}}` and `{{VERSION}}` substituted |
 | `/api/search`, `/api/search.rss`, `/opensearch.xml` | GET | none | Search |
+| `/api/export.csv` | GET | none | All files of the page's search as CSV (same parameters as `/api/search`) |
 | `/api/status`, `/api/settings`, `/api/health` | GET | none | State, current settings, problem files |
 | `/api/browse`, `/api/log` | GET | token | Folder picker, log viewer (they reveal local paths) |
 | `/api/pause`, `/api/resume`, `/api/reindex`, `/api/retry`, `/api/rebuild`, `/api/maintenance`, `/api/settings`, `/api/open` | POST | token | Control actions |

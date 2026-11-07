@@ -647,8 +647,9 @@ def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[i
 
 
 def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", offset: int = 0,
-            limit: int = 20, only: frozenset[str] | None = None, skip: frozenset[str] = frozenset()) -> dict:
+            limit: int | None = 20, only: frozenset[str] | None = None, skip: frozenset[str] = frozenset()) -> dict:
     """One page of `found`, in the order of `sort` (one of SORTS), with a snippet for each file.
+    `limit=None` is every file from `offset` on (the CSV export).
 
     The order is applied to all the files that were found, before the page is cut from it. "relevance" keeps
     the order of the search and, when the query has two or more words, puts the files where these words are
@@ -680,7 +681,7 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
     matcher = found.matcher
 
     results = []
-    for fid, rowid in list(best.items())[offset:offset + limit]:
+    for fid, rowid in list(best.items())[offset:None if limit is None else offset + limit]:
         f = conn.execute(
             "SELECT f.dir, f.name, f.size, f.mtime_ns, f.status, m.kind, m.width, m.height, m.duration_s, "
             "m.taken_at, m.camera FROM files f LEFT JOIN media m ON m.file_id = f.id WHERE f.id = ?",

@@ -9,7 +9,9 @@ with at most SEARCH_SLOTS searches running at once.
 
 from __future__ import annotations
 
+import csv
 import hmac
+import io
 import json
 import logging
 import sqlite3
@@ -17,7 +19,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from html import unescape as html_unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +48,48 @@ FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file a
 _PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "only_ext", "skip_ext"})
 _TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
+EXPORT_COLUMNS = ("path", "filename", "size_bytes", "modified", "content")
+_MARK = regex.compile(r"</?mark>")
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")  # what makes a spreadsheet read a cell as a formula
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# Anything but letters (of any script), digits, underscore and hyphen is not safe in a file name: Windows refuses
+# < > : " / \ | ? *, and ^ ' ` ~ . and spaces cause trouble in shells and at the end of a name.
+_UNSAFE_NAME_CHARS = regex.compile(r"[^\p{L}\p{N}_-]+")
+EXPORT_NAME_CHARS = 40  # of the search words kept in the file name; a long name is a nuisance in a path of 260
+
+
+def _cell(text: str) -> str:
+    """Text for a CSV cell. The file names and contents come from other people's files: a cell that starts with
+    `=`, `+`, `-` or `@` would be run as a formula when the CSV is opened in a spreadsheet, so it gets a quote."""
+    return "'" + text if text.startswith(_FORMULA_START) else text
+
+
+def export_filename(query: str, today: date) -> str:
+    """`sindex-<what was searched>-<date>.csv`: every run of unsafe characters in the query becomes one underscore.
+    A query with nothing usable left (empty, or only symbols; a search by photo and video filters has no words) is
+    called "results"."""
+    words = _UNSAFE_NAME_CHARS.sub("_", query).strip("_-")[:EXPORT_NAME_CHARS].rstrip("_-")
+    return f"sindex-{words or 'results'}-{today.isoformat()}.csv"
+
+
+def _local_time(seconds: float) -> str:
+    try:
+        return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        # Windows has no local time for dates before 1970; say it is UTC rather than pass it off as local
+        return (_EPOCH + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def results_csv(results: list[dict]) -> str:
+    """The files of a search as CSV: folder, file name, size in bytes, date and time of the file (local time) and the
+    text that the page shows for the file, without its highlighting. Files found by name only have no text."""
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\r\n")
+    writer.writerow(EXPORT_COLUMNS)
+    for r in results:
+        content = " ".join(html_unescape(_MARK.sub("", r["snippet"])).split())
+        writer.writerow([_cell(r["dir"]), _cell(r["name"]), r["size"], _local_time(r["mtime"]), _cell(content)])
+    return out.getvalue()
 
 
 class SearchTicket:
@@ -145,9 +189,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- helpers -------------------------------------------------------
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, headers: dict[str, str] | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -194,6 +240,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._log(q)
         if url.path == "/api/search":
             return self._search(q)
+        if url.path == "/api/export.csv":
+            return self._export(q)
         if url.path == "/api/search/cancel":
             return self._cancel_search(q)
         if url.path == "/api/status":
@@ -305,29 +353,48 @@ class _Handler(BaseHTTPRequestHandler):
                     "limit": HEALTH_PAGE})
 
     def _search(self, q: dict) -> None:
+        self._json(self._search_result(q, export=False))
+
+    def _export(self, q: dict) -> None:
+        """Every file of the search the page shows (all pages, its sort and extension menus) as a CSV download.
+
+        The page sends the same parameters as for the search, so the tab's kept search is used and nothing is
+        read again. UTF-8 with a byte order mark: without it a spreadsheet reads the text as the ANSI code page.
+        """
+        result = self._search_result(q, export=True)
+        if result.get("error"):
+            return self._json(result, 400)
+        name = export_filename(q.get("q", ""), datetime.now().date())
+        # RFC 5987: the name may hold any letters, and a header is Latin-1 only
+        disposition = f"attachment; filename*=UTF-8''{quote(name)}"
+        self._send(200, results_csv(result["results"]).encode("utf-8-sig"), "text/csv; charset=utf-8",
+                   {"Content-Disposition": disposition})
+
+    def _search_result(self, q: dict, *, export: bool) -> dict:
         conn = self._connect()
         if conn is None:
-            return self._json({"results": [], "total": 0, "error": "The index does not exist yet."})
+            return {"results": [], "total": 0, "error": "The index does not exist yet."}
         tab = q["tab"] if _TAB_ID.fullmatch(q.get("tab", "")) else None
         searches = self.server.searches
         try:
-            ticket = searches.begin(tab, int(q.get("seq", 0) or 0))
+            # an export is not a newer search of the tab: it must not cancel the one the page is waiting for
+            ticket = searches.begin(None if export else tab, int(q.get("seq", 0) or 0))
         except ValueError as e:
             conn.close()
-            return self._json({"results": [], "total": 0, "error": str(e)})
+            return {"results": [], "total": 0, "error": str(e)}
         result: dict | None = None
         try:
             with self.server.search_slots:  # waiting here is cheap: a newer search may cancel this one meanwhile
                 if not ticket.cancelled:
                     conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
-                    result = self._run_search(conn, q, tab)
+                    result = self._run_search(conn, q, tab, export=export)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         except sqlite3.OperationalError:
             if not ticket.stopped:
                 raise
         finally:
-            searches.end(tab, ticket)
+            searches.end(None if export else tab, ticket)
             conn.close()
         if ticket.cancelled:
             result = {"results": [], "total": 0, "capped": False, "error": None, "cancelled": True}
@@ -335,7 +402,7 @@ class _Handler(BaseHTTPRequestHandler):
             result = {"results": [], "total": 0, "capped": False,
                       "error": f"The search took longer than {SEARCH_TIMEOUT_S:.0f} s and was stopped. Try more words."}
         assert result is not None, "a search that was not stopped has a result"
-        self._json(result)
+        return result
 
     def _cancel_search(self, q: dict) -> None:
         # the page calls this when its user edits the search box: closing the request does not stop the query
@@ -347,9 +414,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad seq"}, 400)
         self._json({})
 
-    def _run_search(self, conn: sqlite3.Connection, q: dict, tab: str | None) -> dict:
-        """The page of results for `q`. With `reuse=1` (another sort or page) the tab's last search is used if it
-        was for the same words and filters; otherwise the text is searched."""
+    def _run_search(self, conn: sqlite3.Connection, q: dict, tab: str | None, *, export: bool = False) -> dict:
+        """The page of results for `q`, or with `export` all of them. With `reuse=1` (another sort or page) the
+        tab's last search is used if it was for the same words and filters; otherwise the text is searched."""
         key = tuple(sorted((k, v) for k, v in q.items() if k not in _PAGE_PARAMS))
         cache = self.server.found
         found = cache.get(tab, key) if tab and q.get("reuse") == "1" else None
@@ -368,8 +435,8 @@ class _Handler(BaseHTTPRequestHandler):
                 taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
             if tab:
                 cache.put(tab, key, found)
-        return present(conn, found, sort=q.get("sort") or "relevance", limit=20,
-                       offset=max(0, int(q.get("offset", 0) or 0)),
+        return present(conn, found, sort=q.get("sort") or "relevance", limit=None if export else 20,
+                       offset=0 if export else max(0, int(q.get("offset", 0) or 0)),
                        only=_extension_set(q["only_ext"]) if q.get("only_ext") else None,
                        skip=_extension_set(q.get("skip_ext", "")) or frozenset())
 

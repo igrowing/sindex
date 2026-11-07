@@ -161,6 +161,19 @@ sort, this only re-orders the kept search, so it is instant; a new search starts
 are part of the page address (`only_ext=pdf,txt`, `skip_ext=md`; a dot stands for files without an extension, which
 are only indexed when `text_extensions` lists an empty one).
 
+**Export to CSV** (at the right end of the extension line) saves every file of the search on the page, not only the
+page shown, in the current sort order and with the extension filters applied: at most the 2,000 files a search keeps.
+The browser saves it as an ordinary download named `sindex-<what you searched>-DATE.csv` (every run of characters that
+is not a letter, digit, `_` or `-` becomes one `_`, and the words are cut at 40 characters; `sindex-results-DATE.csv` when
+there are no words): a browser set to ask where to save shows
+its Save dialog (name and folder), the others use the Downloads folder. The columns are `path`
+(the folder), `filename`, `size_bytes`, `modified` (local time) and `content` (the text shown under the file, without
+the highlighting; empty for a file found by name only). The file is UTF-8 with a byte order mark, so Excel reads
+non-Latin text correctly, and a name or text that starts with `=`, `+`, `-` or `@` gets a leading `'` so that a
+spreadsheet cannot run it as a formula. `/api/export.csv` takes the same parameters as `/api/search`.
+The button is greyed out while a search runs and when there are no results. A failed export shows its message under the
+extension line until you dismiss it; `HTTP 404` there means that the running sindex is older than the page, so restart it.
+
 Each result has **Open file** (in the app Windows associates with it) and **Open folder** (the folder in Explorer,
 with the file selected). A web page cannot start programs, so both ask the sindex server to do it. Like Open file,
 Open folder therefore only works while sindex runs in your own desktop session (`sindex run`); the installed
