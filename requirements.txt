@@ -1,0 +1,18 @@
+# Every third-party module sindex uses, for `pip install -r requirements.txt`.
+# pyproject.toml is the source of truth (`pip install -e ".[dev]"` reads it); tests/test_requirements.py
+# fails when this file drifts from it, so change both together.
+
+# runtime ([project] dependencies)
+charset-normalizer>=3.3
+Pillow>=10.0
+pymediainfo>=6.1
+pypdf[cryptodome]>=4.0
+pywin32>=306
+regex>=2023.12
+
+# packaging the Windows executable ([project.optional-dependencies] build)
+pyinstaller>=6.10
+
+# tests and lint ([project.optional-dependencies] dev)
+pytest>=8
+ruff>=0.6
