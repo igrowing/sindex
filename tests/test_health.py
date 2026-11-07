@@ -206,3 +206,61 @@ def test_retry_rebuild_and_maintenance_need_the_token_and_queue_requests(web):
 def test_bad_actions_are_refused(web, path, body):
     assert call(web, path, body, "secret")[0] == 404
     assert not (web.data_dir / "requests").exists()
+
+
+def test_open_folder_shows_the_file_selected_in_explorer(tmp_path, monkeypatch):
+    f = tmp_path / "My Docs" / "report.pdf"
+    f.parent.mkdir()
+    f.write_bytes(b"x")
+    seen = []
+    monkeypatch.setattr(control.subprocess, "run", lambda args, **kw: seen.append((args, kw)))
+
+    control.open_folder(str(f))
+
+    # a command line string, not a list: Explorer understands /select,"path" but not "/select,path" (it then
+    # opens Documents), and Python quotes a list item that holds spaces as a whole
+    assert seen[0][0] == f'explorer.exe /select,"{f}"'
+
+    assert seen[0][1]["check"] is False  # Explorer reports 1 even when it worked
+
+
+def test_open_folder_of_a_file_that_is_gone_opens_the_folder_it_was_in(tmp_path, monkeypatch):
+    opened = []
+    monkeypatch.setattr(control.os, "startfile", lambda path: opened.append(path))
+    monkeypatch.setattr(control.subprocess, "run", lambda *a, **kw: pytest.fail("nothing to select"))
+
+    control.open_folder(str(tmp_path / "deleted.pdf"))
+
+    assert opened == [str(tmp_path)]
+
+
+def test_open_folder_of_a_folder_that_is_gone_is_an_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no longer exists"):
+        control.open_folder(str(tmp_path / "gone" / "a.pdf"))
+
+
+def test_open_folder_refuses_a_relative_path():
+    with pytest.raises(ValueError, match="full path"):
+        control.open_folder("report.pdf")
+
+
+def test_open_api_can_open_the_folder_instead(web, monkeypatch):
+    opened = []
+    monkeypatch.setattr(control, "open_file", lambda path: opened.append(("file", path)))
+    monkeypatch.setattr(control, "open_folder", lambda path: opened.append(("folder", path)))
+    path = "D:\\Docs\\report.pdf"
+
+    assert call(web, "/api/open", {"path": path, "target": "folder"})[0] == 403  # the token, as for the file
+    assert call(web, "/api/open", {"path": path, "target": "folder"}, "secret")[0] == 200
+    assert call(web, "/api/open", {"path": path, "target": "file"}, "secret")[0] == 200
+    assert call(web, "/api/open", {"path": path}, "secret")[0] == 200  # the older request: the file
+    assert opened == [("folder", path), ("file", path), ("file", path)]
+    assert call(web, "/api/open", {"path": path, "target": "desktop"}, "secret")[0] == 404
+
+
+def test_open_api_reports_why_the_folder_could_not_be_opened(web, monkeypatch):
+    monkeypatch.setattr(control, "open_folder",
+                        lambda path: (_ for _ in ()).throw(FileNotFoundError("the folder no longer exists")))
+    status, body = call(web, "/api/open", {"path": "D:\\Gone\\a.pdf", "target": "folder"}, "secret")
+
+    assert status == 400 and "no longer exists" in json.loads(body)["error"]

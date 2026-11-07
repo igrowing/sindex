@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import time
 import uuid
 
@@ -150,6 +151,30 @@ def open_file(path: str) -> None:
     example `sindex run` in a console).
     """
     os.startfile(path)  # noqa: S606 -- token-gated like every other mutating action; see web/server.py
+
+
+def open_folder(path: str) -> None:
+    """Show the folder of the file `path` in Explorer, with the file selected when it still exists.
+
+    Like open_file() it needs your own desktop session. FileNotFoundError says the folder is gone, ValueError
+    that `path` is not a full path.
+    """
+    if not os.path.isabs(path):
+        raise ValueError(f"{path!r} is not a full path")
+    folder = os.path.dirname(path)
+    if os.path.exists(path):
+        try:
+            # A command line string on purpose: Explorer wants quotes around the path only, /select,"<path>".
+            # A list would have Python quote "/select,..." as a whole, and Explorer then ignores it and opens
+            # Documents. A path cannot hold a quote character. Explorer answers 1 even when it worked.
+            subprocess.run(f'explorer.exe /select,"{path}"', check=False, timeout=15)
+        except subprocess.TimeoutExpired as e:
+            raise OSError("Explorer did not answer") from e
+    elif os.path.isdir(folder):
+        # token-gated like open_file(); the file is gone, so there is nothing to select
+        os.startfile(folder)
+    else:
+        raise FileNotFoundError(f"the folder {folder} no longer exists")
 
 
 def indexer_status(cfg: Config) -> dict:

@@ -127,13 +127,14 @@ function fmtMedia(m) {
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { prompt("Copy:", text); }
 }
-async function openFile(path) {
+// target: "file" (in its associated app) or "folder" (in Explorer, with the file selected)
+async function openPath(path, target) {
   const r = await fetch("/api/open", {
     method: "POST", headers: { "Content-Type": "application/json", "X-Sindex-Token": TOKEN },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, target }),
   });
   const data = await r.json().catch(() => ({}));
-  toast(r.ok ? "Opening…" : (data.error || "Could not open the file"));
+  toast(r.ok ? "Opening…" : (data.error || `Could not open the ${target}`));
 }
 
 const MEDIA_KEYS = ["kind", "camera", "has_gps", "min_height", "min_duration", "max_duration", "taken_after", "taken_before"];
@@ -262,7 +263,8 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
         <span>${fmtSize(r.size)}</span><span>${fmtDate(r.mtime)}</span>
         ${r.status !== "ok" ? `<span>${esc(r.status)}</span>` : ""}
         ${r.hits === 0 && !res.negative_only ? `<span>folder or file name match</span>` : ""}
-        <button class="plain" data-open="${i}" title="Open in its associated app (only while sindex runs in your own session)">Open</button>
+        <button class="plain" data-open="${i}" title="Open in its associated app (only while sindex runs in your own session)">Open file</button>
+        <button class="plain" data-open-dir="${i}" title="Show the file in its folder in Explorer (only while sindex runs in your own session)">Open folder</button>
         <button class="plain" data-copy="${i}" data-what="path">Copy path</button>
         <button class="plain" data-copy="${i}" data-what="dir">Copy folder</button>
       </div>
@@ -270,7 +272,9 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
   $("results").querySelectorAll("[data-copy]").forEach(b =>
     b.onclick = () => copy(res.results[+b.dataset.copy][b.dataset.what]));
   $("results").querySelectorAll("[data-open]").forEach(b =>
-    b.onclick = () => openFile(res.results[+b.dataset.open].path));
+    b.onclick = () => openPath(res.results[+b.dataset.open].path, "file"));
+  $("results").querySelectorAll("[data-open-dir]").forEach(b =>
+    b.onclick = () => openPath(res.results[+b.dataset.openDir].path, "folder"));
   lastTotal = res.total;
   renderPager(res.total);
 }

@@ -82,6 +82,11 @@ sort, this only re-orders the kept search, so it is instant; a new search starts
 are part of the page address (`only_ext=pdf,txt`, `skip_ext=md`; a dot stands for files without an extension, which
 are only indexed when `text_extensions` lists an empty one).
 
+Each result has **Open file** (in the app Windows associates with it) and **Open folder** (the folder in Explorer,
+with the file selected). A web page cannot start programs, so both ask the sindex server to do it. Like Open file,
+Open folder therefore only works while sindex runs in your own desktop session (`sindex run`); the installed
+service runs in Windows' isolated session 0, where the request fails with a message instead of doing nothing.
+
 Punctuation in a word is part of the search: `kyo)` finds only text that has those four characters, and `c++` does
 not find every `c`. (The word index itself throws punctuation away, so what it finds for such a word is checked
 against the stored text.) To search for a `*` or `?` itself, tick Use RegEx and write `\*` or `\?`.

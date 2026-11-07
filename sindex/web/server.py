@@ -240,18 +240,19 @@ class _Handler(BaseHTTPRequestHandler):
             control.request_maintenance(cfg, body["action"])
         elif path == "/api/reindex" and isinstance(body.get("path"), str) and body["path"].strip():
             control.request_reindex(cfg, body["path"].strip())
-        elif path == "/api/open" and isinstance(body.get("path"), str) and body["path"].strip():
-            return self._open_file(body["path"].strip())
+        elif (path == "/api/open" and isinstance(body.get("path"), str) and body["path"].strip()
+              and body.get("target", "file") in ("file", "folder")):
+            return self._open_file(body["path"].strip(), folder=body.get("target") == "folder")
         else:
             return self._json({"error": "unknown action"}, 404)
         self._json({"ok": True})
 
-    def _open_file(self, path: str) -> None:
+    def _open_file(self, path: str, *, folder: bool = False) -> None:
         # only shows something when sindex runs interactively; the installed service has no desktop to use
         # (LocalSystem in Session 0), so this fails there instead of silently doing nothing
         try:
-            control.open_file(path)
-        except OSError as e:
+            (control.open_folder if folder else control.open_file)(path)
+        except (OSError, ValueError) as e:
             return self._json({"error": f"could not open {path}: {e}"}, 400)
         self._json({"ok": True})
 
