@@ -42,7 +42,8 @@ SEARCH_SLOTS = 2  # searches that run at the same time; each holds a connection 
 SEARCH_TIMEOUT_S = 30.0  # a query that runs longer is stopped, so an abandoned one cannot hold a slot for ever
 FOUND_TTL_S = 120.0  # how long the files a tab found stay available for another sort order or page
 FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file and chunk numbers (about 100 KB)
-_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse"})  # what changes the view, not what is found
+# what changes the view of a search, not what it finds
+_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "only_ext", "skip_ext"})
 _TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
 
@@ -103,6 +104,11 @@ class SearchRegistry:
         with self._lock:
             if self._current.get(tab) is ticket:
                 del self._current[tab]
+
+
+def _extension_set(text: str) -> frozenset[str]:
+    """"pdf,TXT,." -> {"pdf", "txt", ""}: the page writes "no extension" as a dot, the one thing no extension is."""
+    return frozenset("" if item == "." else item.lower() for item in text.split(",") if item)
 
 
 class FoundCache:
@@ -362,7 +368,9 @@ class _Handler(BaseHTTPRequestHandler):
             if tab:
                 cache.put(tab, key, found)
         return present(conn, found, sort=q.get("sort") or "relevance", limit=20,
-                       offset=max(0, int(q.get("offset", 0) or 0)))
+                       offset=max(0, int(q.get("offset", 0) or 0)),
+                       only=_extension_set(q["only_ext"]) if q.get("only_ext") else None,
+                       skip=_extension_set(q.get("skip_ext", "")) or frozenset())
 
     def _status(self) -> None:
         cfg = self.server.cfg

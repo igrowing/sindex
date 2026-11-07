@@ -77,6 +77,16 @@
       </select>
     </label>
   </div>
+  <div id="extBar" class="extbar" hidden>
+    <details class="multi" id="onlyMenu">
+      <summary><span class="lbl">Show only files with extension(s):</span> <b class="val">ALL</b></summary>
+      <div class="panel" id="onlyPanel"></div>
+    </details>
+    <details class="multi" id="skipMenu">
+      <summary><span class="lbl">Exclude files with extension(s):</span> <b class="val">NONE</b></summary>
+      <div class="panel" id="skipPanel"></div>
+    </details>
+  </div>
   <ol id="results"></ol>
   <div class="pager" id="pager"></div>
 
@@ -135,13 +145,67 @@ function params() {
   for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
   if ($("sort").value !== "relevance") p.set("sort", $("sort").value);
+  for (const [name, m] of Object.entries(EXT_MENUS))  // "no extension" travels as a dot
+    if (m.sel.size) p.set(name + "_ext", [...m.sel].map(e => e || ".").join(","));
   for (const k of NAME_MODS) if ($(k).checked) p.set(k, "1");
   return p;
 }
 
+// The two extension menus. Each has a generic choice (ALL, NONE) that means "no filter"; choosing any extension
+// in one menu greys the other out until the first is back at its generic choice.
+const EXT_MENUS = {
+  only: { generic: "ALL", other: "skip", sel: new Set() },
+  skip: { generic: "NONE", other: "only", sel: new Set() },
+};
+let extList = [], extKey = "";  // [extension, count] of all files found, and what the panels were built from
+const extLabel = (e) => e === "" ? "(no extension)" : e;
+function clearExtSelection() { for (const m of Object.values(EXT_MENUS)) m.sel.clear(); }
+
+function buildExtPanels() {
+  const known = new Set(extList.map(([e]) => e));
+  const key = JSON.stringify([extList, Object.values(EXT_MENUS).flatMap(m => [...m.sel]).filter(e => !known.has(e))]);
+  if (key === extKey) return;  // nothing new: keep the open panel where the person scrolled it
+  extKey = key;
+  for (const [name, m] of Object.entries(EXT_MENUS)) {
+    // what is selected stays on offer even when this search did not find it (a page opened from an address)
+    const offered = new Map(extList);
+    for (const e of m.sel) if (!offered.has(e)) offered.set(e, 0);
+    $(name + "Panel").innerHTML =
+      `<label class="opt generic"><input type="checkbox" data-generic="1"> ${m.generic}</label>` +
+      [...offered].map(([e, n]) =>
+        `<label class="opt"><input type="checkbox" data-ext="${esc(e)}"> ${esc(extLabel(e))} <span class="n">${n}</span></label>`).join("");
+  }
+}
+function syncExtMenus() {
+  for (const [name, m] of Object.entries(EXT_MENUS)) {
+    const menu = $(name + "Menu"), shown = [...m.sel].map(extLabel);
+    menu.querySelector(".val").textContent = !shown.length ? m.generic
+      : shown.length <= 3 ? shown.join(", ") : `${shown.slice(0, 3).join(", ")} +${shown.length - 3}`;
+    for (const box of $(name + "Panel").querySelectorAll("input"))
+      box.checked = "generic" in box.dataset ? m.sel.size === 0 : m.sel.has(box.dataset.ext);
+    const waiting = EXT_MENUS[m.other].sel.size > 0;
+    menu.classList.toggle("off", waiting);
+    menu.inert = waiting;
+    if (waiting) menu.open = false;
+  }
+}
+function pickExtension(name, box) {
+  const m = EXT_MENUS[name];
+  if ("generic" in box.dataset) m.sel.clear();  // ALL / NONE: back to no filter
+  else if (box.checked) m.sel.add(box.dataset.ext);
+  else m.sel.delete(box.dataset.ext);  // the last one unchecked is the generic choice again
+  syncExtMenus();
+  offset = 0; runSearch({ reuse: true });
+}
+for (const name of Object.keys(EXT_MENUS))
+  $(name + "Panel").addEventListener("change", (e) => pickExtension(name, e.target));
+document.addEventListener("click", (e) => {  // a dropdown closes when the person clicks anywhere else
+  for (const d of document.querySelectorAll("details.multi[open]")) if (!d.contains(e.target)) d.open = false;
+});
+
 function clearResults() {
   $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0;
-  $("sortBox").hidden = true;
+  $("sortBox").hidden = true; $("extBar").hidden = true; clearExtSelection();
 }
 function setBusy(on) { $("progress").hidden = !on; }
 
@@ -159,8 +223,9 @@ function stopSearch() {
 }
 
 // reuse: another sort order or page of the same search, which the server still has; it only re-orders it
-async function runSearch({ reuse = false } = {}) {
+async function runSearch({ reuse = false, keepExt = false } = {}) {
   stopSearch();
+  if (!reuse && !keepExt) clearExtSelection();  // a new search has other extensions to choose from
   if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   const p = params(), mine = seq, ctl = new AbortController();
   inflight = { ctl, seq: mine };
@@ -177,14 +242,19 @@ async function runSearch({ reuse = false } = {}) {
   setBusy(false);
   const sum = $("summary");
   $("sortBox").hidden = !res.total;
+  extList = res.extensions || [];
+  const found = res.found_total ?? res.total;  // an error has neither
+  $("extBar").hidden = !found;
+  buildExtPanels(); syncExtMenus();
   if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
-  else if (!res.total) { sum.textContent = "No matches."; }
+  else if (!res.total) { sum.textContent = found ? "No files with the selected extensions." : "No matches."; }
   else {
-    sum.textContent = `${res.total}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
+    const count = res.total === found ? res.total : `${res.total} of ${found}`;
+    sum.textContent = `${count}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
   }
   $("results").innerHTML = res.results.map((r, i) => `
     <li class="hit">
-      <div class="dir">${esc(r.dir)}/</div>
+      <div class="dir">${esc(r.dir)}\\</div>
       <div class="name">${esc(r.name)}</div>
       <div class="snip">${r.snippet}</div>
       ${fmtMedia(r.media)}
@@ -320,9 +390,12 @@ const init = new URLSearchParams(location.search);
 for (const k of ["q", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
 $("names").checked = init.get("names") === "1";
 if (init.get("sort")) $("sort").value = init.get("sort");
+for (const [name, m] of Object.entries(EXT_MENUS))
+  if (!EXT_MENUS.only.sel.size && init.get(name + "_ext"))  // both at once is not offered: the first one wins
+    for (const e of init.get(name + "_ext").split(",")) if (e) m.sel.add(e === "." ? "" : e);
 for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
 offset = +(init.get("offset") || 0);
-if (init.get("q") || hasMediaFilter()) runSearch();
+if (init.get("q") || hasMediaFilter()) runSearch({ keepExt: true });
 refreshStatus(); setInterval(refreshStatus, 5000);
 </script>
 </body>

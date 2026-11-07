@@ -74,6 +74,14 @@ found for two minutes, so choosing another sort or turning a page only re-orders
 all the text again; a new search, or any change of the words or filters, searches again. The menu is part of the page address
 (`sort=`), and `/api/search` takes the same values.
 
+Below the count, two dropdowns with checkboxes narrow the found files by extension: **Show only files with
+extension(s)** (generic choice ALL) and **Exclude files with extension(s)** (generic choice NONE). They list the
+extensions of all found files with their counts, not just those of the page on screen. Choosing an extension in one
+menu greys the other out until the first is back at its generic choice (or its last extension is unchecked). Like a
+sort, this only re-orders the kept search, so it is instant; a new search starts again with ALL and NONE. The choices
+are part of the page address (`only_ext=pdf,txt`, `skip_ext=md`; a dot stands for files without an extension, which
+are only indexed when `text_extensions` lists an empty one).
+
 Punctuation in a word is part of the search: `kyo)` finds only text that has those four characters, and `c++` does
 not find every `c`. (The word index itself throws punctuation away, so what it finds for such a word is checked
 against the stored text.) To search for a `*` or `?` itself, tick Use RegEx and write `\*` or `\?`.

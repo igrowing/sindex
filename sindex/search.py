@@ -200,20 +200,37 @@ def _closest_together(positions: list[list[int]]) -> tuple[int, int]:
     return best
 
 
-def _sorted_by_file(conn: sqlite3.Connection, best: dict[int, int | None], sort: str) -> dict[int, int | None]:
-    """`best` (file id -> chunk) in the order of the file's path, name, size or date; equal files keep their order."""
+def _file_rows(conn: sqlite3.Connection, ids: list[int]) -> dict[int, tuple[str, str, int, int]]:
+    """file id -> (folder, name, size, mtime_ns) for these files."""
     rows: dict[int, tuple[str, str, int, int]] = {}
-    ids = list(best)
     for i in range(0, len(ids), 500):
         batch = ids[i:i + 500]
         marks = ", ".join("?" for _ in batch)
         for fid, folder, name, size, mtime in conn.execute(
                 f"SELECT id, dir, name, size, mtime_ns FROM files WHERE id IN ({marks})", batch):
-            rows[fid] = (folder.casefold(), name.casefold(), size, mtime)
+            rows[fid] = (folder, name, size, mtime)
+    return rows
+
+
+def extension_of(name: str) -> str:
+    """The extension of a file name as the extension menus list it: after the last dot, lower case, "" for none."""
+    return os.path.splitext(name)[1].lstrip(".").lower()
+
+
+def _extensions(conn: sqlite3.Connection, found: Found) -> dict[int, str]:
+    if found.extensions is None:
+        found.extensions = {fid: extension_of(row[1]) for fid, row in _file_rows(conn, list(found.best)).items()}
+    return found.extensions
+
+
+def _sorted_by_file(conn: sqlite3.Connection, best: dict[int, int | None], sort: str) -> dict[int, int | None]:
+    """`best` (file id -> chunk) in the order of the file's path, name, size or date; equal files keep their order."""
+    rows = {fid: (folder.casefold(), name.casefold(), size, mtime)
+            for fid, (folder, name, size, mtime) in _file_rows(conn, list(best)).items()}
     column, _, direction = sort.partition("_")
     keys = {"path": lambda r: (r[0], r[1]), "name": lambda r: (r[1], r[0]), "size": lambda r: r[2],
             "date": lambda r: r[3]}
-    ordered = sorted((fid for fid in ids if fid in rows), key=lambda fid: keys[column](rows[fid]),
+    ordered = sorted((fid for fid in best if fid in rows), key=lambda fid: keys[column](rows[fid]),
                      reverse=direction == "desc")
     return {fid: best[fid] for fid in ordered}
 
@@ -395,6 +412,7 @@ class Found:
     # file id -> (distance, chunk rowid) of the chunk in which the searched words are closest to each other;
     # worked out when first asked for
     closest: dict[int, tuple[int, int]] | None = None
+    extensions: dict[int, str] | None = None  # file id -> extension (lower case, no dot, "" for none); same
 
 
 def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
@@ -629,7 +647,7 @@ def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[i
 
 
 def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", offset: int = 0,
-            limit: int = 20) -> dict:
+            limit: int = 20, only: frozenset[str] | None = None, skip: frozenset[str] = frozenset()) -> dict:
     """One page of `found`, in the order of `sort` (one of SORTS), with a snippet for each file.
 
     The order is applied to all the files that were found, before the page is cut from it. "relevance" keeps
@@ -640,6 +658,7 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
     if sort not in SORTS:
         raise SearchError(f"Unknown sort order {sort!r}.")
     best = found.best
+    extensions = _extensions(conn, found)
     closest = _closest_chunks(conn, found) if found.by_proximity else {}
     if closest:
         best = {fid: closest[fid][1] if fid in closest else rowid for fid, rowid in best.items()}  # show that chunk
@@ -650,6 +669,14 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
         position = {fid: n for n, fid in enumerate(best)}
         ranked = sorted(best, key=lambda f: (f not in closest, closest[f][0] if f in closest else 0, position[f]))
         best = {fid: best[fid] for fid in ranked}
+    counts: dict[str, int] = {}
+    for ext in extensions.values():
+        counts[ext] = counts.get(ext, 0) + 1
+    # what is on offer to select: all found files, whatever is selected now
+    offered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    if only is not None or skip:
+        best = {fid: rowid for fid, rowid in best.items()
+                if (only is None or extensions.get(fid) in only) and extensions.get(fid) not in skip}
     matcher = found.matcher
 
     results = []
@@ -679,15 +706,17 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
                       "camera": f[10]} if f[5] else None,
         })
     return {"results": results, "total": len(best), "capped": found.capped, "error": None,
-            "negative_only": found.negative_only}
+            "negative_only": found.negative_only, "found_total": len(found.best),
+            "extensions": [list(item) for item in offered]}
 
 
 def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
            after: str | None = None, before: str | None = None, offset: int = 0, limit: int = 20, *,
-           sort: str = "relevance", **options: Any) -> dict:
+           sort: str = "relevance", only: frozenset[str] | None = None, skip: frozenset[str] = frozenset(),
+           **options: Any) -> dict:
     """find() and present() in one call, with a failure reported as {"error": ...}; `options` are those of find()."""
     try:
         return present(conn, find(conn, query, path, exts, after, before, **options),
-                       sort=sort, offset=offset, limit=limit)
+                       sort=sort, offset=offset, limit=limit, only=only, skip=skip)
     except SearchError as e:
         return {"results": [], "total": 0, "capped": False, "error": str(e)}
