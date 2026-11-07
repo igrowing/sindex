@@ -8,8 +8,9 @@ the header-only guarantee this extractor exists to keep.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Iterator
+
+import regex
 
 from . import Context, ExtractError, MediaFields
 
@@ -18,7 +19,7 @@ log = logging.getLogger(__name__)
 PARSE_SPEED = 0.3
 
 # QuickTime ©xyz / ISO 6709: "+40.6892-074.0445/" (lat, lon, optional altitude, trailing slash).
-_ISO6709 = re.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)")
+_ISO6709 = regex.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)")
 
 _missing_library_logged = False
 
@@ -27,7 +28,7 @@ def _taken_at(value: str | None) -> str | None:
     """"YYYY-MM-DD HH:MM:SS" (optionally with a trailing zone) to ISO 8601; unparsable is dropped."""
     if not value:
         return None
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", value.strip())
+    m = regex.match(r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", value.strip())
     if not m:
         return None
     y, mo, d, h, mi, s = m.groups()

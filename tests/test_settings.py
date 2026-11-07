@@ -172,9 +172,10 @@ def test_a_body_that_is_not_an_object_is_a_400_not_a_crash(web):
 def test_the_settings_script_quotes_its_attribute_selectors():
     # [data-tab=${name}] is a syntax error for an empty name (a plain /settings has no #tab), which stopped
     # the script before it built any field; only a browser can run the page, so this guards the pattern
-    import re
     from pathlib import Path
+
+    import regex
 
     page = (Path(__file__).parent.parent / "sindex" / "web" / "static" / "settings.html").read_text(encoding="utf-8")
 
-    assert not re.findall(r"\[data-\w+=\$\{", page)
+    assert not regex.findall(r"\[data-\w+=\$\{", page)

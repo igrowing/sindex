@@ -55,11 +55,31 @@ Reading the USN journal needs administrator rights. Without them, sindex falls b
 start http://127.0.0.1:8765/
 ```
 
-The search box searches while you type: after a 0.2 s pause a quick search ranks only the best 200 hits (no file-name
-scan), and `search_complete_after_s` seconds (default 1, `[web]`; 0 = off) after the last keystroke the same query is
-repeated with the full limit of 2000. Enter always runs the full search. The web server answers requests on threads
-(at most two searches at a time); a newer search of the same browser tab cancels the older one inside SQLite, and a
-search that runs longer than 30 s is stopped.
+**Searching.** A search starts when you press Enter, or by itself `search_complete_after_s` seconds (default 1,
+`[web]`; 0 = Enter only) after your last keystroke. Changing the text stops a running search, and a moving line under
+the search box shows that one is running. A search has three steps, in this order of ranking:
+
+1. the word index: whole words and prefixes (`kyo`, `kyo*`), accents ignored, ranked by relevance; instant;
+2. a scan of the stored text of every file for the same words *inside* other words, so `kyo` also finds `tokyo` and
+   `kyoto`. `*` and `?` inside a word are wildcards (`k?o`, `ky*to`). The stored text keeps its original letters, so
+   this needs no second index and no extra disk space, but it reads all of it: on a 921 MB index about 2-3 s, and
+   up to about 8 s for a complicated regular expression, growing in step with the index;
+3. folder and file names, only if the names box is ticked.
+
+Three independent checkboxes sit under the search box: **Also in folder- and file-names**, **Use RegEx** and **Case
+sensitive** (`sindex search --names --regex --case` on the command line). Names adds the folder and file names to the
+search. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`).
+Use RegEx turns the whole query into one Python regular expression for the contents (`^` and `$` match at line
+starts and ends) and, with the names box, for the full path (`D:\folder\file.txt`); case is ignored unless Case
+sensitive is also ticked. A pattern is limited to 200 characters.
+
+The web server answers requests on threads, at most two searches at a time. A newer search of the same browser tab
+cancels the older one inside SQLite, editing the box cancels the running one, and a search that runs longer than 30 s
+is stopped. Regular expressions run on the third-party `regex` module, the only regular-expression library the
+program uses: unlike the standard `re` it can stop a match that has run away (a pattern that needs more than 0.5 s
+on one path or 1 s on one piece of text is refused with a message) and lets other threads work meanwhile, so a bad
+pattern cannot freeze the service. `requirements.txt` lists every third-party module. The Explorer search connector
+(`/api/search.rss`) asks on every keystroke and therefore uses the word index only, without the scan.
 
 `sindex install` also puts a "sindex search" shortcut to the web UI on the all-users Desktop and in the Start menu
 (`sindex remove` deletes them). They open `http://<web_host>:<web_port>/` from `config.toml`; the UI is served over

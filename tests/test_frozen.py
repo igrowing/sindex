@@ -1,10 +1,10 @@
 """What differs when sindex runs as the PyInstaller executable, and how the executable installs itself."""
 
-import re
 import subprocess
 import sys
 
 import pytest
+import regex
 
 from sindex import cli, service
 
@@ -54,7 +54,7 @@ def test_the_internal_commands_are_not_advertised(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--help"])
 
-    commands = re.search(r"\{([^}]*)\}", capsys.readouterr().out).group(1).split(",")
+    commands = regex.search(r"\{([^}]*)\}", capsys.readouterr().out).group(1).split(",")
     assert "install" in commands and not {"service", "indexer"} & set(commands)
 
 

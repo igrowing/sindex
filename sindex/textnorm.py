@@ -14,9 +14,10 @@ The encoding is reversible (see `decode_display`), so snippets read naturally.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from collections.abc import Iterable, Iterator
+
+import regex
 
 BIGRAM_SEP = "\ue000"
 RUN_START = "\ue001"
@@ -29,21 +30,21 @@ _CJK = (
     "\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f"
     "\U00020000-\U0002ffff"
 )
-_CJK_RUN = re.compile(f"[{_CJK}]+")
-_CJK_CHAR = re.compile(f"[{_CJK}]")
+_CJK_RUN = regex.compile(f"[{_CJK}]+")
+_CJK_CHAR = regex.compile(f"[{_CJK}]")
 
-_GREEK = re.compile("[\u0370-\u03ff\u1f00-\u1fff]")
-_GREEK_MARKS = re.compile("([\u0370-\u03ff\u1f00-\u1fff])[\u0300-\u036f]+")
-_SEMITIC_MARKS = re.compile(
+_GREEK = regex.compile("[\u0370-\u03ff\u1f00-\u1fff]")
+_GREEK_MARKS = regex.compile("([\u0370-\u03ff\u1f00-\u1fff])[\u0300-\u036f]+")
+_SEMITIC_MARKS = regex.compile(
     "[\u0591-\u05bd\u05bf\u05c1\u05c2\u05c4\u05c5\u05c7"  # Hebrew points and cantillation
     "\u0610-\u061a\u0640\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4\u06e7\u06e8\u06ea-\u06ed]"  # Arabic
 )
-_SURROGATE = re.compile("[\ud800-\udfff]")
+_SURROGATE = regex.compile("[\ud800-\udfff]")
 # Control characters (except tab/newline) and our own private-use markers.
-_JUNK = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufeff\ue000-\ue004]")
+_JUNK = regex.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufeff\ue000-\ue004]")
 
 
-def _encode_run(m: re.Match) -> str:
+def _encode_run(m: regex.Match) -> str:
     run = m.group()
     if len(run) == 1:
         return RUN_START + run + RUN_END

@@ -27,7 +27,12 @@
       <input id="q" type="search" placeholder="Search file contents…" autofocus>
       <button type="submit">Search</button>
     </div>
-    <label class="check"><input id="names" type="checkbox"> Also in folder- and file-names</label>
+    <div id="progress" class="progress" role="progressbar" aria-label="Searching" hidden></div>
+    <div class="checks">
+      <label class="check"><input id="names" type="checkbox"> Also in folder- and file-names</label>
+      <label class="check" title="The query becomes one regular expression for the full path (folder\file name); only folder and file names are searched, not contents. Runs on Enter or after the pause, not on every keystroke."><input id="regex" type="checkbox"> Use RegEx</label>
+      <label class="check" title="Folder and file names must match the typed letters exactly (also with RegEx). File contents are always searched without case."><input id="case" type="checkbox"> Case sensitive</label>
+    </div>
     <div class="row filters">
       <label>In folder <input id="path" placeholder="D:\Documents"></label>
       <label>Extensions <input id="ext" placeholder="pdf docx"></label>
@@ -67,11 +72,10 @@
 const TOKEN = {{TOKEN}};
 const $ = (id) => document.getElementById(id);
 const PAGE = 20;
-const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds of typing pause before the full search; 0 = never
-const TYPE_DELAY_MS = 200;  // pause that makes a keystroke worth a quick search
+const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds without typing before the search starts by itself; 0 = Enter only
 const TAB = Math.random().toString(36).slice(2, 12);  // lets the server stop this tab's superseded searches
 let offset = 0;
-let seq = 0, inflight = null, typeTimer = null, completeTimer = null, lastQuick = null;
+let seq = 0, inflight = null, typeTimer = null;
 
 function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
@@ -108,45 +112,56 @@ async function openFile(path) {
 }
 
 const MEDIA_KEYS = ["kind", "camera", "has_gps", "min_height", "min_duration", "max_duration", "taken_after", "taken_before"];
+const NAME_MODS = ["regex", "case"];  // independent of "names" and of each other
 function hasMediaFilter() { return MEDIA_KEYS.some((k) => $(k).value); }
 
 function params() {
   const p = new URLSearchParams({ q: $("q").value, offset });
   for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
+  for (const k of NAME_MODS) if ($(k).checked) p.set(k, "1");
   return p;
 }
 
-function stopInflight() {
-  if (inflight) inflight.abort();
-  inflight = null; seq++;  // an answer that is still on its way is no longer wanted
+function clearResults() {
+  $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0;
 }
-function cancelPending() {
-  clearTimeout(typeTimer); clearTimeout(completeTimer); completeTimer = null;
-  stopInflight();
+function setBusy(on) { $("progress").hidden = !on; }
+
+// The search that is running is no longer wanted. Closing the request does not stop the query inside the
+// server, so the server is told as well.
+function stopSearch() {
+  clearTimeout(typeTimer); typeTimer = null;
+  if (inflight) {
+    inflight.ctl.abort();
+    fetch("/api/search/cancel?" + new URLSearchParams({ tab: TAB, seq: inflight.seq }), { keepalive: true }).catch(() => {});
+    inflight = null;
+  }
+  seq++;  // an answer that is still on its way is dropped
+  setBusy(false);
 }
 
-// quick: a search while typing (the server ranks few hits); otherwise the full one
-async function runSearch({ quick = false } = {}) {
-  if (quick) stopInflight(); else cancelPending();  // a quick search leaves the timer of the full one running
-  if (!$("q").value.trim() && !hasMediaFilter()) { $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0; return; }
-  const p = params(), mine = seq, ctl = inflight = new AbortController();
+async function runSearch() {
+  stopSearch();
+  if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
+  const p = params(), mine = seq, ctl = new AbortController();
+  inflight = { ctl, seq: mine };
+  setBusy(true);
+  $("summary").textContent = "Searching…";
   history.replaceState(null, "", "?" + p);
   const q = new URLSearchParams(p);
   q.set("tab", TAB); q.set("seq", mine);
-  if (quick) q.set("quick", "1");
   const res = await fetch("/api/search?" + q, { signal: ctl.signal }).then(r => r.json())
     .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
-  if (!res || mine !== seq || res.cancelled) return;  // superseded by a newer search
+  if (!res || mine !== seq || res.cancelled) return;  // stopped or replaced by a newer search
   inflight = null;
-  lastQuick = quick ? { key: p.toString(), capped: !!res.capped } : null;
+  setBusy(false);
   const sum = $("summary");
   if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
   else if (!res.total) { sum.textContent = "No matches."; }
   else {
     sum.textContent = `${res.total}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
   }
-  if (quick && completeTimer) sum.textContent += " · completing…";
   $("results").innerHTML = res.results.map((r, i) => `
     <li class="hit">
       <div class="name">${esc(r.name)}</div>
@@ -253,28 +268,23 @@ async function refreshStatus() {
   $("pauseBtn").dataset.paused = ix.user_paused ? "1" : "";
 }
 
-// Search as you type: quick searches after a short pause, the full one after COMPLETE_AFTER seconds
+// Searching starts on Enter, or by itself COMPLETE_AFTER seconds after the last keystroke. Any change of the
+// text stops the search that is running and waits again.
 function onType() {
-  cancelPending();
+  const wasRunning = !!inflight;
+  stopSearch();
   offset = 0;
-  const text = $("q").value.trim();
-  if (!text) { runSearch(); return; }  // clears the results
-  if (text.length < 2 && !/\P{ASCII}/u.test(text)) return;  // one ASCII letter matches nearly everything
-  typeTimer = setTimeout(() => runSearch({ quick: true }), TYPE_DELAY_MS);
-  if (COMPLETE_AFTER > 0) completeTimer = setTimeout(completeSearch, COMPLETE_AFTER * 1000);
-}
-function completeSearch() {
-  completeTimer = null;
-  // a quick answer that was not cut short and had no name scan to skip is already the full one
-  if (lastQuick && lastQuick.key === params().toString() && !lastQuick.capped && !$("names").checked) {
-    $("summary").textContent = $("summary").textContent.replace(" · completing…", "");
-    return;
+  if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
+  if (wasRunning) {
+    $("summary").textContent = COMPLETE_AFTER > 0 ? "Search stopped; it starts again when you pause typing."
+                                                  : "Search stopped; press Enter to search again.";
   }
-  runSearch();
+  if (COMPLETE_AFTER > 0) typeTimer = setTimeout(runSearch, COMPLETE_AFTER * 1000);
 }
 $("q").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
+for (const k of NAME_MODS) $(k).onchange = () => { offset = 0; runSearch(); };
 for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });
 $("pauseBtn").onclick = async () => {
   await post($("pauseBtn").dataset.paused ? "resume" : "pause"); refreshStatus();
@@ -288,6 +298,7 @@ $("reindexBtn").onclick = async () => {
 const init = new URLSearchParams(location.search);
 for (const k of ["q", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
 $("names").checked = init.get("names") === "1";
+for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
 offset = +(init.get("offset") || 0);
 if (init.get("q") || hasMediaFilter()) runSearch();
 refreshStatus(); setInterval(refreshStatus, 5000);

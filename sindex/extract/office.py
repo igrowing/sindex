@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import zipfile
 from collections.abc import Iterable, Iterator
 from xml.parsers import expat
+
+import regex
 
 from . import Context, ExtractError
 
@@ -103,7 +104,7 @@ def _check_members(zf: zipfile.ZipFile, names: Iterable[str]) -> list[zipfile.Zi
 
 
 def _numbered(names: Iterable[str], pattern: str) -> list[str]:
-    rx = re.compile(pattern)
+    rx = regex.compile(pattern)
     found = [(int(m.group(1)), n) for n in names if (m := rx.fullmatch(n))]
     return [n for _, n in sorted(found)]
 

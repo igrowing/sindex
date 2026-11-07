@@ -1,4 +1,4 @@
-"""Search while typing: the hit limit, the per-tab "latest search wins" rule, the deadline, the setting."""
+"""Controlling a search: the hit limit, cancelling, the per-tab "latest search wins" rule, the deadline."""
 
 import json
 import socket
@@ -10,7 +10,7 @@ import pytest
 
 from sindex import config, db
 from sindex.indexer import Indexer
-from sindex.search import HIT_LIMIT, LIVE_HIT_LIMIT, search
+from sindex.search import search
 from sindex.web.server import SearchRegistry, SearchTicket, WebServer
 
 from .conftest import call
@@ -30,14 +30,16 @@ def many(cfg, tmp_path):
     return cfg
 
 
-def test_the_live_limit_is_a_tenth_of_the_full_one():
-    assert LIVE_HIT_LIMIT == 200 and HIT_LIMIT == 2000
-
-
-def test_hit_limit_caps_the_ranked_hits(many):
+def test_hit_limit_caps_the_ranked_hits(many, monkeypatch):
+    monkeypatch.setattr("sindex.search.HIT_LIMIT", 5)
     conn = db.connect(many.db_path, readonly=True)
     try:
-        small = search(conn, "common", hit_limit=5)
+        small = search(conn, "common")
+    finally:
+        conn.close()
+    monkeypatch.undo()
+    conn = db.connect(many.db_path, readonly=True)
+    try:
         full = search(conn, "common")
     finally:
         conn.close()
@@ -49,21 +51,11 @@ def test_hit_limit_caps_the_ranked_hits(many):
 def test_hit_limit_caps_the_name_scan_too(many):
     conn = db.connect(many.db_path, readonly=True)
     try:
-        res = search(conn, "common", names=True, hit_limit=1000)
+        res = search(conn, "common", names=True)
     finally:
         conn.close()
 
     assert res["total"] == 41  # 40 by content, 1 more by name
-
-
-def test_quick_search_skips_the_name_scan_and_says_so(web, many):
-    _, body = call(web, "/api/search?q=common&names=1&quick=1")
-    quick = json.loads(body)
-    _, body = call(web, "/api/search?q=common&names=1")
-    full = json.loads(body)
-
-    assert quick["quick"] is True and quick["total"] == 40
-    assert full["quick"] is False and full["total"] == 41
 
 
 def test_a_newer_search_of_the_tab_cancels_the_older_one():
@@ -114,6 +106,27 @@ def test_a_finished_search_leaves_no_trace():
     assert registry._current == {}
 
 
+def test_cancel_stops_the_running_search_of_that_tab_only():
+    registry = SearchRegistry()
+    mine = registry.begin("mine", 4)
+    other = registry.begin("other", 4)
+
+    registry.cancel("mine", 4)
+
+    assert mine.cancelled and not other.cancelled
+
+
+def test_cancel_leaves_a_newer_search_alone():
+    # the page cancels search 3 when the user edits the box, then starts search 5; the cancel may arrive late
+    registry = SearchRegistry()
+    newer = registry.begin("tab", 5)
+
+    registry.cancel("tab", 3)
+    registry.cancel("unknown-tab", 9)  # nothing is running there: not an error
+
+    assert not newer.cancelled
+
+
 def test_the_progress_handler_stops_a_running_statement_when_cancelled():
     ticket = SearchTicket(1, timeout_s=60)
     conn = sqlite3.connect(":memory:")
@@ -152,6 +165,23 @@ def test_the_api_answers_a_superseded_search_as_cancelled(cfg, many):
     assert status == 200
     data = json.loads(body)
     assert data["cancelled"] is True and data["results"] == []
+
+
+def test_the_cancel_endpoint_stops_the_search_the_page_gave_up_on(cfg, many):
+    cfg.web_port = _free_port()
+    server = WebServer(cfg)
+    server.start()
+    try:
+        running = server._server.searches.begin("tab1", 7)
+        newer = server._server.searches.begin("tab2", 9)
+        assert call(cfg, "/api/search/cancel?tab=tab1&seq=7")[0] == 200
+        call(cfg, "/api/search/cancel?tab=tab2&seq=8")  # an older search than the running one
+        assert call(cfg, "/api/search/cancel?tab=../x&seq=1")[0] == 200  # a bad id is ignored
+        assert call(cfg, "/api/search/cancel?tab=tab1&seq=x")[0] == 400
+    finally:
+        server.stop()
+
+    assert running.cancelled and not newer.cancelled
 
 
 def test_the_api_ignores_a_malformed_tab_id(web, many):

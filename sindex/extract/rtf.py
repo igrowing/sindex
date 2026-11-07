@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 import codecs
-import re
 from collections.abc import Iterator
+
+import regex
 
 from . import Context, ExtractError
 
 BLOCK_BYTES = 64 * 1024
 
-_TOKEN = re.compile(
+_TOKEN = regex.compile(
     r"\\([a-zA-Z]{1,32})(-?\d{1,10})? ?"  # control word
     r"|\\'([0-9a-fA-F]{2})"  # hex-escaped byte
     r"|\\(.)"  # control symbol
     r"|([{}])"
     r"|([^\\{}\r\n]+)"  # plain text run
     r"|[\r\n]+",
-    re.DOTALL,
+    regex.DOTALL,
 )
 
 # destinations whose content is not document text
@@ -82,7 +83,7 @@ class _Rtf:
             self.flush_bytes()
             self.out.append(text)
 
-    def feed_token(self, m: re.Match) -> None:
+    def feed_token(self, m: regex.Match) -> None:
         word, arg, hexbyte, symbol, brace, text = m.groups()
         at_group_start, self.group_start = self.group_start, False
         if brace == "{":

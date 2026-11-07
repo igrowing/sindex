@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import re
 import stat
+
+import regex
 
 from .config import Config
 from .extract import file_ext, kind_of
@@ -41,7 +42,7 @@ def dedupe_roots(roots: list[str]) -> list[str]:
     return kept
 
 
-def compile_globs(patterns: list[str]) -> tuple[frozenset[str], list[re.Pattern], list[re.Pattern]]:
+def compile_globs(patterns: list[str]) -> tuple[frozenset[str], list[regex.Pattern], list[regex.Pattern]]:
     r"""Split exclude entries into (plain names, patterns for the name, patterns for the whole path).
 
     A pattern with a backslash is a path pattern, one without is about the name alone, so that "*.env"
@@ -49,14 +50,15 @@ def compile_globs(patterns: list[str]) -> tuple[frozenset[str], list[re.Pattern]
     below any .ssh folder.
     """
     names: set[str] = set()  # a plain name is a set lookup, not a regular expression
-    by_name: list[re.Pattern] = []
-    by_path: list[re.Pattern] = []
+    by_name: list[regex.Pattern] = []
+    by_path: list[regex.Pattern] = []
     for pattern in patterns:
         pattern = pattern.replace("/", "\\")
-        if not re.search(r"[*?\[\\]", pattern):
+        if not regex.search(r"[*?\[\\]", pattern):
             names.add(pattern.lower())
         else:
-            (by_path if "\\" in pattern else by_name).append(re.compile(fnmatch.translate(pattern), re.IGNORECASE))
+            compiled = regex.compile(fnmatch.translate(pattern), regex.IGNORECASE)
+            (by_path if "\\" in pattern else by_name).append(compiled)
     return frozenset(names), by_name, by_path
 
 

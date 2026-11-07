@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import codecs
-import re
 from collections.abc import Iterator
 from html.parser import HTMLParser
 
 import charset_normalizer
+import regex
 
 from . import Context, NotText
 
@@ -21,9 +21,9 @@ _BOMS = [
     (codecs.BOM_UTF16_LE, "utf-16"),
     (codecs.BOM_UTF16_BE, "utf-16"),
 ]
-_DECLARED = re.compile(
-    rb"""<\?xml[^>]*encoding=["']([\w.:-]+)|<meta[^>]*charset=["']?([\w.:-]+)""", re.IGNORECASE)
-_CONTROL = re.compile(rb"[\x00-\x08\x0e-\x1a\x1c-\x1f]")
+_DECLARED = regex.compile(
+    rb"""<\?xml[^>]*encoding=["']([\w.:-]+)|<meta[^>]*charset=["']?([\w.:-]+)""", regex.IGNORECASE)
+_CONTROL = regex.compile(rb"[\x00-\x08\x0e-\x1a\x1c-\x1f]")
 
 
 def _valid_utf8(sample: bytes, *, complete: bool) -> bool:

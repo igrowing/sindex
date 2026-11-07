@@ -7,7 +7,6 @@ import ctypes
 import html
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +14,8 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlencode
+
+import regex
 
 from . import config, control, db
 from .search import search
@@ -88,13 +89,13 @@ def cmd_search(args) -> int:
     cfg = _cfg(args)
     conn = db.connect(cfg.db_path, readonly=True)
     res = search(conn, " ".join(args.query), path=args.path, exts=args.ext, limit=args.limit,
-                 names=args.names)
+                 names=args.names, regex=args.regex, case_sensitive=args.case)
     if res["error"]:
         print(res["error"], file=sys.stderr)
         return 1
     for r in res["results"]:
         print(r["path"])
-        print("    " + html.unescape(re.sub(r"</?mark>", "*", r["snippet"])))
+        print("    " + html.unescape(regex.sub(r"</?mark>", "*", r["snippet"])))
     print(f"-- {res['total']}{'+' if res['capped'] else ''} files")
     return 0
 
@@ -465,6 +466,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ext", action="append")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--names", action="store_true", help="also match folder and file names")
+    p.add_argument("--regex", action="store_true",
+                   help="the query is a regular expression for the full path of the file (names only, not contents)")
+    p.add_argument("--case", action="store_true", help="folder and file names are matched case-sensitively")
     p.set_defaults(func=cmd_search)
     sub.add_parser("status", help="show indexer status").set_defaults(func=cmd_status)
     sub.add_parser("pause", help="pause indexing").set_defaults(func=cmd_pause)

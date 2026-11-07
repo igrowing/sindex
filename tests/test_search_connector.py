@@ -1,7 +1,8 @@
 """The Explorer search connector: /opensearch.xml (the description) and /api/search.rss (the results)."""
 
-import re
 from urllib.parse import quote
+
+import regex
 
 from sindex.indexer import Indexer
 
@@ -48,7 +49,7 @@ def test_search_rss_with_no_match_is_an_empty_but_valid_feed(web, tmp_path):
     assert status == 200
     text = body.decode("utf-8")
     assert "<opensearch:totalResults>0</opensearch:totalResults>" in text
-    assert not re.search(r"<item>", text)
+    assert not regex.search(r"<item>", text)
 
 
 def test_search_rss_before_the_index_exists_is_an_empty_feed(web):

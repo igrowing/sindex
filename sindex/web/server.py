@@ -12,7 +12,6 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-import re
 import sqlite3
 import sys
 import threading
@@ -24,9 +23,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
+import regex
+
 from .. import config, control, db
 from ..config import Config
-from ..search import HIT_LIMIT, LIVE_HIT_LIMIT, search
+from ..search import search
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ RSS_PAGE = 20  # default number of items per page of the Explorer search connect
 RSS_PAGE_MAX = 100
 SEARCH_SLOTS = 2  # searches that run at the same time; each holds a connection and ranks up to HIT_LIMIT hits
 SEARCH_TIMEOUT_S = 30.0  # a query that runs longer is stopped, so an abandoned one cannot hold a slot for ever
-_TAB_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+_TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
 
 
@@ -84,6 +85,13 @@ class SearchRegistry:
                 old.cancelled = True
             self._current[tab] = ticket
         return ticket
+
+    def cancel(self, tab: str, seq: int) -> None:
+        """Stop the tab's running search if it is `seq` or older (a newer one is not what the page gave up on)."""
+        with self._lock:
+            ticket = self._current.get(tab)
+            if ticket is not None and ticket.seq <= seq:
+                ticket.cancelled = True
 
     def end(self, tab: str | None, ticket: SearchTicket) -> None:
         if tab is None:
@@ -151,6 +159,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._log(q)
         if url.path == "/api/search":
             return self._search(q)
+        if url.path == "/api/search/cancel":
+            return self._cancel_search(q)
         if url.path == "/api/status":
             return self._status()
         if url.path == "/opensearch.xml":
@@ -263,9 +273,6 @@ class _Handler(BaseHTTPRequestHandler):
         if conn is None:
             return self._json({"results": [], "total": 0, "error": "The index does not exist yet."})
         tab = q["tab"] if _TAB_ID.fullmatch(q.get("tab", "")) else None
-        # "quick" is a search while the user types: few hits, no slow name scan; the page follows it with a
-        # full one once the typing pauses
-        quick = q.get("quick") == "1"
         searches = self.server.searches
         try:
             ticket = searches.begin(tab, int(q.get("seq", 0) or 0))
@@ -277,7 +284,7 @@ class _Handler(BaseHTTPRequestHandler):
             with self.server.search_slots:  # waiting here is cheap: a newer search may cancel this one meanwhile
                 if not ticket.cancelled:
                     conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
-                    result = self._run_search(conn, q, quick=quick)
+                    result = self._run_search(conn, q)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         except sqlite3.OperationalError:
@@ -292,17 +299,26 @@ class _Handler(BaseHTTPRequestHandler):
             result = {"results": [], "total": 0, "capped": False,
                       "error": f"The search took longer than {SEARCH_TIMEOUT_S:.0f} s and was stopped. Try more words."}
         assert result is not None, "a search that was not stopped has a result"
-        result["quick"] = quick
         self._json(result)
 
+    def _cancel_search(self, q: dict) -> None:
+        # the page calls this when its user edits the search box: closing the request does not stop the query
+        # inside SQLite, so the server is told
+        if _TAB_ID.fullmatch(q.get("tab", "")):
+            try:
+                self.server.searches.cancel(q["tab"], int(q.get("seq", 0) or 0))
+            except ValueError:
+                return self._json({"error": "bad seq"}, 400)
+        self._json({})
+
     @staticmethod
-    def _run_search(conn: sqlite3.Connection, q: dict, *, quick: bool) -> dict:
+    def _run_search(conn: sqlite3.Connection, q: dict) -> dict:
         exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
         return search(
             conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
             after=q.get("after") or None, before=q.get("before") or None,
-            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1" and not quick,
-            hit_limit=LIVE_HIT_LIMIT if quick else HIT_LIMIT,
+            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1",
+            regex=q.get("regex") == "1", case_sensitive=q.get("case") == "1",
             kind=q.get("kind") or None, camera=q.get("camera") or None,
             has_gps={"1": True, "0": False}.get(q.get("has_gps")),
             min_width=int(q["min_width"]) if q.get("min_width") else None,
@@ -344,7 +360,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _rss_item(self, r: dict) -> str:
         link = "file:///" + quote(r["path"].replace("\\", "/"), safe="/:")
-        snippet = re.sub(r"</?mark>", "", html_unescape(r["snippet"])) if r["snippet"] else ""
+        snippet = regex.sub(r"</?mark>", "", html_unescape(r["snippet"])) if r["snippet"] else ""
         modified = datetime.fromtimestamp(r["mtime"], tz=UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
         return (
             f"<item><title>{xml_escape(r['name'])}</title><link>{link}</link>"
@@ -365,7 +381,8 @@ class _Handler(BaseHTTPRequestHandler):
         total = 0
         if conn is not None:
             try:
-                result = search(conn, q.get("q", ""), offset=start - 1, limit=count)
+                # Explorer asks on every keystroke: the index-only answer, not the scan of the stored text
+                result = search(conn, q.get("q", ""), offset=start - 1, limit=count, contains=False)
             finally:
                 conn.close()
             results, total = result["results"], result["total"]

@@ -1,13 +1,13 @@
-import re
 from dataclasses import fields
 
 import pytest
+import regex
 
 from sindex import config
 
 
 def test_template_has_a_placeholder_for_every_setting_and_no_other():
-    placeholders = set(re.findall(r"^\w+ = \{(\w+)\}$", config.CONFIG_TEMPLATE, flags=re.MULTILINE))
+    placeholders = set(regex.findall(r"^\w+ = \{(\w+)\}$", config.CONFIG_TEMPLATE, flags=regex.MULTILINE))
     assert placeholders == {f.name for f in fields(config.Config)} - {"data_dir"}
 
 

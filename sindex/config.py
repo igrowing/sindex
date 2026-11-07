@@ -9,7 +9,6 @@ import json
 import logging
 import math
 import os
-import re
 import secrets
 import shutil
 import tomllib
@@ -17,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+import regex
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +103,8 @@ class Config:
     web_host: str = "127.0.0.1"
     web_port: int = 8765
     token: str = ""
-    # while typing, a search looks at few hits to stay quick; this long after the last change the page repeats it
-    # with the full hit limit. 0 = never refine.
+    # the search page starts a search by itself this long after the last keystroke (Enter always searches);
+    # 0 = on Enter only
     search_complete_after_s: float = 1.0
     # [storage]
     db_dir: str = ""  # where index.db lives; empty = the data directory
@@ -207,17 +208,17 @@ class ConfigError(ValueError):
         self.errors = errors
 
 
-_WINDOW = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
-_EXT = re.compile(r"[\w+~-]+")
-_EXT_PATTERN = re.compile(r"[\w+~*?-]+")
+_WINDOW = regex.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
+_EXT = regex.compile(r"[\w+~-]+")
+_EXT_PATTERN = regex.compile(r"[\w+~*?-]+")
 
 
 @functools.lru_cache(maxsize=8)
-def _ext_matcher(entries: tuple[str, ...]) -> tuple[frozenset[str], re.Pattern | None]:
+def _ext_matcher(entries: tuple[str, ...]) -> tuple[frozenset[str], regex.Pattern | None]:
     """Split excluded extensions into plain ones (a set lookup) and patterns (one regular expression)."""
-    literals = frozenset(e for e in entries if not re.search(r"[*?]", e))
-    wild = [fnmatch.translate(e) for e in entries if re.search(r"[*?]", e)]
-    return literals, re.compile("|".join(wild), re.IGNORECASE) if wild else None
+    literals = frozenset(e for e in entries if not regex.search(r"[*?]", e))
+    wild = [fnmatch.translate(e) for e in entries if regex.search(r"[*?]", e)]
+    return literals, regex.compile("|".join(wild), regex.IGNORECASE) if wild else None
 
 
 def parse_window(text: str) -> tuple[int, int]:
@@ -256,7 +257,7 @@ def _ext_pattern_item(text: str) -> str:
     ext = text.lower().removeprefix("*").lstrip(".") if text.startswith(("*.", ".")) else text.lower()
     if not _EXT_PATTERN.fullmatch(ext):
         raise ValueError(f"{text!r} is not a file extension (write it like pdf, .pdf or msi*)")
-    if not re.search(r"[^*?]", ext):
+    if not regex.search(r"[^*?]", ext):
         raise ValueError("would exclude every file")
     return ext
 
@@ -267,7 +268,7 @@ def _glob_item(text: str) -> str:
     # "*", "?*", "*\*"), or a bare "." not anchored at the very start (e.g. "*.*", the old DOS "every
     # file" wildcard), means the pattern matches almost any name; ".*" itself is kept, it is the
     # documented way to exclude dotfiles (it only matches names that literally start with a dot).
-    literal = re.sub(r"[*?\\]", "", pattern)
+    literal = regex.sub(r"[*?\\]", "", pattern)
     if not literal or (literal == "." and not pattern.startswith(".")):
         raise ValueError(f"{text!r} would exclude almost every file; name a folder or a narrower pattern instead")
     return pattern
@@ -291,7 +292,7 @@ def _check(key: str, value: object, *, check_paths: bool = False) -> object:
         if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
             raise ConfigError({key: "must be a list of non-empty texts"})
         if spec.items in ("ext", "extpat"):  # extensions may be typed separated by spaces, commas or lines
-            value = [word for text in value for word in re.split(r"[\s,;]+", text) if word]
+            value = [word for text in value for word in regex.split(r"[\s,;]+", text) if word]
         items: list[str] = []
         for text in value:
             try:
@@ -420,8 +421,7 @@ web_host = {web_host}
 web_port = {web_port}
 # Protects the pause/resume/reindex and settings actions of the web UI.
 token = {token}
-# Searching while you type looks at the best few hits only. This many seconds after your last keystroke the
-# search is repeated with the full limit (more files, names too). 0 = never.
+# A search starts when you press Enter, or by itself this many seconds after your last keystroke. 0 = Enter only.
 search_complete_after_s = {search_complete_after_s}
 """
 

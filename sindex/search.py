@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import html
 import os
-import re
 import sqlite3
 import unicodedata
 from datetime import datetime, timedelta
 
+import regex
+
 from . import db, textnorm
 
 HIT_LIMIT = 2000  # chunk hits considered per query; results are grouped per file
-LIVE_HIT_LIMIT = 200  # the same while the user is still typing: ranking fewer hits is what keeps a keystroke cheap
 SNIPPET_TOKENS = 24
+SNIPPET_CHARS = 80  # context on each side of a hit that the word index did not find (and so has no snippet())
+MAX_REGEX_CHARS = 200
+# The user's pattern runs on every path and on every chunk of stored text. The stdlib `re` holds the GIL while it
+# matches, so one catastrophic pattern froze the whole service; `regex` can give the GIL back (concurrent=True)
+# and stops a match by itself. A path is a few hundred characters and a chunk 16,000 (chunk_chars), so a match
+# that needs this long is a runaway, not a slow pattern.
+REGEX_PATH_TIMEOUT_S = 0.5
+REGEX_CHUNK_TIMEOUT_S = 1.0
 
-_TERM = re.compile(r'(-?)"([^"]*)"(\*?)|(\S+)')
-_WORDISH = re.compile(r"\w")
+_TERM = regex.compile(r'(-?)"([^"]*)"(\*?)|(\S+)')
+_WORDISH = regex.compile(r"\w")
 
 
 def _phrase(text: str, *, prefix: bool) -> str | None:
@@ -47,8 +55,10 @@ def _parse(query: str) -> tuple[list[list[tuple[str, bool]]], list[str]]:
                 continue
             neg = "-" if word.startswith("-") and len(word) > 1 else ""
             word = word[1:] if neg else word
-            star = "*" if word.endswith("*") and len(word) > 1 else ""
-            phrase = word.rstrip("*")
+            word = word.lstrip("*?")  # a wildcard at the front says nothing: words are found inside words anyway
+            star = "*" if word.endswith("*") else ""
+            phrase = word.rstrip("*?")  # the same at the end; a final question mark is just punctuation
+        phrase = phrase.strip("*?")
         if not _WORDISH.search(textnorm.normalize(phrase)):
             continue
         if neg:
@@ -63,7 +73,15 @@ def build_match(query: str) -> str | None:
     return _to_match(*_parse(query))
 
 
+def _is_wild(text: str) -> bool:
+    """A `*` or `?` inside a term (leading and trailing ones are stripped by _parse): FTS5 cannot match those."""
+    return "*" in text or "?" in text
+
+
 def _to_match(groups: list[list[tuple[str, bool]]], negatives: list[str]) -> str | None:
+    """The FTS5 expression for the part of the query the word index can answer; the scan answers the rest."""
+    groups = [g for g in groups if not any(_is_wild(text) for text, _ in g)]
+    negatives = [text for text in negatives if not _is_wild(text)]
     if not groups:
         return None
     expr = " OR ".join(" ".join(_fts_term(text, prefix=prefix) for text, prefix in g) for g in groups)
@@ -80,19 +98,122 @@ def _name_key(text: str) -> str:
     return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
 
-def _name_condition(groups: list[list[tuple[str, bool]]], negatives: list[str]) -> tuple[str, list[str]]:
-    """SQL for "the path contains the words", built from the same parse as the content query."""
-    path = "sindex_key(f.dir || '\\' || f.name)"
+def _like_pattern(text: str) -> str:
+    """LIKE pattern (ESCAPE '^') for a term: `*` is any text, `?` one character, the rest is literal."""
+    escaped = text.replace("^", "^^").replace("%", "^%").replace("_", "^_")
+    return escaped.replace("*", "%").replace("?", "_")
+
+
+def _name_condition(groups: list[list[tuple[str, bool]]], negatives: list[str], *,
+                    case_sensitive: bool = False) -> tuple[str, list[str]]:
+    """SQL for "the path contains the words", built from the same parse as the content query.
+
+    The words are compared without case and accents unless `case_sensitive` (then exactly as typed, with
+    GLOB). `*` and `?` inside a word are wildcards.
+    """
+    path = "f.dir || '\\' || f.name"
+    if case_sensitive:
+        test = f"({path}) GLOB ?"
+
+        def param(text: str) -> str:
+            return "*" + text.replace("[", "[[]") + "*"
+    else:
+        test = f"sindex_key({path}) LIKE ? ESCAPE '^'"
+
+        def param(text: str) -> str:
+            return "%" + _like_pattern(_name_key(text)) + "%"
+
     params: list[str] = []
     ors = []
     for group in groups:
-        ors.append("(" + " AND ".join(f"instr({path}, ?) > 0" for _ in group) + ")")
-        params += [_name_key(text) for text, _ in group]
+        ors.append("(" + " AND ".join(test for _ in group) + ")")
+        params += [param(text) for text, _ in group]
     cond = "(" + " OR ".join(ors) + ")"
     for text in negatives:
-        cond += f" AND instr({path}, ?) = 0"
-        params.append(_name_key(text))
+        cond += f" AND NOT ({test})"
+        params.append(param(text))
     return cond, params
+
+
+def _user_regex(pattern: str, *, case_sensitive: bool, multiline: bool) -> regex.Pattern[str]:
+    """The compiled pattern the user typed; ValueError says what is wrong with it."""
+    if not pattern.strip():
+        raise ValueError("Type a regular expression to search for.")
+    if len(pattern) > MAX_REGEX_CHARS:
+        raise ValueError(f"The regular expression is longer than {MAX_REGEX_CHARS} characters.")
+    flags = (0 if case_sensitive else regex.IGNORECASE) | (regex.MULTILINE if multiline else 0)
+    try:
+        return regex.compile(pattern, flags)
+    except regex.error as e:
+        raise ValueError(f"Invalid regular expression: {e}") from e
+
+
+def _term_pattern(text: str) -> str:
+    """Regular expression for one query term: the letters as typed, `*` any word characters, `?` one."""
+    out: list[str] = []
+    in_space = False
+    for ch in textnorm.fold(text):  # the stored text went through fold() too
+        if ch.isspace():
+            if not in_space:
+                out.append(r"\s+")
+            in_space = True
+            continue
+        in_space = False
+        out.append(r"\w*" if ch == "*" else r"\w" if ch == "?" else regex.escape(ch))
+    return "".join(out)
+
+
+class _ChunkMatcher:
+    """Does a chunk of stored text satisfy the query? The word index only knows whole words and folds case, so this
+    is the "contains" rule behind words found inside words, case sensitivity, wildcards and regular expressions.
+
+    It is called by SQLite for every chunk it scans. `timed_out` tells the caller that a pattern did not finish.
+    """
+
+    __slots__ = ("groups", "negatives", "timed_out")
+
+    def __init__(self, groups: list[list[regex.Pattern[str]]], negatives: list[regex.Pattern[str]]) -> None:
+        self.groups = groups  # OR of AND-lists; a chunk matches when all patterns of one list are found in it
+        self.negatives = negatives
+        self.timed_out = False
+
+    @classmethod
+    def for_terms(cls, groups: list[list[tuple[str, bool]]], negatives: list[str], *,
+                  case_sensitive: bool) -> _ChunkMatcher:
+        flags = 0 if case_sensitive else regex.IGNORECASE
+        return cls([[regex.compile(_term_pattern(text), flags) for text, _ in group] for group in groups],
+                   [regex.compile(_term_pattern(text), flags) for text in negatives])
+
+    @staticmethod
+    def _search(pattern: regex.Pattern[str], text: str) -> regex.Match[str] | None:
+        return pattern.search(text, timeout=REGEX_CHUNK_TIMEOUT_S, concurrent=True)
+
+    def __call__(self, body: str) -> bool:
+        text = textnorm.decode_display(body)
+        try:
+            if not any(all(self._search(p, text) for p in group) for group in self.groups):
+                return False
+            return not any(self._search(p, text) for p in self.negatives)
+        except TimeoutError:
+            self.timed_out = True
+            raise
+
+    def snippet(self, body: str) -> str:
+        """A piece of the chunk around the first hit, with the hits between highlight markers."""
+        text = textnorm.decode_display(body)
+        patterns = [p for group in self.groups for p in group]
+        try:
+            first = min((m for p in patterns if (m := self._search(p, text))), key=lambda m: m.start(), default=None)
+            if first is None:
+                return text[:2 * SNIPPET_CHARS]
+            lo, hi = max(0, first.start() - SNIPPET_CHARS), min(len(text), first.end() + SNIPPET_CHARS)
+            window = text[lo:hi]
+            for p in patterns:
+                window = p.sub(lambda m: textnorm.HL_START + m.group() + textnorm.HL_END if m.group() else "",
+                               window, timeout=REGEX_CHUNK_TIMEOUT_S, concurrent=True)
+        except TimeoutError:
+            return text[:2 * SNIPPET_CHARS]  # the hit was found; only its highlighting was too slow
+        return ("…" if lo else "") + window + ("…" if hi < len(text) else "")
 
 
 def snippet_html(raw: str) -> str:
@@ -152,20 +273,43 @@ def _date_ns(value: str | None, *, end: bool = False) -> int | None:
 
 def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
            after: str | None = None, before: str | None = None,
-           offset: int = 0, limit: int = 20, *, names: bool = False, hit_limit: int = HIT_LIMIT,
+           offset: int = 0, limit: int = 20, *, names: bool = False,
+           regex: bool = False, case_sensitive: bool = False, contains: bool = True,
            kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
            min_width: int | None = None, min_height: int | None = None,
            min_duration_s: float | None = None, max_duration_s: float | None = None,
            taken_after: str | None = None, taken_before: str | None = None) -> dict:
-    """Files whose text matches `query`; with `names`, also files whose folder or file name contains the words.
+    """Files whose text matches `query`; with `names`, also files whose folder or file name matches it.
 
-    Name-only matches come after the content matches and have `hits == 0` and no snippet. `kind` and the
-    other media filters narrow the results to images/videos with matching `media` fields; with an empty
-    `query` and at least one media filter set, this browses by filter alone (no keyword required).
-    `hit_limit` bounds the chunk hits that are ranked (`capped` says it was reached).
+    Hits are ranked in three steps: the word index first (whole words and prefixes, accents ignored), then a
+    scan of the stored text for the same words *inside* other words (`contains`), then name matches, which have
+    `hits == 0` and no snippet. The scan reads every chunk, about a second and a half per GB of index.
+    `*` and `?` inside a word are wildcards.
+
+    `names`, `regex` and `case_sensitive` are independent. `case_sensitive` compares the typed letters exactly,
+    in contents and, with `names`, in names. `regex` makes the whole query one regular expression for the
+    contents (and, with `names`, for the path: folder, backslash, file name). Case sensitivity and regular
+    expressions cannot use the word index and always scan.
+
+    `kind` and the other media filters narrow the results to images/videos with matching `media` fields; with
+    an empty `query` and at least one media filter set, this browses by filter alone (no keyword required).
     """
+    hit_limit = HIT_LIMIT  # read here so that a test can lower it
     groups, negatives = _parse(query)
-    match = _to_match(groups, negatives)
+    matcher = rx_path = None
+    if regex:
+        try:
+            matcher = _ChunkMatcher([[_user_regex(query, case_sensitive=case_sensitive, multiline=True)]], [])
+            if names:
+                rx_path = _user_regex(query, case_sensitive=case_sensitive, multiline=False)
+        except ValueError as e:
+            return {"results": [], "total": 0, "capped": False, "error": str(e)}
+        has_query, match = True, None
+    else:
+        has_query = bool(groups)
+        match = _to_match(groups, negatives)
+        if has_query:
+            matcher = _ChunkMatcher.for_terms(groups, negatives, case_sensitive=case_sensitive)
 
     where = []
     params: list = []
@@ -189,44 +333,105 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
         min_duration_s=min_duration_s, max_duration_s=max_duration_s,
         taken_after=taken_after, taken_before=taken_before)
     media_join = "JOIN media m ON m.file_id = f.id" if media_where else ""
+    chunk_join = f"FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) {media_join}"
 
-    if match is None:
+    best: dict[int, int | None] = {}  # file id -> best chunk rowid (None: name match only), in rank order
+    hits: dict[int, int] = {}
+    indexed: set[int] = set()  # the rowids in `best` that the word index found, so snippet() can show them
+    capped = False
+
+    if not has_query:
         if not media_where:
             return {"results": [], "total": 0, "capped": False, "error": "Type some words to search for."}
         # no keyword: browse by the media/path/ext/date filters alone, newest first
         sql = (f"SELECT f.id FROM files f {media_join} "
                f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT ?")
         fids = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
-        best: dict[int, int | None] = dict.fromkeys(fids)
-        hits: dict[int, int] = {}
+        best = dict.fromkeys(fids)
         capped = len(fids) >= hit_limit
     else:
-        sql = (f"SELECT chunks.rowid FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) "
-               f"{media_join} WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where])} "
-               "ORDER BY rank LIMIT ?")
-        try:
-            rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params, hit_limit])]
-        except sqlite3.OperationalError as e:
-            return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
+        assert matcher is not None, "a query has a matcher"
+        conn.create_function("sindex_chunk", 1, matcher, deterministic=True)
+        seen: set[int] = set()
 
-        best = {}  # file id -> best chunk rowid (None: name match only), in rank order
-        hits = {}
-        for rowid in rowids:
+        def add(rowid: int, *, from_index: bool) -> None:
+            if rowid in seen:
+                return
+            seen.add(rowid)
             fid = rowid >> db.CHUNK_BITS
-            best.setdefault(fid, rowid)
+            if fid not in best or best[fid] is None:
+                best[fid] = rowid
+                if from_index:
+                    indexed.add(rowid)
             hits[fid] = hits.get(fid, 0) + 1
-        capped = len(rowids) >= hit_limit
+
+        def slow_pattern() -> dict:
+            return {"results": [], "total": 0, "capped": False,
+                    "error": f"The regular expression took longer than {REGEX_CHUNK_TIMEOUT_S:g} s on some text; "
+                             "make it simpler or more specific."}
+
+        if match is not None:
+            # case sensitivity is checked on the stored text, which keeps the letters as they were written
+            exact = ["sindex_chunk(chunks.body)"] if case_sensitive else []
+            sql = (f"SELECT chunks.rowid {chunk_join} "
+                   f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where, *exact])} ORDER BY rank LIMIT ?")
+            try:
+                rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params, hit_limit])]
+            except sqlite3.OperationalError as e:
+                if matcher.timed_out:
+                    return slow_pattern()
+                return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
+            capped = len(rowids) >= hit_limit
+            for rowid in rowids:
+                add(rowid, from_index=True)
+
+        if regex or case_sensitive or contains:
+            sql = (f"SELECT chunks.rowid {chunk_join} "
+                   f"WHERE {' AND '.join([*where, *media_where, 'sindex_chunk(chunks.body)'])} LIMIT ?")
+            try:
+                scanned = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
+            except sqlite3.OperationalError:
+                if matcher.timed_out:
+                    return slow_pattern()
+                raise  # a cancelled or timed-out search, or a real error
+            capped = capped or len(scanned) >= hit_limit
+            for rowid in scanned:
+                add(rowid, from_index=False)
 
         if names:
             # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
-            conn.create_function("sindex_key", 1, _name_key, deterministic=True)
-            cond, name_params = _name_condition(groups, negatives)
+            if rx_path is not None:
+                slow: list[str] = []  # the first path the pattern did not finish on
+
+                def path_matches(text: str) -> bool:
+                    try:
+                        return rx_path.search(text, timeout=REGEX_PATH_TIMEOUT_S, concurrent=True) is not None
+                    except TimeoutError:
+                        slow.append(text)
+                        raise
+
+                conn.create_function("sindex_re", 1, path_matches, deterministic=True)
+                cond, name_params = "sindex_re(f.dir || ? || f.name)", ["\\"]
+            else:
+                conn.create_function("sindex_key", 1, _name_key, deterministic=True)
+                cond, name_params = _name_condition(groups, negatives, case_sensitive=case_sensitive)
             sql = (f"SELECT f.id FROM files f {media_join} "
                    f"WHERE {' AND '.join([cond, *where, *media_where])} LIMIT ?")
-            by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params, hit_limit])]
+            try:
+                by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params, hit_limit])]
+            except sqlite3.OperationalError:
+                if not (rx_path is not None and slow):
+                    raise
+                return {"results": [], "total": 0, "capped": False,
+                        "error": f"The regular expression took longer than {REGEX_PATH_TIMEOUT_S:g} s on {slow[0]}; "
+                                 "make it simpler or more specific."}
             for fid in by_name:
                 best.setdefault(fid, None)
             capped = capped or len(by_name) >= hit_limit
+
+    if len(best) > hit_limit:
+        best = dict(list(best.items())[:hit_limit])
+        capped = True
 
     results = []
     for fid, rowid in list(best.items())[offset:offset + limit]:
@@ -236,16 +441,21 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             (fid,)).fetchone()
         if f is None:
             continue
-        snip = None
+        snippet = ""
         if rowid is not None:
-            snip = conn.execute(
-                f"SELECT snippet(chunks, 0, ?, ?, '…', {SNIPPET_TOKENS}) FROM chunks "
-                "WHERE chunks MATCH ? AND rowid = ?",
-                (textnorm.HL_START, textnorm.HL_END, match, rowid)).fetchone()
+            if rowid in indexed and not case_sensitive:
+                row = conn.execute(
+                    f"SELECT snippet(chunks, 0, ?, ?, '…', {SNIPPET_TOKENS}) FROM chunks "
+                    "WHERE chunks MATCH ? AND rowid = ?",
+                    (textnorm.HL_START, textnorm.HL_END, match, rowid)).fetchone()
+            else:
+                row = conn.execute("SELECT body FROM chunks WHERE rowid = ?", (rowid,)).fetchone()
+                row = (matcher.snippet(row[0]),) if row and matcher else None
+            snippet = snippet_html(row[0]) if row else ""
         results.append({
             "path": os.path.join(f[0], f[1]), "dir": f[0], "name": f[1], "size": f[2],
             "mtime": f[3] / 1e9, "status": f[4], "hits": hits.get(fid, 0),
-            "snippet": snippet_html(snip[0]) if snip else "",
+            "snippet": snippet,
             "media": {"kind": f[5], "width": f[6], "height": f[7], "duration_s": f[8], "taken_at": f[9],
                       "camera": f[10]} if f[5] else None,
         })

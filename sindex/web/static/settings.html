@@ -130,9 +130,9 @@
 
   <section data-tab="search">
     <h2>Search</h2>
-    <p class="lead">The search box searches while you type. To keep every keystroke cheap it first looks at the best
-      few hits only; when you pause, it repeats the search with the full limit (more files, and file names if that
-      box is ticked). Pressing Enter always runs the full search.</p>
+    <p class="lead">A search starts when you press Enter, or by itself when you stop typing for a moment. Changing
+      the text stops a running search. Besides whole words, a search reads the stored text of every file for the
+      words inside other words, so it takes a second or more, longer on a big index.</p>
     <div id="f-search"></div>
   </section>
 
@@ -222,8 +222,8 @@ const GROUPS = {
     usn_poll_seconds: ["Look for changes every (seconds)", "How often the NTFS change journal is read."],
   },
   "f-search": {
-    search_complete_after_s: ["Complete search after (s)",
-      "Seconds without typing before the full search runs. 0 = only on Enter. Applies the next time the search page is opened."],
+    search_complete_after_s: ["Search after you stop typing (s)",
+      "Seconds without typing before the search starts by itself. 0 = only on Enter. Applies the next time the search page is opened."],
   },
   "f-roots": {
     roots: ["Folders to index", "Tick the folders to index; browse into a folder with its name or arrow. Nothing chosen = all fixed drives."],

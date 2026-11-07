@@ -1,4 +1,3 @@
-import re
 import sys
 import uuid
 import winreg
@@ -6,6 +5,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import regex
 
 from sindex import cli, db
 
@@ -30,7 +30,7 @@ def test_index_command_recycles_in_fresh_processes(tmp_path):
     assert conn.execute("SELECT count(*) FROM files").fetchone()[0] == 10
     assert conn.execute("SELECT count(*) FROM queue").fetchone()[0] == 0
     log = (data / "logs" / "indexer.log").read_text(encoding="utf-8")
-    pids = set(re.findall(r"indexer\[(\d+)\]", log))
+    pids = set(regex.findall(r"indexer\[(\d+)\]", log))
     assert len(pids) >= 3, f"10 files with a recycle every 3 should take at least 3 processes, saw {pids}"
 
 
