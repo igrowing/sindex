@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import OrderedDict
 from datetime import UTC, datetime
 from html import unescape as html_unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +28,7 @@ import regex
 
 from .. import config, control, db
 from ..config import Config
-from ..search import search
+from ..search import Found, find, present, search
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ RSS_PAGE = 20  # default number of items per page of the Explorer search connect
 RSS_PAGE_MAX = 100
 SEARCH_SLOTS = 2  # searches that run at the same time; each holds a connection and ranks up to HIT_LIMIT hits
 SEARCH_TIMEOUT_S = 30.0  # a query that runs longer is stopped, so an abandoned one cannot hold a slot for ever
+FOUND_TTL_S = 120.0  # how long the files a tab found stay available for another sort order or page
+FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file and chunk numbers (about 100 KB)
+_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse"})  # what changes the view, not what is found
 _TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
 
@@ -99,6 +103,31 @@ class SearchRegistry:
         with self._lock:
             if self._current.get(tab) is ticket:
                 del self._current[tab]
+
+
+class FoundCache:
+    """The last search of each browser tab, so that sorting it again or turning a page does not read all the text
+    again. An entry is for one set of search words and filters (`key`) and ends after `ttl_s`: the index changes."""
+
+    def __init__(self, ttl_s: float = FOUND_TTL_S, tabs: int = FOUND_TABS) -> None:
+        self._ttl_s = ttl_s
+        self._tabs = tabs
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, tuple[tuple, float, Found]] = OrderedDict()
+
+    def get(self, tab: str, key: tuple) -> Found | None:
+        with self._lock:
+            entry = self._entries.get(tab)
+            if entry is None or entry[0] != key or time.monotonic() > entry[1]:
+                return None
+            return entry[2]
+
+    def put(self, tab: str, key: tuple, found: Found) -> None:
+        with self._lock:
+            self._entries[tab] = (key, time.monotonic() + self._ttl_s, found)
+            self._entries.move_to_end(tab)
+            while len(self._entries) > self._tabs:
+                self._entries.popitem(last=False)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -284,7 +313,7 @@ class _Handler(BaseHTTPRequestHandler):
             with self.server.search_slots:  # waiting here is cheap: a newer search may cancel this one meanwhile
                 if not ticket.cancelled:
                     conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
-                    result = self._run_search(conn, q)
+                    result = self._run_search(conn, q, tab)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         except sqlite3.OperationalError:
@@ -311,21 +340,29 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad seq"}, 400)
         self._json({})
 
-    @staticmethod
-    def _run_search(conn: sqlite3.Connection, q: dict) -> dict:
-        exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
-        return search(
-            conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
-            after=q.get("after") or None, before=q.get("before") or None,
-            offset=max(0, int(q.get("offset", 0) or 0)), limit=20, names=q.get("names") == "1",
-            regex=q.get("regex") == "1", case_sensitive=q.get("case") == "1",
-            kind=q.get("kind") or None, camera=q.get("camera") or None,
-            has_gps={"1": True, "0": False}.get(q.get("has_gps")),
-            min_width=int(q["min_width"]) if q.get("min_width") else None,
-            min_height=int(q["min_height"]) if q.get("min_height") else None,
-            min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
-            max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
-            taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
+    def _run_search(self, conn: sqlite3.Connection, q: dict, tab: str | None) -> dict:
+        """The page of results for `q`. With `reuse=1` (another sort or page) the tab's last search is used if it
+        was for the same words and filters; otherwise the text is searched."""
+        key = tuple(sorted((k, v) for k, v in q.items() if k not in _PAGE_PARAMS))
+        cache = self.server.found
+        found = cache.get(tab, key) if tab and q.get("reuse") == "1" else None
+        if found is None:
+            exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
+            found = find(
+                conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
+                after=q.get("after") or None, before=q.get("before") or None, names=q.get("names") == "1",
+                regex=q.get("regex") == "1", case_sensitive=q.get("case") == "1",
+                kind=q.get("kind") or None, camera=q.get("camera") or None,
+                has_gps={"1": True, "0": False}.get(q.get("has_gps")),
+                min_width=int(q["min_width"]) if q.get("min_width") else None,
+                min_height=int(q["min_height"]) if q.get("min_height") else None,
+                min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
+                max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
+                taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
+            if tab:
+                cache.put(tab, key, found)
+        return present(conn, found, sort=q.get("sort") or "relevance", limit=20,
+                       offset=max(0, int(q.get("offset", 0) or 0)))
 
     def _status(self) -> None:
         cfg = self.server.cfg
@@ -409,6 +446,7 @@ class _Server(ThreadingHTTPServer):
         self.cfg = cfg
         self.supervisor = supervisor
         self.searches = SearchRegistry()
+        self.found = FoundCache()
         self.search_slots = threading.BoundedSemaphore(SEARCH_SLOTS)
         # POSTs change settings and control files; they ran one at a time before the server was threaded
         self.post_lock = threading.Lock()

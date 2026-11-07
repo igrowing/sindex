@@ -11,7 +11,8 @@ import pytest
 from sindex import config, db
 from sindex.indexer import Indexer
 from sindex.search import search
-from sindex.web.server import SearchRegistry, SearchTicket, WebServer
+from sindex.web import server as server_module
+from sindex.web.server import FoundCache, SearchRegistry, SearchTicket, WebServer
 
 from .conftest import call
 
@@ -202,14 +203,14 @@ def test_a_slow_search_does_not_block_the_status(web, many):
 
     held = threading.Event()
     release = threading.Event()
-    real = web_server.search
+    real = web_server.find
 
     def slow(*args, **kwargs):
         held.set()
         assert release.wait(10), "the test never released the search"
         return real(*args, **kwargs)
 
-    web_server.search = slow
+    web_server.find = slow
     try:
         t = threading.Thread(target=call, args=(web, "/api/search?q=common"), daemon=True)
         t.start()
@@ -217,7 +218,7 @@ def test_a_slow_search_does_not_block_the_status(web, many):
         status, _ = call(web, "/api/status")
     finally:
         release.set()
-        web_server.search = real
+        web_server.find = real
         t.join(10)
 
     assert status == 200
@@ -252,3 +253,89 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def test_the_found_cache_keeps_one_search_per_tab_for_the_same_words():
+    cache = FoundCache(ttl_s=60, tabs=2)
+    found = object()
+
+    cache.put("t1", ("common",), found)  # type: ignore[arg-type]
+
+    assert cache.get("t1", ("common",)) is found
+    assert cache.get("t1", ("rare",)) is None  # another search of the tab
+    assert cache.get("t2", ("common",)) is None  # another tab
+
+
+def test_the_found_cache_forgets_old_entries_and_old_tabs():
+    expired = FoundCache(ttl_s=-1, tabs=2)
+    expired.put("t1", ("a",), object())  # type: ignore[arg-type]
+    assert expired.get("t1", ("a",)) is None
+
+    cache = FoundCache(ttl_s=60, tabs=2)
+    for tab in ("t1", "t2", "t3"):
+        cache.put(tab, ("a",), object())  # type: ignore[arg-type]
+    assert cache.get("t1", ("a",)) is None  # the oldest tab made room
+    assert cache.get("t3", ("a",)) is not None
+
+
+def test_another_sort_or_page_does_not_search_the_text_again(cfg, many, monkeypatch):
+    cfg.web_port = _free_port()
+    calls = []
+    real = server_module.find
+    monkeypatch.setattr(server_module, "find", lambda *a, **kw: (calls.append(a[1]), real(*a, **kw))[1])
+    server = WebServer(cfg)
+    server.start()
+
+    def search_with(qs):
+        status, body = call(cfg, "/api/search?tab=t1&" + qs)
+        assert status == 200
+        return json.loads(body)
+
+    try:
+        first = search_with("q=common&seq=1")
+        assert len(calls) == 1 and first["total"] == 40
+
+        by_name = search_with("q=common&seq=2&sort=name_desc&reuse=1")
+        page_two = search_with("q=common&seq=3&sort=name_desc&reuse=1&offset=20")
+        assert len(calls) == 1, "the sort and the page used the kept search"
+        names_ = [r["name"] for r in by_name["results"]] + [r["name"] for r in page_two["results"]]
+        assert names_ == sorted(names_, key=str.casefold, reverse=True) and len(names_) == 40
+
+        search_with("q=common&seq=4&sort=name_desc")  # no reuse: the person asked again
+        assert len(calls) == 2
+        search_with("q=rare&seq=5&reuse=1")  # other words: nothing to reuse
+        assert len(calls) == 3
+        search_with("q=common&seq=6&names=1&reuse=1")  # another filter: nothing to reuse
+        assert len(calls) == 4
+    finally:
+        server.stop()
+
+
+def test_a_kept_search_ends_after_its_time(cfg, many, monkeypatch):
+    cfg.web_port = _free_port()
+    calls = []
+    real = server_module.find
+    monkeypatch.setattr(server_module, "find", lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
+    server = WebServer(cfg)
+    server.start()
+    server._server.found = FoundCache(ttl_s=-1)  # every entry is already too old
+    try:
+        call(cfg, "/api/search?q=common&tab=t1&seq=1")
+        call(cfg, "/api/search?q=common&tab=t1&seq=2&sort=size_asc&reuse=1")
+    finally:
+        server.stop()
+
+    assert len(calls) == 2, "an expired search is searched again"
+
+
+def test_a_failed_search_is_not_kept(cfg, many, monkeypatch):
+    cfg.web_port = _free_port()
+    server = WebServer(cfg)
+    server.start()
+    try:
+        _, body = call(cfg, "/api/search?q=%28&regex=1&tab=t1&seq=1")
+        assert "Invalid regular expression" in json.loads(body)["error"]
+        assert server._server.found.get("t1", ()) is None
+        assert server._server.found._entries == {}
+    finally:
+        server.stop()

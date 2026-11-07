@@ -23,6 +23,7 @@
   </details>
 
   <form id="form" autocomplete="off">
+    <div class="hint">Hints: Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
     <div class="row">
       <input id="q" type="search" placeholder="Search file contents…" autofocus>
       <button type="submit">Search</button>
@@ -39,7 +40,6 @@
       <label>Modified after <input id="after" type="date"></label>
       <label>Modified before <input id="before" type="date"></label>
     </div>
-    <div class="hint">Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
     <details id="mediaFilters">
       <summary>Photos &amp; videos</summary>
       <div class="row filters">
@@ -61,7 +61,22 @@
     </details>
   </form>
 
-  <div id="summary"></div>
+  <div class="resultbar">
+    <div id="summary"></div>
+    <label id="sortBox" class="sort" hidden>Sort by
+      <select id="sort">
+        <option value="path_asc">Path A-Z</option>
+        <option value="path_desc">Path Z-A</option>
+        <option value="name_asc">File name A-Z</option>
+        <option value="name_desc">File name Z-A</option>
+        <option value="size_asc">File size increasing</option>
+        <option value="size_desc">File size decreasing</option>
+        <option value="date_asc">Date time: older first</option>
+        <option value="date_desc">Date time: newer first</option>
+        <option value="relevance" selected>Relevance (searched words closer - higher relevance)</option>
+      </select>
+    </label>
+  </div>
   <ol id="results"></ol>
   <div class="pager" id="pager"></div>
 
@@ -119,12 +134,14 @@ function params() {
   const p = new URLSearchParams({ q: $("q").value, offset });
   for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
+  if ($("sort").value !== "relevance") p.set("sort", $("sort").value);
   for (const k of NAME_MODS) if ($(k).checked) p.set(k, "1");
   return p;
 }
 
 function clearResults() {
   $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0;
+  $("sortBox").hidden = true;
 }
 function setBusy(on) { $("progress").hidden = !on; }
 
@@ -141,7 +158,8 @@ function stopSearch() {
   setBusy(false);
 }
 
-async function runSearch() {
+// reuse: another sort order or page of the same search, which the server still has; it only re-orders it
+async function runSearch({ reuse = false } = {}) {
   stopSearch();
   if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   const p = params(), mine = seq, ctl = new AbortController();
@@ -151,12 +169,14 @@ async function runSearch() {
   history.replaceState(null, "", "?" + p);
   const q = new URLSearchParams(p);
   q.set("tab", TAB); q.set("seq", mine);
+  if (reuse) q.set("reuse", "1");
   const res = await fetch("/api/search?" + q, { signal: ctl.signal }).then(r => r.json())
     .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
   if (!res || mine !== seq || res.cancelled) return;  // stopped or replaced by a newer search
   inflight = null;
   setBusy(false);
   const sum = $("summary");
+  $("sortBox").hidden = !res.total;
   if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
   else if (!res.total) { sum.textContent = "No matches."; }
   else {
@@ -164,8 +184,8 @@ async function runSearch() {
   }
   $("results").innerHTML = res.results.map((r, i) => `
     <li class="hit">
+      <div class="dir">${esc(r.dir)}/</div>
       <div class="name">${esc(r.name)}</div>
-      <div class="dir">${esc(r.dir)}</div>
       <div class="snip">${r.snippet}</div>
       ${fmtMedia(r.media)}
       <div class="meta">
@@ -186,7 +206,7 @@ async function runSearch() {
 }
 function pageBtn(label, to) {
   const b = document.createElement("button"); b.className = "plain"; b.textContent = label;
-  b.onclick = () => { offset = to; runSearch(); window.scrollTo(0, 0); }; return b;
+  b.onclick = () => { offset = to; runSearch({ reuse: true }); window.scrollTo(0, 0); }; return b;
 }
 
 let lastTotal = 0;
@@ -224,7 +244,7 @@ function renderPager(total) {
     b.className = "plain" + (p === current ? " on" : "");
     b.textContent = p;
     if (p === current) b.disabled = true;
-    else b.onclick = () => { offset = (p - 1) * PAGE; runSearch(); window.scrollTo(0, 0); };
+    else b.onclick = () => { offset = (p - 1) * PAGE; runSearch({ reuse: true }); window.scrollTo(0, 0); };
     pager.append(b);
     prev = p;
   }
@@ -284,6 +304,7 @@ function onType() {
 $("q").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
+$("sort").onchange = () => { offset = 0; runSearch({ reuse: true }); };
 for (const k of NAME_MODS) $(k).onchange = () => { offset = 0; runSearch(); };
 for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });
 $("pauseBtn").onclick = async () => {
@@ -298,6 +319,7 @@ $("reindexBtn").onclick = async () => {
 const init = new URLSearchParams(location.search);
 for (const k of ["q", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
 $("names").checked = init.get("names") === "1";
+if (init.get("sort")) $("sort").value = init.get("sort");
 for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
 offset = +(init.get("offset") || 0);
 if (init.get("q") || hasMediaFilter()) runSearch();

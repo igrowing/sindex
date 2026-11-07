@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import html
+import itertools
 import os
 import sqlite3
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 import regex
 
@@ -14,6 +17,10 @@ from . import db, textnorm
 
 HIT_LIMIT = 2000  # chunk hits considered per query; results are grouped per file
 SNIPPET_TOKENS = 24
+# the choices of the "Sort by" menu; "relevance" is the order of the search itself
+SORTS = ("relevance", "path_asc", "path_desc", "name_asc", "name_desc", "size_asc", "size_desc",
+         "date_asc", "date_desc")
+PROXIMITY_MATCHES = 500  # hits of one term that are compared when measuring how close the terms are
 SNIPPET_CHARS = 80  # context on each side of a hit that the word index did not find (and so has no snippet())
 MAX_REGEX_CHARS = 200
 # The user's pattern runs on every path and on every chunk of stored text. The stdlib `re` holds the GIL while it
@@ -172,6 +179,45 @@ def _term_pattern(text: str) -> str:
     return "".join(out)
 
 
+def _closest_together(positions: list[list[int]]) -> tuple[int, int]:
+    """(distance, first position) of the closest choice of one position from every list: the smallest distance
+    between the first and the last of the chosen positions."""
+    merged = sorted((pos, i) for i, found in enumerate(positions) for pos in found)
+    have = [0] * len(positions)
+    covered = lo = 0
+    best: tuple[int, int] | None = None
+    for pos, i in merged:
+        covered += have[i] == 0
+        have[i] += 1
+        while covered == len(positions):
+            span = pos - merged[lo][0]
+            best = (span, merged[lo][0]) if best is None or span < best[0] else best
+            j = merged[lo][1]
+            have[j] -= 1
+            covered -= have[j] == 0
+            lo += 1
+    assert best is not None, "every list had a position"
+    return best
+
+
+def _sorted_by_file(conn: sqlite3.Connection, best: dict[int, int | None], sort: str) -> dict[int, int | None]:
+    """`best` (file id -> chunk) in the order of the file's path, name, size or date; equal files keep their order."""
+    rows: dict[int, tuple[str, str, int, int]] = {}
+    ids = list(best)
+    for i in range(0, len(ids), 500):
+        batch = ids[i:i + 500]
+        marks = ", ".join("?" for _ in batch)
+        for fid, folder, name, size, mtime in conn.execute(
+                f"SELECT id, dir, name, size, mtime_ns FROM files WHERE id IN ({marks})", batch):
+            rows[fid] = (folder.casefold(), name.casefold(), size, mtime)
+    column, _, direction = sort.partition("_")
+    keys = {"path": lambda r: (r[0], r[1]), "name": lambda r: (r[1], r[0]), "size": lambda r: r[2],
+            "date": lambda r: r[3]}
+    ordered = sorted((fid for fid in ids if fid in rows), key=lambda fid: keys[column](rows[fid]),
+                     reverse=direction == "desc")
+    return {fid: best[fid] for fid in ordered}
+
+
 class _ChunkMatcher:
     """Does a chunk of stored text satisfy the query? The word index only knows whole words and folds case, so this
     is the "contains" rule behind words found inside words, case sensitivity, wildcards and regular expressions.
@@ -213,6 +259,29 @@ class _ChunkMatcher:
             self.timed_out = True
             raise
 
+    def _closest(self, text: str) -> tuple[int, int] | None:
+        """(distance, first position) of the closest words of one group in `text`, or None when no group has two
+        words to compare. The distance is in characters between the first letters of the words."""
+        closest = None
+        try:
+            for group in self.groups:
+                if len(group) < 2:
+                    continue
+                starts = [[m.start() for m in itertools.islice(
+                    p.finditer(text, timeout=REGEX_CHUNK_TIMEOUT_S, concurrent=True), PROXIMITY_MATCHES)]
+                    for p in group]
+                if all(starts):
+                    found = _closest_together(starts)
+                    closest = found if closest is None else min(closest, found)
+        except TimeoutError:
+            pass  # a slow pattern only costs the chunk its proximity, the hit itself was found already
+        return closest
+
+    def proximity(self, body: str) -> int | None:
+        """How far apart the searched words are in the chunk (see _closest)."""
+        found = self._closest(textnorm.decode_display(body))
+        return None if found is None else found[0]
+
     def lacks_negatives(self, body: str) -> bool:
         """True when none of the excluded terms is inside the chunk (words found inside words count)."""
         text = textnorm.decode_display(body)
@@ -230,10 +299,15 @@ class _ChunkMatcher:
         text = textnorm.decode_display(body)
         patterns = [p for group in self.groups for p in group]
         try:
-            first = min((m for p in patterns if (m := self._search(p, text))), key=lambda m: m.start(), default=None)
-            if first is None:
+            if (closest := self._closest(text)) is not None:
+                # words that belong together: show them together, not the first of them wherever it is
+                start, end = closest[1], closest[1] + closest[0] + SNIPPET_CHARS // 2
+            elif (first := min((m for p in patterns if (m := self._search(p, text))),
+                               key=lambda m: m.start(), default=None)) is not None:
+                start, end = first.start(), first.end()
+            else:
                 return text[:2 * SNIPPET_CHARS]
-            lo, hi = max(0, first.start() - SNIPPET_CHARS), min(len(text), first.end() + SNIPPET_CHARS)
+            lo, hi = max(0, start - SNIPPET_CHARS), min(len(text), end + SNIPPET_CHARS)
             window = text[lo:hi]
             for p in patterns:
                 window = p.sub(lambda m: textnorm.HL_START + m.group() + textnorm.HL_END if m.group() else "",
@@ -298,15 +372,40 @@ def _date_ns(value: str | None, *, end: bool = False) -> int | None:
     return max(-(2**63), min(ns, 2**63 - 1))  # SQLite integers are 64-bit
 
 
-def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
-           after: str | None = None, before: str | None = None,
-           offset: int = 0, limit: int = 20, *, names: bool = False,
-           regex: bool = False, case_sensitive: bool = False, contains: bool = True,
-           kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
-           min_width: int | None = None, min_height: int | None = None,
-           min_duration_s: float | None = None, max_duration_s: float | None = None,
-           taken_after: str | None = None, taken_before: str | None = None) -> dict:
-    """Files whose text matches `query`; with `names`, also files whose folder or file name matches it.
+class SearchError(ValueError):
+    """The query cannot be run (a bad pattern, nothing to search for); the message is for the user."""
+
+
+@dataclass(slots=True)
+class Found:
+    """What a search found, before it is sorted and cut into pages. The web server keeps it for a while, so that
+    another sort order or page does not search (read all the text) again."""
+
+    best: dict[int, int | None]  # file id -> best chunk rowid (None: name match only), in search order
+    hits: dict[int, int]  # file id -> number of chunks that matched
+    indexed: set[int]  # the rowids in `best` that the word index found, so snippet() can show them
+    seen: set[int]  # every chunk that matched
+    capped: bool
+    negative_only: bool
+    literal: bool  # the word index's answer was checked against the text (punctuation in a word)
+    case_sensitive: bool
+    match: str | None  # the FTS5 expression of the index step
+    matcher: _ChunkMatcher | None
+    by_proximity: bool  # a group of two or more words: relevance can rank by how close they are
+    # file id -> (distance, chunk rowid) of the chunk in which the searched words are closest to each other;
+    # worked out when first asked for
+    closest: dict[int, tuple[int, int]] | None = None
+
+
+def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
+         after: str | None = None, before: str | None = None, *, names: bool = False,
+         regex: bool = False, case_sensitive: bool = False, contains: bool = True,
+         kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
+         min_width: int | None = None, min_height: int | None = None,
+         min_duration_s: float | None = None, max_duration_s: float | None = None,
+         taken_after: str | None = None, taken_before: str | None = None) -> Found:
+    """The files whose text matches `query`; with `names`, also those whose folder or file name matches it.
+    SearchError says why a query cannot be run.
 
     Hits are ranked in three steps: the word index first (whole words and prefixes, accents ignored), then a
     scan of the stored text for the same words *inside* other words (`contains`), then name matches, which have
@@ -320,6 +419,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
 
     `kind` and the other media filters narrow the results to images/videos with matching `media` fields; with
     an empty `query` and at least one media filter set, this browses by filter alone (no keyword required).
+    At most HIT_LIMIT files are kept (`capped` says it was reached).
     """
     hit_limit = HIT_LIMIT  # read here so that a test can lower it
     groups, negatives = _parse(query)
@@ -332,7 +432,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             if names:
                 rx_path = _user_regex(query, case_sensitive=case_sensitive, multiline=False)
         except ValueError as e:
-            return {"results": [], "total": 0, "capped": False, "error": str(e)}
+            raise SearchError(str(e)) from e
         has_query, match = True, None
     else:
         has_query = bool(groups) or negative_only
@@ -367,12 +467,13 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
     best: dict[int, int | None] = {}  # file id -> best chunk rowid (None: name match only), in rank order
     hits: dict[int, int] = {}
     indexed: set[int] = set()  # the rowids in `best` that the word index found, so snippet() can show them
+    seen: set[int] = set()  # every chunk that matched
     capped = False
     literal = False  # the word index's answer has to be checked against the text (see below)
 
     if not has_query:
         if not media_where:
-            return {"results": [], "total": 0, "capped": False, "error": "Type some words to search for."}
+            raise SearchError("Type some words to search for.")
         # no keyword: browse by the media/path/ext/date filters alone, newest first
         sql = (f"SELECT f.id FROM files f {media_join} "
                f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT ?")
@@ -388,7 +489,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             excluded = {r[0] for r in conn.execute(sql, [*params, *media_params])}
         except sqlite3.OperationalError:
             if matcher.timed_out:
-                return {"results": [], "total": 0, "capped": False, "error": "A pattern took too long on some text."}
+                raise SearchError("A pattern took too long on some text.") from None
             raise  # a cancelled or timed-out search, or a real error
         if not case_sensitive and (words := _to_match([[(text, False)] for text in negatives], [])) is not None:
             # the scan compares accents, the word index does not: "-cafe" must drop "café" as a plain search finds it
@@ -422,7 +523,6 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
         if literal:
             conn.create_function("sindex_literal", 1, _ChunkMatcher.for_terms(
                 groups, negatives, case_sensitive=case_sensitive, only_punctuated=True), deterministic=True)
-        seen: set[int] = set()
 
         def add(rowid: int, *, from_index: bool) -> None:
             if rowid in seen:
@@ -435,10 +535,9 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
                     indexed.add(rowid)
             hits[fid] = hits.get(fid, 0) + 1
 
-        def slow_pattern() -> dict:
-            return {"results": [], "total": 0, "capped": False,
-                    "error": f"The regular expression took longer than {REGEX_CHUNK_TIMEOUT_S:g} s on some text; "
-                             "make it simpler or more specific."}
+        def slow_pattern() -> SearchError:
+            return SearchError(f"The regular expression took longer than {REGEX_CHUNK_TIMEOUT_S:g} s on some text; "
+                               "make it simpler or more specific.")
 
         if match is not None:
             # the word index cannot tell "kyo" from "tokyo", so what it found is checked against the exclusions
@@ -452,8 +551,8 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
                 rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params, hit_limit])]
             except sqlite3.OperationalError as e:
                 if matcher.timed_out:
-                    return slow_pattern()
-                return {"results": [], "total": 0, "capped": False, "error": f"Query not understood: {e}"}
+                    raise slow_pattern() from e
+                raise SearchError(f"Query not understood: {e}") from e
             capped = len(rowids) >= hit_limit
             for rowid in rowids:
                 add(rowid, from_index=True)
@@ -465,7 +564,7 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
                 scanned = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
             except sqlite3.OperationalError:
                 if matcher.timed_out:
-                    return slow_pattern()
+                    raise slow_pattern() from None
                 raise  # a cancelled or timed-out search, or a real error
             capped = capped or len(scanned) >= hit_limit
             for rowid in scanned:
@@ -495,9 +594,8 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             except sqlite3.OperationalError:
                 if not (rx_path is not None and slow):
                     raise
-                return {"results": [], "total": 0, "capped": False,
-                        "error": f"The regular expression took longer than {REGEX_PATH_TIMEOUT_S:g} s on {slow[0]}; "
-                                 "make it simpler or more specific."}
+                raise SearchError(f"The regular expression took longer than {REGEX_PATH_TIMEOUT_S:g} s on "
+                                  f"{slow[0]}; make it simpler or more specific.") from None
             for fid in by_name:
                 best.setdefault(fid, None)
             capped = capped or len(by_name) >= hit_limit
@@ -505,6 +603,54 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
     if len(best) > hit_limit:
         best = dict(list(best.items())[:hit_limit])
         capped = True
+
+    return Found(best=best, hits=hits, indexed=indexed, seen=seen, capped=capped, negative_only=negative_only,
+                 literal=literal, case_sensitive=case_sensitive, match=match, matcher=matcher,
+                 by_proximity=matcher is not None and not regex and any(len(group) >= 2 for group in groups))
+
+
+def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[int, int]]:
+    """For each file with two or more searched words: how close they come in its best chunk, and which chunk that
+    is. A file has many chunks; the one the word index ranks first is not necessarily the one with the words
+    together, and the one with the words together is the one to rank the file by and to show."""
+    if found.closest is None:
+        assert found.matcher is not None, "proximity needs the words of the query"
+        closest: dict[int, tuple[int, int]] = {}
+        for rowid in found.seen:
+            fid = rowid >> db.CHUNK_BITS
+            if fid not in found.best:
+                continue
+            row = conn.execute("SELECT body FROM chunks WHERE rowid = ?", (rowid,)).fetchone()
+            if row and (span := found.matcher.proximity(row[0])) is not None:
+                if fid not in closest or (span, rowid) < closest[fid]:  # the earlier chunk wins a tie
+                    closest[fid] = (span, rowid)
+        found.closest = closest
+    return found.closest
+
+
+def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", offset: int = 0,
+            limit: int = 20) -> dict:
+    """One page of `found`, in the order of `sort` (one of SORTS), with a snippet for each file.
+
+    The order is applied to all the files that were found, before the page is cut from it. "relevance" keeps
+    the order of the search and, when the query has two or more words, puts the files where these words are
+    closest to each other first. It costs little (no text is searched), so another sort or page of the same
+    `found` is quick.
+    """
+    if sort not in SORTS:
+        raise SearchError(f"Unknown sort order {sort!r}.")
+    best = found.best
+    closest = _closest_chunks(conn, found) if found.by_proximity else {}
+    if closest:
+        best = {fid: closest[fid][1] if fid in closest else rowid for fid, rowid in best.items()}  # show that chunk
+    if sort != "relevance":
+        best = _sorted_by_file(conn, best, sort)
+    elif closest:
+        # the files whose words are closer together first; files with nothing to compare keep the search order
+        position = {fid: n for n, fid in enumerate(best)}
+        ranked = sorted(best, key=lambda f: (f not in closest, closest[f][0] if f in closest else 0, position[f]))
+        best = {fid: best[fid] for fid in ranked}
+    matcher = found.matcher
 
     results = []
     for fid, rowid in list(best.items())[offset:offset + limit]:
@@ -516,21 +662,32 @@ def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: 
             continue
         snippet = ""
         if rowid is not None:
-            if rowid in indexed and not case_sensitive and not literal:
+            if rowid in found.indexed and not found.case_sensitive and not found.literal and fid not in closest:
                 row = conn.execute(
                     f"SELECT snippet(chunks, 0, ?, ?, '…', {SNIPPET_TOKENS}) FROM chunks "
                     "WHERE chunks MATCH ? AND rowid = ?",
-                    (textnorm.HL_START, textnorm.HL_END, match, rowid)).fetchone()
+                    (textnorm.HL_START, textnorm.HL_END, found.match, rowid)).fetchone()
             else:
                 row = conn.execute("SELECT body FROM chunks WHERE rowid = ?", (rowid,)).fetchone()
                 row = (matcher.snippet(row[0]),) if row and matcher else None
             snippet = snippet_html(row[0]) if row else ""
         results.append({
             "path": os.path.join(f[0], f[1]), "dir": f[0], "name": f[1], "size": f[2],
-            "mtime": f[3] / 1e9, "status": f[4], "hits": hits.get(fid, 0),
+            "mtime": f[3] / 1e9, "status": f[4], "hits": found.hits.get(fid, 0),
             "snippet": snippet,
             "media": {"kind": f[5], "width": f[6], "height": f[7], "duration_s": f[8], "taken_at": f[9],
                       "camera": f[10]} if f[5] else None,
         })
-    return {"results": results, "total": len(best), "capped": capped, "error": None,
-            "negative_only": negative_only}
+    return {"results": results, "total": len(best), "capped": found.capped, "error": None,
+            "negative_only": found.negative_only}
+
+
+def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
+           after: str | None = None, before: str | None = None, offset: int = 0, limit: int = 20, *,
+           sort: str = "relevance", **options: Any) -> dict:
+    """find() and present() in one call, with a failure reported as {"error": ...}; `options` are those of find()."""
+    try:
+        return present(conn, find(conn, query, path, exts, after, before, **options),
+                       sort=sort, offset=offset, limit=limit)
+    except SearchError as e:
+        return {"results": [], "total": 0, "capped": False, "error": str(e)}

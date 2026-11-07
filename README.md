@@ -66,6 +66,14 @@ the search box shows that one is running. A search has three steps, in this orde
    up to about 8 s for a complicated regular expression, growing in step with the index;
 3. folder and file names, only if the names box is ticked.
 
+**Sort by** (above the results) orders the list by path, file name, size or date, ascending or descending. The default,
+Relevance, keeps the order of the steps above and, for two or more words, puts the files in which these words are
+closest to each other first. A sort orders the files that were found, at most 2,000 (`2000+` in the summary says the
+search stopped there), so with that many matches it does not reach the rest. The server keeps the files a browser tab
+found for two minutes, so choosing another sort or turning a page only re-orders them (milliseconds) instead of reading
+all the text again; a new search, or any change of the words or filters, searches again. The menu is part of the page address
+(`sort=`), and `/api/search` takes the same values.
+
 Punctuation in a word is part of the search: `kyo)` finds only text that has those four characters, and `c++` does
 not find every `c`. (The word index itself throws punctuation away, so what it finds for such a word is checked
 against the stored text.) To search for a `*` or `?` itself, tick Use RegEx and write `\*` or `\?`.
