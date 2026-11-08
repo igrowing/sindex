@@ -142,7 +142,7 @@ def test_ui_command_with_a_query(tmp_path, monkeypatch):
 
     cli.main(["ui", "--query", "invoice 2024"])
 
-    assert parse_qs(urlsplit(opened[0]).query)["q"] == ["invoice 2024"]
+    assert parse_qs(urlsplit(opened[0]).query)["query"] == ["invoice 2024"]
 
 
 def test_unknown_subcommand_falls_back_to_a_ui_query(tmp_path, monkeypatch):
@@ -156,7 +156,7 @@ def test_unknown_subcommand_falls_back_to_a_ui_query(tmp_path, monkeypatch):
 
     assert code == 0
     assert len(opened) == 1
-    assert parse_qs(urlsplit(opened[0]).query)["q"] == ["overdue invoice"]
+    assert parse_qs(urlsplit(opened[0]).query)["query"] == ["overdue invoice"]
 
 
 def test_a_real_subcommand_name_is_not_treated_as_a_query(tmp_path, monkeypatch):

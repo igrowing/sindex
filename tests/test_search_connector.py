@@ -24,13 +24,13 @@ def test_opensearch_description_points_at_the_rss_endpoint(web):
     assert status == 200
     text = body.decode("utf-8")
     assert "<ShortName>sindex</ShortName>" in text
-    assert f"http://127.0.0.1:{web.web_port}/api/search.rss?q={{searchTerms}}" in text
+    assert f"http://127.0.0.1:{web.web_port}/api/search.rss?query={{searchTerms}}" in text
 
 
 def test_search_rss_lists_matching_files_as_file_links(web, tmp_path):
     root = _index(web, tmp_path)
 
-    status, body = call(web, "/api/search.rss?q=invoice")
+    status, body = call(web, "/api/search.rss?query=invoice")
 
     assert status == 200
     text = body.decode("utf-8")
@@ -44,7 +44,7 @@ def test_search_rss_lists_matching_files_as_file_links(web, tmp_path):
 def test_search_rss_with_no_match_is_an_empty_but_valid_feed(web, tmp_path):
     _index(web, tmp_path)
 
-    status, body = call(web, "/api/search.rss?q=nonexistentword")
+    status, body = call(web, "/api/search.rss?query=nonexistentword")
 
     assert status == 200
     text = body.decode("utf-8")
@@ -53,7 +53,7 @@ def test_search_rss_with_no_match_is_an_empty_but_valid_feed(web, tmp_path):
 
 
 def test_search_rss_before_the_index_exists_is_an_empty_feed(web):
-    status, body = call(web, "/api/search.rss?q=anything")
+    status, body = call(web, "/api/search.rss?query=anything")
 
     assert status == 200
     assert "<opensearch:totalResults>0</opensearch:totalResults>" in body.decode("utf-8")
@@ -62,10 +62,10 @@ def test_search_rss_before_the_index_exists_is_an_empty_feed(web):
 def test_search_rss_rejects_a_bad_count_or_start_index(web, tmp_path):
     _index(web, tmp_path)
 
-    status, _ = call(web, "/api/search.rss?q=invoice&count=nope")
+    status, _ = call(web, "/api/search.rss?query=invoice&count=nope")
     assert status == 400
 
-    status, _ = call(web, "/api/search.rss?q=invoice&startIndex=nope")
+    status, _ = call(web, "/api/search.rss?query=invoice&startIndex=nope")
     assert status == 400
 
 
@@ -75,7 +75,7 @@ def test_search_rss_escapes_special_characters_in_the_snippet(web, tmp_path):
     (root / "notes.txt").write_text("a <script>alert('x')</script> & more about tags", encoding="utf-8")
     assert Indexer(web, [str(root)], until_idle=True, limits=False).run() == 0
 
-    status, body = call(web, "/api/search.rss?q=script")
+    status, body = call(web, "/api/search.rss?query=script")
 
     assert status == 200
     text = body.decode("utf-8")

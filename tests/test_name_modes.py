@@ -98,11 +98,11 @@ def test_the_api_takes_regex_and_case(web, named):  # noqa: F811
         assert status == 200
         return json.loads(body)
 
-    assert total("q=Invoices%5Cd%2B&names=1&regex=1")["total"] == 2
-    assert total("q=Invoices%5Cd%2B&names=1&regex=1&case=1")["total"] == 2
-    assert total("q=invoices%5Cd%2B&names=1&regex=1&case=1")["total"] == 0
-    assert total("q=invoices2024&names=1&case=1")["total"] == 0
-    assert total("q=(&names=1&regex=1")["error"].startswith("Invalid regular expression")
+    assert total("query=Invoices%5Cd%2B&names=1&regex=1")["total"] == 2
+    assert total("query=Invoices%5Cd%2B&names=1&regex=1&case=1")["total"] == 2
+    assert total("query=invoices%5Cd%2B&names=1&regex=1&case=1")["total"] == 0
+    assert total("query=invoices2024&names=1&case=1")["total"] == 0
+    assert total("query=(&names=1&regex=1")["error"].startswith("Invalid regular expression")
 
 
 def test_the_three_boxes_are_independent_in_the_api(web, named):  # noqa: F811
@@ -110,15 +110,15 @@ def test_the_three_boxes_are_independent_in_the_api(web, named):  # noqa: F811
         data = json.loads(call(web, "/api/search?" + qs)[1])
         return {r["name"] for r in data["results"]}
 
-    assert found("q=zebra") == {"notes.txt"}  # none ticked: contents
-    assert found("q=zebra&names=1") == {"notes.txt", "zebra-plan.txt"}
-    assert found("q=zebra&regex=1") == {"notes.txt"}  # a regex over the contents
-    assert found("q=zebra&regex=1&names=1") == {"notes.txt", "zebra-plan.txt"}
-    assert found("q=ZEBRA&case=1") == set()  # exact letters, in the contents too
-    assert found("q=ZEBRA&names=1&case=1") == set()
-    assert found("q=zebra&names=1&case=1") == {"notes.txt", "zebra-plan.txt"}
-    assert found("q=ZEBRA&regex=1&case=1") == set()
-    assert found("q=ZEBRA&regex=1") == {"notes.txt"}
+    assert found("query=zebra") == {"notes.txt"}  # none ticked: contents
+    assert found("query=zebra&names=1") == {"notes.txt", "zebra-plan.txt"}
+    assert found("query=zebra&regex=1") == {"notes.txt"}  # a regex over the contents
+    assert found("query=zebra&regex=1&names=1") == {"notes.txt", "zebra-plan.txt"}
+    assert found("query=ZEBRA&case=1") == set()  # exact letters, in the contents too
+    assert found("query=ZEBRA&names=1&case=1") == set()
+    assert found("query=zebra&names=1&case=1") == {"notes.txt", "zebra-plan.txt"}
+    assert found("query=ZEBRA&regex=1&case=1") == set()
+    assert found("query=ZEBRA&regex=1") == {"notes.txt"}
 
 
 def test_the_cli_searches_by_regex(named, capsys):  # noqa: F811
@@ -165,7 +165,7 @@ def test_a_runaway_regex_does_not_freeze_the_other_threads(runaway):
 
 
 def test_the_api_survives_a_runaway_regex(web, runaway):  # noqa: F811
-    status, body = call(web, "/api/search?q=" + quote(RUNAWAY) + "&names=1&regex=1")
+    status, body = call(web, "/api/search?query=" + quote(RUNAWAY) + "&names=1&regex=1")
 
     assert status == 200 and "took longer than" in json.loads(body)["error"]
     assert call(web, "/api/status")[0] == 200

@@ -124,7 +124,7 @@ def test_the_api_filters_the_kept_search_without_searching_again(cfg, mixed, mon
     server.start()
 
     def get(qs):
-        status, body = call(cfg, "/api/search?tab=t1&q=common&" + qs)
+        status, body = call(cfg, "/api/search?tab=t1&query=common&" + qs)
         assert status == 200
         return json.loads(body)
 

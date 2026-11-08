@@ -30,7 +30,7 @@ input, select, button { font: inherit; color: inherit; }
 input, select { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
 input[type=checkbox] { padding: 0; margin: 0; accent-color: var(--accent); }
 input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-#q { flex: 1 1 320px; font-size: 16px; }
+#query { flex: 1 1 320px; font-size: 16px; }
 .progress { position: relative; height: 3px; margin-top: 6px; overflow: hidden; border-radius: 2px; background: var(--line); }
 .progress::before { content: ""; position: absolute; top: 0; bottom: 0; width: 35%; border-radius: 2px; background: var(--accent);
   animation: progress-slide 1.2s ease-in-out infinite; }

@@ -159,7 +159,7 @@ def test_the_api_answers_a_superseded_search_as_cancelled(cfg, many):
     server.start()
     try:
         server._server.searches.begin("tab1", 9)  # a newer search of the same tab is already running
-        status, body = call(cfg, "/api/search?q=common&tab=tab1&seq=3")
+        status, body = call(cfg, "/api/search?query=common&tab=tab1&seq=3")
     finally:
         server.stop()
 
@@ -186,13 +186,13 @@ def test_the_cancel_endpoint_stops_the_search_the_page_gave_up_on(cfg, many):
 
 
 def test_the_api_ignores_a_malformed_tab_id(web, many):
-    status, body = call(web, "/api/search?q=common&tab=../../x&seq=1")
+    status, body = call(web, "/api/search?query=common&tab=../../x&seq=1")
 
     assert status == 200 and json.loads(body)["total"] == 40
 
 
 def test_a_bad_sequence_number_is_an_error_message_not_a_crash(web, many):
-    status, body = call(web, "/api/search?q=common&tab=abc&seq=x")
+    status, body = call(web, "/api/search?query=common&tab=abc&seq=x")
 
     assert status == 200 and json.loads(body)["error"]
 
@@ -212,7 +212,7 @@ def test_a_slow_search_does_not_block_the_status(web, many):
 
     web_server.find = slow
     try:
-        t = threading.Thread(target=call, args=(web, "/api/search?q=common"), daemon=True)
+        t = threading.Thread(target=call, args=(web, "/api/search?query=common"), daemon=True)
         t.start()
         assert held.wait(10)
         status, _ = call(web, "/api/status")
@@ -292,20 +292,20 @@ def test_another_sort_or_page_does_not_search_the_text_again(cfg, many, monkeypa
         return json.loads(body)
 
     try:
-        first = search_with("q=common&seq=1")
+        first = search_with("query=common&seq=1")
         assert len(calls) == 1 and first["total"] == 40
 
-        by_name = search_with("q=common&seq=2&sort=name_desc&reuse=1")
-        page_two = search_with("q=common&seq=3&sort=name_desc&reuse=1&offset=20")
+        by_name = search_with("query=common&seq=2&sort=name_desc&reuse=1")
+        page_two = search_with("query=common&seq=3&sort=name_desc&reuse=1&offset=20")
         assert len(calls) == 1, "the sort and the page used the kept search"
         names_ = [r["name"] for r in by_name["results"]] + [r["name"] for r in page_two["results"]]
         assert names_ == sorted(names_, key=str.casefold, reverse=True) and len(names_) == 40
 
-        search_with("q=common&seq=4&sort=name_desc")  # no reuse: the person asked again
+        search_with("query=common&seq=4&sort=name_desc")  # no reuse: the person asked again
         assert len(calls) == 2
-        search_with("q=rare&seq=5&reuse=1")  # other words: nothing to reuse
+        search_with("query=rare&seq=5&reuse=1")  # other words: nothing to reuse
         assert len(calls) == 3
-        search_with("q=common&seq=6&names=1&reuse=1")  # another filter: nothing to reuse
+        search_with("query=common&seq=6&names=1&reuse=1")  # another filter: nothing to reuse
         assert len(calls) == 4
     finally:
         server.stop()
@@ -320,8 +320,8 @@ def test_a_kept_search_ends_after_its_time(cfg, many, monkeypatch):
     server.start()
     server._server.found = FoundCache(ttl_s=-1)  # every entry is already too old
     try:
-        call(cfg, "/api/search?q=common&tab=t1&seq=1")
-        call(cfg, "/api/search?q=common&tab=t1&seq=2&sort=size_asc&reuse=1")
+        call(cfg, "/api/search?query=common&tab=t1&seq=1")
+        call(cfg, "/api/search?query=common&tab=t1&seq=2&sort=size_asc&reuse=1")
     finally:
         server.stop()
 
@@ -333,7 +333,7 @@ def test_a_failed_search_is_not_kept(cfg, many, monkeypatch):
     server = WebServer(cfg)
     server.start()
     try:
-        _, body = call(cfg, "/api/search?q=%28&regex=1&tab=t1&seq=1")
+        _, body = call(cfg, "/api/search?query=%28&regex=1&tab=t1&seq=1")
         assert "Invalid regular expression" in json.loads(body)["error"]
         assert server._server.found.get("t1", ()) is None
         assert server._server.found._entries == {}

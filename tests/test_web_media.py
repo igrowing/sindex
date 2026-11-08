@@ -26,7 +26,7 @@ def test_status_reports_media_counts(web, tmp_path):
 
 def test_search_api_accepts_media_filters(web, tmp_path):
     _index_photo_and_video(web, tmp_path)
-    status, body = call(web, "/api/search?q=holiday&kind=image&has_gps=1")
+    status, body = call(web, "/api/search?query=holiday&kind=image&has_gps=1")
     assert status == 200
     names = {r["name"] for r in json.loads(body)["results"]}
     assert names == {"photo.jpg"}

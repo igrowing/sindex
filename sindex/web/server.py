@@ -220,7 +220,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._send(403, b"forbidden", "text/plain")
         url = urlsplit(self.path)
-        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        query = {k: v[0] for k, v in parse_qs(url.query).items()}
         if url.path in PAGES:
             page = (STATIC / PAGES[url.path]).read_text(encoding="utf-8")
             page = page.replace("{{TOKEN}}", json.dumps(self.server.cfg.token)).replace("{{VERSION}}", config.VERSION)
@@ -233,23 +233,23 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path == "/api/settings":
             return self._json(config.public_settings(config.load(self.server.cfg.data_dir)))
         if url.path == "/api/health":
-            return self._health(q)
+            return self._health(query)
         if url.path == "/api/browse":
-            return self._browse(q)
+            return self._browse(query)
         if url.path == "/api/log":
-            return self._log(q)
+            return self._log(query)
         if url.path == "/api/search":
-            return self._search(q)
+            return self._search(query)
         if url.path == "/api/export.csv":
-            return self._export(q)
+            return self._export(query)
         if url.path == "/api/search/cancel":
-            return self._cancel_search(q)
+            return self._cancel_search(query)
         if url.path == "/api/status":
             return self._status()
         if url.path == "/opensearch.xml":
             return self._opensearch()
         if url.path == "/api/search.rss":
-            return self._search_rss(q)
+            return self._search_rss(query)
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:
@@ -364,7 +364,7 @@ class _Handler(BaseHTTPRequestHandler):
         result = self._search_result(q, export=True)
         if result.get("error"):
             return self._json(result, 400)
-        name = export_filename(q.get("q", ""), datetime.now().date())
+        name = export_filename(q.get("query", ""), datetime.now().date())
         # RFC 5987: the name may hold any letters, and a header is Latin-1 only
         disposition = f"attachment; filename*=UTF-8''{quote(name)}"
         self._send(200, results_csv(result["results"]).encode("utf-8-sig"), "text/csv; charset=utf-8",
@@ -423,7 +423,7 @@ class _Handler(BaseHTTPRequestHandler):
         if found is None:
             exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
             found = find(
-                conn, q.get("q", ""), path=q.get("path") or None, exts=exts or None,
+                conn, q.get("query", ""), path=q.get("path") or None, exts=exts or None,
                 after=q.get("after") or None, before=q.get("before") or None, names=q.get("names") == "1",
                 regex=q.get("regex") == "1", case_sensitive=q.get("case") == "1",
                 kind=q.get("kind") or None, camera=q.get("camera") or None,
@@ -466,7 +466,7 @@ class _Handler(BaseHTTPRequestHandler):
             "  <ShortName>sindex</ShortName>\n"
             "  <Description>Search file contents indexed by sindex</Description>\n"
             f'  <Url type="application/rss+xml" template="{base}/api/search.rss?'
-            'q={searchTerms}&amp;count={count?}&amp;startIndex={startIndex?}"/>\n'
+            'query={searchTerms}&amp;count={count?}&amp;startIndex={startIndex?}"/>\n'
             "</OpenSearchDescription>\n"
         )
         self._send(200, body.encode("utf-8"), "application/opensearchdescription+xml; charset=utf-8")
@@ -495,7 +495,7 @@ class _Handler(BaseHTTPRequestHandler):
         if conn is not None:
             try:
                 # Explorer asks on every keystroke: the index-only answer, not the scan of the stored text
-                result = search(conn, q.get("q", ""), offset=start - 1, limit=count, contains=False)
+                result = search(conn, q.get("query", ""), offset=start - 1, limit=count, contains=False)
             finally:
                 conn.close()
             results, total = result["results"], result["total"]

@@ -25,7 +25,7 @@
   <form id="form" autocomplete="off">
     <div class="hint">Hints: Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
     <div class="row">
-      <input id="q" type="search" placeholder="Search file contents…" autofocus>
+      <input id="query" type="search" placeholder="Search file contents…" autofocus>
       <button type="submit">Search</button>
     </div>
     <div id="progress" class="progress" role="progressbar" aria-label="Searching" hidden></div>
@@ -150,7 +150,7 @@ const NAME_MODS = ["regex", "case"];  // independent of "names" and of each othe
 function hasMediaFilter() { return MEDIA_KEYS.some((k) => $(k).value); }
 
 function params() {
-  const p = new URLSearchParams({ q: $("q").value, offset });
+  const p = new URLSearchParams({ query: $("query").value, offset });
   for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
   if ($("sort").value !== "relevance") p.set("sort", $("sort").value);
@@ -238,16 +238,16 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
   stopSearch();
   hideExportError();
   if (!reuse && !keepExt) clearExtSelection();  // a new search has other extensions to choose from
-  if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
+  if (!$("query").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   const p = params(), mine = seq, ctl = new AbortController();
   inflight = { ctl, seq: mine };
   setBusy(true);
   $("summary").textContent = "Searching…";
   history.replaceState(null, "", "?" + p);
-  const q = new URLSearchParams(p);
-  q.set("tab", TAB); q.set("seq", mine);
-  if (reuse) q.set("reuse", "1");
-  const res = await fetch("/api/search?" + q, { signal: ctl.signal }).then(r => r.json())
+  const query = new URLSearchParams(p);
+  query.set("tab", TAB); query.set("seq", mine);
+  if (reuse) query.set("reuse", "1");
+  const res = await fetch("/api/search?" + query, { signal: ctl.signal }).then(r => r.json())
     .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
   if (!res || mine !== seq || res.cancelled) return;  // stopped or replaced by a newer search
   inflight = null;
@@ -434,14 +434,14 @@ function onType() {
   const wasRunning = !!inflight;
   stopSearch();
   offset = 0;
-  if (!$("q").value.trim() && !hasMediaFilter()) { clearResults(); return; }
+  if (!$("query").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   if (wasRunning) {
     $("summary").textContent = COMPLETE_AFTER > 0 ? "Search stopped; it starts again when you pause typing."
                                                   : "Search stopped; press Enter to search again.";
   }
   if (COMPLETE_AFTER > 0) typeTimer = setTimeout(runSearch, COMPLETE_AFTER * 1000);
 }
-$("q").addEventListener("input", onType);
+$("query").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
 $("sort").onchange = () => { offset = 0; runSearch({ reuse: true }); };
@@ -457,7 +457,7 @@ $("reindexBtn").onclick = async () => {
 };
 
 const init = new URLSearchParams(location.search);
-for (const k of ["q", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
+for (const k of ["query", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
 $("names").checked = init.get("names") === "1";
 if (init.get("sort")) $("sort").value = init.get("sort");
 for (const [name, m] of Object.entries(EXT_MENUS))
@@ -465,7 +465,7 @@ for (const [name, m] of Object.entries(EXT_MENUS))
     for (const e of init.get(name + "_ext").split(",")) if (e) m.sel.add(e === "." ? "" : e);
 for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
 offset = +(init.get("offset") || 0);
-if (init.get("q") || hasMediaFilter()) runSearch({ keepExt: true });
+if (init.get("query") || hasMediaFilter()) runSearch({ keepExt: true });
 refreshStatus(); setInterval(refreshStatus, 5000);
 </script>
 </body>

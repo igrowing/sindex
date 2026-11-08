@@ -109,7 +109,7 @@ def test_present_without_a_limit_returns_every_file(many):
 # ---- the endpoint -----------------------------------------------------------------------------------------------
 
 def test_the_export_has_all_pages_not_only_the_one_shown(many, web):
-    status, body = call(web, "/api/export.csv?q=marker&offset=20")
+    status, body = call(web, "/api/export.csv?query=marker&offset=20")
 
     assert status == 200
     assert body.startswith(b"\xef\xbb\xbf")  # a byte order mark: spreadsheets read UTF-8 correctly
@@ -120,7 +120,7 @@ def test_the_export_has_all_pages_not_only_the_one_shown(many, web):
 
 
 def test_the_row_matches_what_the_page_shows(many, web):
-    table = rows(call(web, "/api/export.csv?q=marker&sort=name_asc")[1])
+    table = rows(call(web, "/api/export.csv?query=marker&sort=name_asc")[1])
     first = table[1]
 
     assert first[0] == str(many.data_dir.parent / "docs") and first[1] == "f00.md"
@@ -131,13 +131,13 @@ def test_the_row_matches_what_the_page_shows(many, web):
 
 
 def test_the_export_keeps_the_sort_order_and_the_extension_filters(many, web):
-    by_size = rows(call(web, "/api/export.csv?q=marker&sort=size_desc")[1])[1:]
+    by_size = rows(call(web, "/api/export.csv?query=marker&sort=size_desc")[1])[1:]
     assert [int(r[2]) for r in by_size] == sorted((int(r[2]) for r in by_size), reverse=True)
 
-    only_md = rows(call(web, "/api/export.csv?q=marker&only_ext=md")[1])[1:]
+    only_md = rows(call(web, "/api/export.csv?query=marker&only_ext=md")[1])[1:]
     assert len(only_md) == 5 and all(r[1].endswith(".md") for r in only_md)
 
-    skip_md = rows(call(web, "/api/export.csv?q=marker&skip_ext=md")[1])[1:]
+    skip_md = rows(call(web, "/api/export.csv?query=marker&skip_ext=md")[1])[1:]
     assert len(skip_md) == COUNT - 5 and not any(r[1].endswith(".md") for r in skip_md)
 
 
@@ -146,8 +146,8 @@ def test_the_export_uses_the_kept_search_instead_of_searching_again(many, web, m
     real = server_module.find
     monkeypatch.setattr(server_module, "find", lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
 
-    assert call(web, "/api/search?tab=t1&seq=1&q=marker")[0] == 200
-    status, body = call(web, "/api/export.csv?tab=t1&reuse=1&q=marker&sort=name_desc&only_ext=txt")
+    assert call(web, "/api/search?tab=t1&seq=1&query=marker")[0] == 200
+    status, body = call(web, "/api/export.csv?tab=t1&reuse=1&query=marker&sort=name_desc&only_ext=txt")
 
     assert status == 200 and len(rows(body)) - 1 == COUNT - 5
     assert len(calls) == 1, "the export filtered the kept search"
@@ -160,7 +160,7 @@ def test_an_export_does_not_cancel_the_search_of_its_tab(many, web):
     real = SearchRegistry.begin
     SearchRegistry.begin = lambda self, tab, seq, *a, **kw: (seen.append(tab), real(self, tab, seq, *a, **kw))[1]
     try:
-        assert call(web, "/api/export.csv?tab=t1&seq=5&q=marker")[0] == 200
+        assert call(web, "/api/export.csv?tab=t1&seq=5&query=marker")[0] == 200
     finally:
         SearchRegistry.begin = real
 
@@ -168,13 +168,13 @@ def test_an_export_does_not_cancel_the_search_of_its_tab(many, web):
 
 
 def test_an_export_of_a_bad_search_is_an_error_not_an_empty_file(many, web):
-    status, body = call(web, "/api/export.csv?q=")
+    status, body = call(web, "/api/export.csv?query=")
 
     assert status == 400 and json.loads(body)["error"]
 
 
 def test_nothing_found_exports_only_the_header(many, web):
-    status, body = call(web, "/api/export.csv?q=zzznotthere")
+    status, body = call(web, "/api/export.csv?query=zzznotthere")
 
     assert status == 200 and [tuple(r) for r in rows(body)] == [EXPORT_COLUMNS]
 
@@ -253,7 +253,7 @@ def test_a_long_search_is_cut_without_a_dangling_separator():
 
 
 def disposition(web, query: str) -> str:
-    url = f"http://127.0.0.1:{web.web_port}/api/export.csv?q=" + quote(query)
+    url = f"http://127.0.0.1:{web.web_port}/api/export.csv?query=" + quote(query)
     with urllib.request.urlopen(url, timeout=10) as r:
         assert r.status == 200
         return r.headers["Content-Disposition"]

@@ -570,7 +570,7 @@ sequenceDiagram
     participant D as index.db (read-only)
 
     U->>B: types
-    B->>H: GET /api/search?q=...&quick=1&tab=T&seq=n (after 0.2 s)
+    B->>H: GET /api/search?query=...&quick=1&tab=T&seq=n (after 0.2 s)
     H->>H: Host header check (DNS-rebinding guard)
     H->>S: begin(tab, seq, 30 s)
     Note over S: a newer seq of the same tab<br/>cancels the older ticket

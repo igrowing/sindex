@@ -141,7 +141,7 @@ def cmd_ui(args) -> int:
     if args.path:
         params["path"] = os.path.abspath(args.path)
     if args.query:
-        params["q"] = args.query
+        params["query"] = args.query
     url = f"http://{cfg.web_host}:{cfg.web_port}/"
     if params:
         url += "?" + urlencode(params)
