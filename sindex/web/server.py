@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html import unescape as html_unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +31,7 @@ import regex
 
 from .. import config, control, db
 from ..config import Config
-from ..search import Found, find, present, search
+from ..search import Found, find, is_slow, present, search
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,15 @@ RSS_PAGE = 20  # default number of items per page of the Explorer search connect
 RSS_PAGE_MAX = 100
 SEARCH_SLOTS = 2  # searches that run at the same time; each holds a connection and ranks up to HIT_LIMIT hits
 SEARCH_TIMEOUT_S = 30.0  # a query that runs longer is stopped, so an abandoned one cannot hold a slot for ever
+# A slow search (search.is_slow: wildcards, case sensitivity, regex) runs in the background with no time limit, its
+# page polling what it has found so far; it is stopped when the page stops asking for this long (the tab was closed).
+POLL_GRACE_S = 10.0
+# the request that starts a slow search waits this long for its first results, so that one which ends (or fails, a
+# bad pattern) at once answers without a poll
+FIRST_ANSWER_S = 1.0
+# slow searches that read text at the same time: one may read the whole index for a minute, and a second would only
+# compete with it for the disk
+SCAN_SLOTS = 1
 FOUND_TTL_S = 120.0  # how long the files a tab found stay available for another sort order or page
 FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file and chunk numbers (about 100 KB)
 # what changes the view of a search, not what it finds
@@ -113,6 +123,10 @@ class SearchTicket:
             self.timed_out = True
         return 1 if self.stopped else 0
 
+    def extend(self, seconds: float) -> None:
+        """A page still wants this search: it may run `seconds` longer from now."""
+        self.deadline = max(self.deadline, time.monotonic() + seconds)
+
 
 class SearchRegistry:
     """Latest search wins: starting search `seq` of a tab cancels that tab's older running search."""
@@ -155,29 +169,132 @@ def _extension_set(text: str) -> frozenset[str]:
     return frozenset("" if item == "." else item.lower() for item in text.split(",") if item)
 
 
+def _search_key(q: dict) -> tuple:
+    """What a search found depends on these parameters; the others only change how it is shown."""
+    return tuple(sorted((k, v) for k, v in q.items() if k not in _PAGE_PARAMS))
+
+
+def _find_options(q: dict) -> dict:
+    """search.find() arguments, besides the query, from the request parameters. ValueError: a bad number."""
+    exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
+    return {
+        "path": q.get("path") or None, "exts": exts or None,
+        "after": q.get("after") or None, "before": q.get("before") or None, "names": q.get("names") == "1",
+        "regex": q.get("regex") == "1", "case_sensitive": q.get("case") == "1",
+        "kind": q.get("kind") or None, "camera": q.get("camera") or None,
+        "has_gps": {"1": True, "0": False}.get(q.get("has_gps")),
+        "min_width": int(q["min_width"]) if q.get("min_width") else None,
+        "min_height": int(q["min_height"]) if q.get("min_height") else None,
+        "min_duration_s": float(q["min_duration"]) if q.get("min_duration") else None,
+        "max_duration_s": float(q["max_duration"]) if q.get("max_duration") else None,
+        "taken_after": q.get("taken_after") or None, "taken_before": q.get("taken_before") or None,
+    }
+
+
+def _view_options(q: dict, *, export: bool) -> dict:
+    """search.present() arguments from the request parameters: the order, the page, the extension filters."""
+    return {
+        "sort": q.get("sort") or "relevance", "limit": None if export else 20,
+        "offset": 0 if export else max(0, int(q.get("offset", 0) or 0)),
+        "only": _extension_set(q["only_ext"]) if q.get("only_ext") else None,
+        "skip": _extension_set(q.get("skip_ext", "")) or frozenset(),
+    }
+
+
+def _background_search(server: _Server, q: dict, tab: str, kept: KeptSearch, first: threading.Event) -> None:
+    """Run a slow search, putting what it has found so far into `kept` for the page's polls; `first` is set when
+    there is something to show (or the search ended). A failed or stopped search leaves the cache, with its error."""
+    ticket = kept.ticket
+    assert ticket is not None, "a background search has a ticket"
+
+    def update(found: Found) -> None:
+        kept.found = found
+        first.set()
+
+    try:
+        while not server.scan_slots.acquire(timeout=0.5):  # another tab's slow search is reading the index
+            if ticket.should_stop():
+                return
+        try:
+            conn = db.connect(server.cfg.db_path, readonly=True)
+            try:
+                conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
+                kept.found = find(conn, q.get("query", ""), **_find_options(q), progress=update)
+            finally:
+                conn.close()
+        finally:
+            server.scan_slots.release()
+    except ValueError as e:  # SearchError: a bad pattern, nothing to search for; or a filter that is not a number
+        kept.error = str(e)
+    except sqlite3.OperationalError:
+        if not ticket.stopped:
+            log.exception("search %r failed", q.get("query", ""))
+            kept.error = "The search failed; the log has the details."
+    except Exception:
+        # a thread's exception would otherwise only reach stderr, and the page would poll a search that never ends
+        log.exception("search %r failed", q.get("query", ""))
+        kept.error = "The search failed; the log has the details."
+    finally:
+        if ticket.stopped:
+            kept.error = "The search was stopped."  # never shown as if it had found everything
+        kept.running = False
+        server.searches.end(tab, ticket)
+        if kept.error is None:
+            server.found.finished(tab, kept)
+        else:
+            server.found.discard(tab, kept)
+        first.set()
+
+
+@dataclass(slots=True)
+class KeptSearch:
+    """A search of a tab: what it found, and while it still runs in the background (`ticket` is set), what it has
+    found so far. Its thread replaces `found` with a newer snapshot; a reader takes the reference once."""
+
+    found: Found
+    ticket: SearchTicket | None = None
+    running: bool = False
+    error: str | None = None
+
+
 class FoundCache:
     """The last search of each browser tab, so that sorting it again or turning a page does not read all the text
-    again. An entry is for one set of search words and filters (`key`) and ends after `ttl_s`: the index changes."""
+    again. An entry is for one set of search words and filters (`key`) and ends `ttl_s` after the search finished:
+    the index changes."""
 
     def __init__(self, ttl_s: float = FOUND_TTL_S, tabs: int = FOUND_TABS) -> None:
         self._ttl_s = ttl_s
         self._tabs = tabs
         self._lock = threading.Lock()
-        self._entries: OrderedDict[str, tuple[tuple, float, Found]] = OrderedDict()
+        self._entries: OrderedDict[str, tuple[tuple, float, KeptSearch]] = OrderedDict()
 
-    def get(self, tab: str, key: tuple) -> Found | None:
+    def get(self, tab: str, key: tuple) -> KeptSearch | None:
         with self._lock:
             entry = self._entries.get(tab)
-            if entry is None or entry[0] != key or time.monotonic() > entry[1]:
+            if entry is None or entry[0] != key or (not entry[2].running and time.monotonic() > entry[1]):
                 return None
             return entry[2]
 
-    def put(self, tab: str, key: tuple, found: Found) -> None:
+    def put(self, tab: str, key: tuple, kept: KeptSearch) -> None:
         with self._lock:
-            self._entries[tab] = (key, time.monotonic() + self._ttl_s, found)
+            self._entries[tab] = (key, time.monotonic() + self._ttl_s, kept)
             self._entries.move_to_end(tab)
             while len(self._entries) > self._tabs:
                 self._entries.popitem(last=False)
+
+    def finished(self, tab: str, kept: KeptSearch) -> None:
+        """A background search ended: its time to live starts now, unless the tab has searched something else."""
+        with self._lock:
+            entry = self._entries.get(tab)
+            if entry is not None and entry[2] is kept:
+                self._entries[tab] = (entry[0], time.monotonic() + self._ttl_s, kept)
+
+    def discard(self, tab: str, kept: KeptSearch) -> None:
+        """A background search failed or was stopped: it is not kept (a newer search of the tab stays)."""
+        with self._lock:
+            entry = self._entries.get(tab)
+            if entry is not None and entry[2] is kept:
+                del self._entries[tab]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -371,10 +488,32 @@ class _Handler(BaseHTTPRequestHandler):
                    {"Content-Disposition": disposition})
 
     def _search_result(self, q: dict, *, export: bool) -> dict:
+        tab = q["tab"] if _TAB_ID.fullmatch(q.get("tab", "")) else None
+        key = _search_key(q)
+        kept = self.server.found.get(tab, key) if tab and q.get("reuse") == "1" else None
+        if kept is not None and kept.running:
+            # the page polls a search that runs in the background: what it has found so far
+            if export:
+                return {"results": [], "total": 0, "error": "The search is still running; export it when it ends."}
+            assert kept.ticket is not None, "a running search has a ticket"
+            kept.ticket.extend(POLL_GRACE_S)
+            return self._present_kept(q, kept)
+        if kept is None and tab and not export and is_slow(q.get("query", ""), regex=q.get("regex") == "1",
+                                                            case_sensitive=q.get("case") == "1"):
+            if not self.server.cfg.db_path.exists():
+                return {"results": [], "total": 0, "error": "The index does not exist yet."}
+            try:
+                seq = int(q.get("seq", 0) or 0)
+            except ValueError as e:
+                return {"results": [], "total": 0, "error": str(e)}
+            kept = self._start_in_background(q, tab, key, seq)
+            if kept is None:
+                return {"results": [], "total": 0, "capped": False, "error": None, "cancelled": True}
+            return self._present_kept(q, kept)
+
         conn = self._connect()
         if conn is None:
             return {"results": [], "total": 0, "error": "The index does not exist yet."}
-        tab = q["tab"] if _TAB_ID.fullmatch(q.get("tab", "")) else None
         searches = self.server.searches
         try:
             # an export is not a newer search of the tab: it must not cancel the one the page is waiting for
@@ -387,7 +526,7 @@ class _Handler(BaseHTTPRequestHandler):
             with self.server.search_slots:  # waiting here is cheap: a newer search may cancel this one meanwhile
                 if not ticket.cancelled:
                     conn.set_progress_handler(ticket.should_stop, _PROGRESS_OPS)
-                    result = self._run_search(conn, q, tab, export=export)
+                    result = self._run_search(conn, q, tab, key, kept, export=export)
         except ValueError as e:
             result = {"results": [], "total": 0, "error": str(e)}
         except sqlite3.OperationalError:
@@ -414,31 +553,50 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad seq"}, 400)
         self._json({})
 
-    def _run_search(self, conn: sqlite3.Connection, q: dict, tab: str | None, *, export: bool = False) -> dict:
-        """The page of results for `q`, or with `export` all of them. With `reuse=1` (another sort or page) the
-        tab's last search is used if it was for the same words and filters; otherwise the text is searched."""
-        key = tuple(sorted((k, v) for k, v in q.items() if k not in _PAGE_PARAMS))
-        cache = self.server.found
-        found = cache.get(tab, key) if tab and q.get("reuse") == "1" else None
-        if found is None:
-            exts = [e for e in q.get("ext", "").replace(",", " ").split() if e]
-            found = find(
-                conn, q.get("query", ""), path=q.get("path") or None, exts=exts or None,
-                after=q.get("after") or None, before=q.get("before") or None, names=q.get("names") == "1",
-                regex=q.get("regex") == "1", case_sensitive=q.get("case") == "1",
-                kind=q.get("kind") or None, camera=q.get("camera") or None,
-                has_gps={"1": True, "0": False}.get(q.get("has_gps")),
-                min_width=int(q["min_width"]) if q.get("min_width") else None,
-                min_height=int(q["min_height"]) if q.get("min_height") else None,
-                min_duration_s=float(q["min_duration"]) if q.get("min_duration") else None,
-                max_duration_s=float(q["max_duration"]) if q.get("max_duration") else None,
-                taken_after=q.get("taken_after") or None, taken_before=q.get("taken_before") or None)
+    def _run_search(self, conn: sqlite3.Connection, q: dict, tab: str | None, key: tuple, kept: KeptSearch | None,
+                    *, export: bool = False) -> dict:
+        """The page of results for `q`, or with `export` all of them, from the tab's kept search (`reuse=1`:
+        another sort or page of the same words and filters) or, without one, from searching the text."""
+        if kept is None:
+            kept = KeptSearch(find(conn, q.get("query", ""), **_find_options(q)))
             if tab:
-                cache.put(tab, key, found)
-        return present(conn, found, sort=q.get("sort") or "relevance", limit=None if export else 20,
-                       offset=0 if export else max(0, int(q.get("offset", 0) or 0)),
-                       only=_extension_set(q["only_ext"]) if q.get("only_ext") else None,
-                       skip=_extension_set(q.get("skip_ext", "")) or frozenset())
+                self.server.found.put(tab, key, kept)
+        if kept.error is not None:
+            return {"results": [], "total": 0, "capped": False, "error": kept.error}
+        return {**present(conn, kept.found, **_view_options(q, export=export)), "running": False}
+
+    def _start_in_background(self, q: dict, tab: str, key: tuple, seq: int) -> KeptSearch | None:
+        """Start a slow search of the tab on a thread of its own and wait a moment for its first results: a search
+        that ends at once, or fails at once (a bad pattern), answers in one go. None: a newer search of the tab
+        is already running."""
+        server = self.server
+        ticket = server.searches.begin(tab, seq, timeout_s=POLL_GRACE_S)
+        if ticket.cancelled:
+            return None
+        kept = KeptSearch(Found.empty(), ticket=ticket, running=True)
+        server.found.put(tab, key, kept)
+        first = threading.Event()
+        # daemon: the thread only reads the index, so ending it with the process loses nothing
+        threading.Thread(target=_background_search, args=(server, q, tab, kept, first), name=f"search-{tab}",
+                         daemon=True).start()
+        first.wait(FIRST_ANSWER_S)
+        return kept
+
+    def _present_kept(self, q: dict, kept: KeptSearch) -> dict:
+        # `running` before `found`: the thread sets its final `found` before it says it stopped running
+        running = kept.running
+        found = kept.found
+        if kept.error is not None:
+            return {"results": [], "total": 0, "capped": False, "error": kept.error}
+        conn = self._connect()
+        if conn is None:
+            return {"results": [], "total": 0, "error": "The index does not exist yet."}
+        try:
+            return {**present(conn, found, **_view_options(q, export=False)), "running": running}
+        except ValueError as e:
+            return {"results": [], "total": 0, "error": str(e)}
+        finally:
+            conn.close()
 
     def _status(self) -> None:
         cfg = self.server.cfg
@@ -494,8 +652,8 @@ class _Handler(BaseHTTPRequestHandler):
         total = 0
         if conn is not None:
             try:
-                # Explorer asks on every keystroke: the index-only answer, not the scan of the stored text
-                result = search(conn, q.get("query", ""), offset=start - 1, limit=count, contains=False)
+                # Explorer asks on every keystroke: the index-only answer, never the scan of the stored text
+                result = search(conn, q.get("query", ""), offset=start - 1, limit=count, scan=False)
             finally:
                 conn.close()
             results, total = result["results"], result["total"]
@@ -524,6 +682,7 @@ class _Server(ThreadingHTTPServer):
         self.searches = SearchRegistry()
         self.found = FoundCache()
         self.search_slots = threading.BoundedSemaphore(SEARCH_SLOTS)
+        self.scan_slots = threading.BoundedSemaphore(SCAN_SLOTS)
         # POSTs change settings and control files; they ran one at a time before the server was threaded
         self.post_lock = threading.Lock()
         config.check_web_host(cfg.web_host)  # again: tests and callers may build a Config without config.load()

@@ -52,6 +52,7 @@ button.plain { background: transparent; color: var(--accent); border: 1px solid 
 a.plain { color: var(--accent); border: 1px solid var(--line); border-radius: 7px; padding: 3px 10px; font-size: 13px;
           text-decoration: none; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+.slownote { color: var(--danger); font-size: 13px; margin-top: 6px; }
 .extbar { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 0 2px 10px; font-size: 13px; }
 .extbar .export { margin-left: auto; }
 button:disabled { opacity: .45; cursor: not-allowed; }

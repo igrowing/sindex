@@ -250,6 +250,7 @@ classDiagram
     class SearchTicket {
         +stopped() bool
         +should_stop() int
+        +extend(seconds)
     }
 
     class Indexer {
@@ -590,11 +591,47 @@ sequenceDiagram
 
 Search features, all in `search.py`:
 
-* Words, phrases, prefixes, OR groups and negation, built into one FTS5 `MATCH` string.
+* Words (each a prefix: `kyo` finds kyoto, not tokyo), phrases, OR groups and negation, built into one FTS5
+  `MATCH` string, so a plain search never reads stored text.
+* What the word index cannot answer reads stored text, through Python functions registered on the connection:
+  a `*` or `?` at the start or inside a word (`*kyo`) and regular expressions scan every chunk; case sensitivity
+  and punctuation check the text of the chunks the index returned. `search.is_slow()` names these searches.
 * Optional `names` mode that also scans folder and file names (a table scan, so opt-in).
 * Filters: path, extensions, modified date range, and the media filters (camera, GPS, size, duration, date taken).
   With media filters and no words it browses by filter alone, newest first.
-* At most two searches run at once; a search over 30 s is stopped.
+* At most two fast searches run at once; one over 30 s is stopped. Slow searches run one at a time in the
+  background with no time limit, as long as their page keeps polling them (below).
+
+A slow search answers while it runs. `find(progress=...)` hands a snapshot of what it found so far to the server
+every 0.5 s; the server keeps it in the tab's `KeptSearch`, which the page polls every second like another sort or
+page of a finished search (`reuse=1`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser (index.html)
+    participant H as web _Handler
+    participant T as background thread
+    participant C as FoundCache (KeptSearch)
+
+    B->>H: GET /api/search?query=*kyo&tab=T&seq=n
+    H->>C: put(tab, key, KeptSearch(running))
+    H->>T: start: find(..., progress=update)
+    T->>C: kept.found = snapshot (every 0.5 s)
+    H-->>B: first results, running: true (after at most 1 s)
+    loop every second while running
+        B->>H: GET /api/search?...&reuse=1
+        H->>C: get(tab, key); ticket.extend(10 s)
+        H-->>B: page of kept.found, running: true
+    end
+    T->>C: kept.found = final; running = false
+    B->>H: GET /api/search?...&reuse=1
+    H-->>B: page, running: false (polling ends)
+```
+
+Editing the box, a newer search of the tab, or ten seconds without a poll (the tab was closed) stops the thread
+through the same `SearchTicket` progress handler. A stopped or failed background search leaves the cache with an
+error, so a partial list is never shown as complete; Export to CSV waits until the search ends.
 
 The same query language is exposed three more ways: `sindex search` (CLI), `/api/search.rss` (Explorer search
 connector, described by `/opensearch.xml`), and the `sindex <words>` shortcut through the registry's App Paths entry.
@@ -850,8 +887,8 @@ costs nothing extra. The same reasoning is behind `pypdf[cryptodome]` instead of
 
 ### 3. Cancelling a search needs a thread-level hook, not a task
 
-A newer search in the same browser tab must cancel the older one, and a search over 30 s must stop
-(`SearchRegistry`, `SearchTicket`). This works by a SQLite progress handler that polls `ticket.should_stop()` inside
+A newer search in the same browser tab must cancel the older one, a fast search over 30 s must stop, and a slow
+search must stop when its page stops polling it (`SearchRegistry`, `SearchTicket`). This works by a SQLite progress handler that polls `ticket.should_stop()` inside
 the running query, and it stops the query at the SQLite level. `asyncio` task cancellation cannot interrupt a
 blocking C call: it would cancel the `await`, leave the query running in the executor thread, and still hold a
 connection and a slot. The thread-plus-progress-handler design is both simpler and correct.
@@ -941,7 +978,7 @@ flowchart TB
 | Another computer reads the index | The server listens on `127.0.0.1`. `config.check_web_host` accepts only an IPv4 loopback address: `config.load` raises `ConfigError` (the service does not start) and `WebServer.start` refuses to start on anything else or on a socket bound elsewhere. |
 | A web page in a browser reaches the server under a foreign name (DNS rebinding) | The `Host` header must be `127.0.0.1`, `localhost` or `[::1]` with the configured port. |
 | A web page or program pauses the indexer, changes settings, browses folders or reads logs | The token (`X-Sindex-Token`, compared with `hmac.compare_digest`) on every POST, `/api/browse` and `/api/log`. Settings are validated before they are written. |
-| Oversized or malformed requests | `MAX_BODY` bounds the body; bodies must be a JSON object; at most two searches run at once and a search stops after 30 s. |
+| Oversized or malformed requests | `MAX_BODY` bounds the body; bodies must be a JSON object; at most two fast searches run at once and stop after 30 s; one slow search runs at a time and stops 10 s after its page stops polling. |
 
 **Not protected, on purpose:**
 

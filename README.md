@@ -138,12 +138,19 @@ A search starts when you press Enter, or by itself `search_complete_after_s` sec
 `[web]`; 0 = Enter only) after your last keystroke. Changing the text stops a running search, and a moving line under
 the search box shows that one is running. A search has three steps, in this order of ranking:
 
-1. the word index: whole words and prefixes (`kyo`, `kyo*`), accents ignored, ranked by relevance; instant;
-2. a scan of the stored text of every file for the same words *inside* other words, so `kyo` also finds `tokyo` and
-   `kyoto`. `*` and `?` inside a word are wildcards (`k?o`, `ky*to`). The stored text keeps its original letters, so
-   this needs no second index and no extra disk space, but it reads all of it: on a 921 MB index about 2-3 s, and
-   up to about 8 s for a complicated regular expression, growing in step with the index;
+1. the word index: every word finds the words that *start* with it (`kyo` finds `kyo` and `kyoto`, not `tokyo`; a
+   trailing `*` changes nothing), accents and case ignored, ranked by relevance; instant;
+2. a scan of the stored text, only for what the index cannot answer: a `*` or `?` at the start or inside a word.
+   `*kyo` finds `kyo` anywhere in a word (`tokyo`, `kyoto`), `t?kyo` one letter between, `ky*to` any letters
+   between. The stored text keeps its original letters, so this needs no second index and no extra disk space, but
+   it reads all of it: on a 4 GB index 35-65 s when its pages are not in the disk cache, about 8 s when they are;
 3. folder and file names, only if the names box is ticked.
+
+Wildcards at the start or inside a word, **Case sensitive** and **Use RegEx** make a search slow, and the page says so
+under the search box as soon as you type them. Such a search runs in the background in the server, without the 30 s
+limit, and the page shows what it has found so far, every second, until it ends ("Searching… 37 files found so
+far"). Editing the box stops it, and so does closing the page: the server stops a search that is not asked about
+for 10 s. One slow search runs at a time; Export to CSV becomes available when it has finished.
 
 **Sort by** (above the results) orders the list by path, file name, size or date, ascending or descending. The default,
 Relevance, keeps the order of the steps above and, for two or more words, puts the files in which these words are
@@ -183,25 +190,27 @@ Punctuation in a word is part of the search: `kyo)` finds only text that has tho
 not find every `c`. (The word index itself throws punctuation away, so what it finds for such a word is checked
 against the stored text.) To search for a `*` or `?` itself, tick Use RegEx and write `\*` or `\?`.
 
-An exclusion (`-kyo`) drops every file whose text has the term, also inside other words (`tokyo`, `kyoto`), and
-`-kyo` alone lists the files with indexed text that do not have it, newest first, without snippets (the names box
-also excludes files with it in their path). Files without indexed text (binary, too big, failed) are left out of
-that list, because it is not known what they contain.
+An exclusion (`-kyo`) drops every file with a word that starts with the term (`kyoto` too; `-*kyo` also drops
+`tokyo`), and `-kyo` alone lists the files with indexed text that do not have it, newest first, without snippets (the
+names box also excludes files with it in their path). Files without indexed text (binary, too big, failed) are left
+out of that list, because it is not known what they contain.
 
 Three independent checkboxes sit under the search box: **Also in folder- and file-names**, **Use RegEx** and **Case
 sensitive** (`sindex search --names --regex --case` on the command line). Names adds the folder and file names to the
-search. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`).
+search. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
+in contents it checks the text of every file the word index found, so a very common word takes longer.
 Use RegEx turns the whole query into one Python regular expression for the contents (`^` and `$` match at line
 starts and ends) and, with the names box, for the full path (`D:\folder\file.txt`); case is ignored unless Case
 sensitive is also ticked. A pattern is limited to 200 characters.
 
-The web server answers requests on threads, at most two searches at a time. A newer search of the same browser tab
-cancels the older one inside SQLite, editing the box cancels the running one, and a search that runs longer than 30 s
-is stopped. Regular expressions run on the third-party `regex` module, the only regular-expression library the
+The web server answers requests on threads, at most two searches at a time, plus one slow search in the background.
+A newer search of the same browser tab cancels the older one inside SQLite, editing the box cancels the running one,
+and a search that is not slow and runs longer than 30 s is stopped. Regular expressions run on the third-party `regex` module, the only regular-expression library the
 program uses: unlike the standard `re` it can stop a match that has run away (a pattern that needs more than 0.5 s
 on one path or 1 s on one piece of text is refused with a message) and lets other threads work meanwhile, so a bad
 pattern cannot freeze the service. `requirements.txt` lists every third-party module. The Explorer search connector
-(`/api/search.rss`) asks on every keystroke and therefore uses the word index only, without the scan.
+(`/api/search.rss`) asks on every keystroke and therefore uses the word index only, without the scan: a term with a
+wildcard at its start or inside finds nothing there.
 
 ## How it stays light
 

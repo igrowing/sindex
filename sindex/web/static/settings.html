@@ -131,8 +131,9 @@
   <section data-tab="search">
     <h2>Search</h2>
     <p class="lead">A search starts when you press Enter, or by itself when you stop typing for a moment. Changing
-      the text stops a running search. Besides whole words, a search reads the stored text of every file for the
-      words inside other words, so it takes a second or more, longer on a big index.</p>
+      the text stops a running search. A word finds the words that start with it, which is instant. Wildcards at
+      the start or inside a word (<code>*kyo</code>), case sensitivity and regular expressions read stored text, which
+      takes longer on a big index; their results show while they run.</p>
     <div id="f-search"></div>
   </section>
 

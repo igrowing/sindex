@@ -23,16 +23,17 @@
   </details>
 
   <form id="form" autocomplete="off">
-    <div class="hint">Hints: Words must all appear · <code>"exact phrase"</code> · <code>prefix*</code> · <code>-exclude</code> · <code>OR</code></div>
+    <div class="hint">Hints: Words must all appear, each as the start of a word · <code>"exact phrase"</code> · <code>*word</code> anywhere in a word · <code>-exclude</code> · <code>OR</code></div>
     <div class="row">
       <input id="query" type="search" placeholder="Search file contents…" autofocus>
       <button type="submit">Search</button>
     </div>
+    <div id="slowNote" class="slownote" role="status" hidden></div>
     <div id="progress" class="progress" role="progressbar" aria-label="Searching" hidden></div>
     <div class="checks">
       <label class="check"><input id="names" type="checkbox"> Also in folder- and file-names</label>
-      <label class="check" title="The query becomes one regular expression for the full path (folder\file name); only folder and file names are searched, not contents. Runs on Enter or after the pause, not on every keystroke."><input id="regex" type="checkbox"> Use RegEx</label>
-      <label class="check" title="Folder and file names must match the typed letters exactly (also with RegEx). File contents are always searched without case."><input id="case" type="checkbox"> Case sensitive</label>
+      <label class="check" title="The query becomes one regular expression for the file contents and, with the names box, for the full path (folder\file name). It reads all the text, so it is slow; results show while it runs."><input id="regex" type="checkbox"> Use RegEx</label>
+      <label class="check" title="The typed letters must match exactly, in the file contents and, with the names box, in folder and file names. The text of every match is checked, so it is slower; results show while it runs."><input id="case" type="checkbox"> Case sensitive</label>
     </div>
     <div class="row filters">
       <label>In folder <input id="path" placeholder="D:\Documents"></label>
@@ -107,6 +108,8 @@ const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds without typing before the
 const TAB = Math.random().toString(36).slice(2, 12);  // lets the server stop this tab's superseded searches
 let offset = 0;
 let seq = 0, inflight = null, typeTimer = null;
+const POLL_MS = 1000;  // how often the page asks a slow search, which runs on in the server, what it has found so far
+let job = false, pollTimer = null, shown = "";  // a slow search runs on; what the result list shows
 let lastParams = null;  // the parameters of the search whose results are on the page
 let exporting = false;
 
@@ -213,36 +216,63 @@ document.addEventListener("click", (e) => {  // a dropdown closes when the perso
 });
 
 function clearResults() {
-  $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0;
+  $("results").innerHTML = ""; $("summary").textContent = ""; $("pager").innerHTML = ""; lastTotal = 0; shown = "";
   $("sortBox").hidden = true; $("extBar").hidden = true; clearExtSelection();
   hideExportError(); syncExport();
 }
 function setBusy(on) { $("progress").hidden = !on; syncExport(); }
-function syncExport() { $("exportBtn").disabled = exporting || !lastTotal || inflight !== null; }
+function syncExport() { $("exportBtn").disabled = exporting || !lastTotal || inflight !== null || job; }
 
-// The search that is running is no longer wanted. Closing the request does not stop the query inside the
-// server, so the server is told as well.
-function stopSearch() {
-  clearTimeout(typeTimer); typeTimer = null;
-  if (inflight) {
-    inflight.ctl.abort();
-    fetch("/api/search/cancel?" + new URLSearchParams({ tab: TAB, seq: inflight.seq }), { keepalive: true }).catch(() => {});
-    inflight = null;
+// A `*` or `?` at the start or inside a word: the word index cannot answer it, the server reads all the text.
+// The same rule as search._parse: a trailing star or question mark changes nothing.
+function hasWildcards(text) {
+  for (const m of text.matchAll(/(-?)"([^"]*)"(\*?)|(\S+)/g)) {
+    let term;
+    if (m[4] === undefined) term = m[2].replace(/^[*?]+|[*?]+$/g, "");
+    else if (m[4] === "OR") continue;
+    else term = (m[4].length > 1 && m[4].startsWith("-") ? m[4].slice(1) : m[4]).replace(/[*?]+$/, "");
+    if (/[*?]/.test(term) && /[\p{L}\p{N}_]/u.test(term)) return true;
   }
-  seq++;  // an answer that is still on its way is dropped
-  setBusy(false);
+  return false;
+}
+// Says at once, under the search box, what makes this search slow (search.is_slow on the server).
+function updateSlowNote() {
+  const why = [];
+  if ($("regex").checked) why.push("RegEx");
+  else if (hasWildcards($("query").value)) why.push("wildcards");
+  if ($("case").checked) why.push("case sensitive");
+  const note = $("slowNote");
+  note.hidden = !why.length;
+  note.textContent = why.length ? `Using ${why.join(" and ")} slows the search down; results show as they are found.` : "";
 }
 
-// reuse: another sort order or page of the same search, which the server still has; it only re-orders it
-async function runSearch({ reuse = false, keepExt = false } = {}) {
-  stopSearch();
+// The search that is running is no longer wanted. Closing the request does not stop the query inside the
+// server, so the server is told as well; a slow search that runs on in the server too, unless `keepJob` (another
+// sort or page of it, or the next poll).
+function stopSearch({ keepJob = false } = {}) {
+  clearTimeout(typeTimer); typeTimer = null;
+  clearTimeout(pollTimer); pollTimer = null;
+  const running = inflight !== null || job;
+  if (inflight) { inflight.ctl.abort(); inflight = null; }
+  // `seq` is above every request sent so far: the server stops this tab's search if it is one of them
+  if (running && !keepJob)
+    fetch("/api/search/cancel?" + new URLSearchParams({ tab: TAB, seq }), { keepalive: true }).catch(() => {});
+  if (!keepJob) job = false;
+  seq++;  // an answer that is still on its way is dropped
+  setBusy(job);
+}
+
+// reuse: another sort order or page of the same search, which the server still has; it only re-orders it.
+// poll: ask a slow search that runs on in the server for what it has found so far.
+async function runSearch({ reuse = false, keepExt = false, poll = false } = {}) {
+  stopSearch({ keepJob: reuse });
   hideExportError();
   if (!reuse && !keepExt) clearExtSelection();  // a new search has other extensions to choose from
   if (!$("query").value.trim() && !hasMediaFilter()) { clearResults(); return; }
   const p = params(), mine = seq, ctl = new AbortController();
   inflight = { ctl, seq: mine };
   setBusy(true);
-  $("summary").textContent = "Searching…";
+  if (!poll) $("summary").textContent = "Searching…";
   history.replaceState(null, "", "?" + p);
   const query = new URLSearchParams(p);
   query.set("tab", TAB); query.set("seq", mine);
@@ -251,7 +281,9 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
     .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
   if (!res || mine !== seq || res.cancelled) return;  // stopped or replaced by a newer search
   inflight = null;
-  setBusy(false);
+  job = !!res.running;
+  setBusy(job);
+  if (job) pollTimer = setTimeout(() => runSearch({ reuse: true, poll: true }), POLL_MS);
   const sum = $("summary");
   $("sortBox").hidden = !res.total;
   extList = res.extensions || [];
@@ -259,11 +291,24 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
   $("extBar").hidden = !found;
   buildExtPanels(); syncExtMenus();
   if (res.error) { sum.innerHTML = `<span class="err">${esc(res.error)}</span>`; }
-  else if (!res.total) { sum.textContent = found ? "No files with the selected extensions." : "No matches."; }
+  else if (!res.total) {
+    sum.textContent = job ? "Searching… nothing found yet."
+      : found ? "No files with the selected extensions." : "No matches.";
+  }
   else {
     const count = res.total === found ? res.total : `${res.total} of ${found}`;
-    sum.textContent = `${count}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"} · showing ${offset + 1}–${offset + res.results.length}`;
+    sum.textContent = (job ? "Searching… " : "") + `${count}${res.capped ? "+" : ""} file${res.total === 1 ? "" : "s"}`
+      + (job ? " found so far" : "") + ` · showing ${offset + 1}–${offset + res.results.length}`;
   }
+  // a poll that found nothing new leaves the list alone, so that it does not flicker under the reader
+  const sig = JSON.stringify([offset, res.results.map(r => [r.path, r.hits, r.snippet])]);
+  if (sig !== shown || !poll) { shown = sig; renderResults(res); }
+  lastTotal = res.total;
+  lastParams = p;
+  syncExport();
+  renderPager(res.total);
+}
+function renderResults(res) {
   $("results").innerHTML = res.results.map((r, i) => `
     <li class="hit">
       <div class="dir">${esc(r.dir)}\\</div>
@@ -286,10 +331,6 @@ async function runSearch({ reuse = false, keepExt = false } = {}) {
     b.onclick = () => openPath(res.results[+b.dataset.open].path, "file"));
   $("results").querySelectorAll("[data-open-dir]").forEach(b =>
     b.onclick = () => openPath(res.results[+b.dataset.openDir].path, "folder"));
-  lastTotal = res.total;
-  lastParams = p;
-  syncExport();
-  renderPager(res.total);
 }
 // Export every file of the search on the page (not just the page shown) as a CSV file. The browser does the
 // saving, as for any download: one that is set to ask where to save shows its Save dialog (name and folder), the
@@ -431,7 +472,8 @@ async function refreshStatus() {
 // Searching starts on Enter, or by itself COMPLETE_AFTER seconds after the last keystroke. Any change of the
 // text stops the search that is running and waits again.
 function onType() {
-  const wasRunning = !!inflight;
+  updateSlowNote();
+  const wasRunning = !!inflight || job;
   stopSearch();
   offset = 0;
   if (!$("query").value.trim() && !hasMediaFilter()) { clearResults(); return; }
@@ -445,7 +487,7 @@ $("query").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
 $("names").onchange = () => { offset = 0; runSearch(); };
 $("sort").onchange = () => { offset = 0; runSearch({ reuse: true }); };
-for (const k of NAME_MODS) $(k).onchange = () => { offset = 0; runSearch(); };
+for (const k of NAME_MODS) $(k).onchange = () => { updateSlowNote(); offset = 0; runSearch(); };
 for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });
 $("pauseBtn").onclick = async () => {
   await post($("pauseBtn").dataset.paused ? "resume" : "pause"); refreshStatus();
@@ -465,6 +507,7 @@ for (const [name, m] of Object.entries(EXT_MENUS))
     for (const e of init.get(name + "_ext").split(",")) if (e) m.sel.add(e === "." ? "" : e);
 for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
 offset = +(init.get("offset") || 0);
+updateSlowNote();
 if (init.get("query") || hasMediaFilter()) runSearch({ keepExt: true });
 refreshStatus(); setInterval(refreshStatus, 5000);
 </script>

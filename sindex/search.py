@@ -6,7 +6,9 @@ import html
 import itertools
 import os
 import sqlite3
+import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -16,6 +18,7 @@ import regex
 from . import db, textnorm
 
 HIT_LIMIT = 2000  # chunk hits considered per query; results are grouped per file
+PROGRESS_EVERY_S = 0.5  # how often a search that reads text hands what it found so far to its `progress` callback
 SNIPPET_TOKENS = 24
 # the choices of the "Sort by" menu; "relevance" is the order of the search itself
 SORTS = ("relevance", "path_asc", "path_desc", "name_asc", "name_desc", "size_asc", "size_desc",
@@ -49,12 +52,20 @@ def _fts_term(text: str, *, prefix: bool) -> str:
     return expr
 
 
-def _parse(query: str) -> tuple[list[list[tuple[str, bool]]], list[str]]:
-    """User syntax -> (OR-separated groups of (text, prefix) terms that must all match, excluded texts)."""
-    groups: list[list[tuple[str, bool]]] = [[]]
-    negatives: list[str] = []
+Term = tuple[str, bool]  # (text, prefix): a word matches the start of a word, a quoted phrase only itself
+
+
+def _parse(query: str) -> tuple[list[list[Term]], list[Term]]:
+    """User syntax -> (OR-separated groups of terms that must all match, excluded terms).
+
+    A bare word is a prefix (`kyo` finds kyo and kyoto), so the word index answers it. A `*` or `?` at the start
+    or inside a word stays in it and makes the term wild (`*kyo` finds tokyo): only a scan of the text answers that.
+    """
+    groups: list[list[Term]] = [[]]
+    negatives: list[Term] = []
     for m in _TERM.finditer(query):
         neg, phrase, star, word = m.groups()
+        prefix = bool(star)
         if word is not None:
             if word == "OR":
                 if groups[-1]:
@@ -62,38 +73,47 @@ def _parse(query: str) -> tuple[list[list[tuple[str, bool]]], list[str]]:
                 continue
             neg = "-" if word.startswith("-") and len(word) > 1 else ""
             word = word[1:] if neg else word
-            word = word.lstrip("*?")  # a wildcard at the front says nothing: words are found inside words anyway
-            star = "*" if word.endswith("*") else ""
-            phrase = word.rstrip("*?")  # the same at the end; a final question mark is just punctuation
-        phrase = phrase.strip("*?")
+            prefix = True
+            phrase = word.rstrip("*?")  # a star at the end says what a word means anyway; a "?" there is punctuation
+        else:
+            phrase = phrase.strip("*?")
         if not _WORDISH.search(textnorm.normalize(phrase)):
             continue
-        if neg:
-            negatives.append(phrase)
-        else:
-            groups[-1].append((phrase, bool(star)))
+        (negatives if neg else groups[-1]).append((phrase, prefix))
     return [g for g in groups if g], negatives
 
 
 def build_match(query: str) -> str | None:
-    """User syntax: words, "phrases", prefix*, -exclude, OR. Everything else is literal."""
+    """User syntax: words (prefixes), "phrases", -exclude, OR. Everything else is literal."""
     return _to_match(*_parse(query))
 
 
 def _is_wild(text: str) -> bool:
-    """A `*` or `?` inside a term (leading and trailing ones are stripped by _parse): FTS5 cannot match those."""
+    """A `*` or `?` at the start or inside a term (trailing ones are stripped by _parse): FTS5 cannot match those."""
     return "*" in text or "?" in text
 
 
-def _to_match(groups: list[list[tuple[str, bool]]], negatives: list[str]) -> str | None:
+def has_wildcards(query: str) -> bool:
+    """Whether a term of `query` needs the scan of all the stored text (see _parse)."""
+    groups, negatives = _parse(query)
+    return any(_is_wild(text) for text, _ in [*negatives, *(term for g in groups for term in g)])
+
+
+def is_slow(query: str, *, regex: bool, case_sensitive: bool) -> bool:
+    """Whether the search reads stored text beyond what the word index returns, so it can take long: the page warns
+    about these and shows their results while they come in."""
+    return regex or case_sensitive or has_wildcards(query)
+
+
+def _to_match(groups: list[list[Term]], negatives: list[Term]) -> str | None:
     """The FTS5 expression for the part of the query the word index can answer; the scan answers the rest."""
     groups = [g for g in groups if not any(_is_wild(text) for text, _ in g)]
-    negatives = [text for text in negatives if not _is_wild(text)]
+    negatives = [term for term in negatives if not _is_wild(term[0])]
     if not groups:
         return None
     expr = " OR ".join(" ".join(_fts_term(text, prefix=prefix) for text, prefix in g) for g in groups)
     if negatives:
-        expr = f"({expr}) NOT ({' OR '.join(_fts_term(text, prefix=False) for text in negatives)})"
+        expr = f"({expr}) NOT ({' OR '.join(_fts_term(text, prefix=prefix) for text, prefix in negatives)})"
     return expr
 
 
@@ -111,7 +131,7 @@ def _like_pattern(text: str) -> str:
     return escaped.replace("*", "%").replace("?", "_")
 
 
-def _name_condition(groups: list[list[tuple[str, bool]]], negatives: list[str], *,
+def _name_condition(groups: list[list[Term]], negatives: list[Term], *,
                     case_sensitive: bool = False) -> tuple[str, list[str]]:
     """SQL for "the path contains the words", built from the same parse as the content query.
 
@@ -136,7 +156,7 @@ def _name_condition(groups: list[list[tuple[str, bool]]], negatives: list[str], 
         ors.append("(" + " AND ".join(test for _ in group) + ")")
         params += [param(text) for text, _ in group]
     cond = "(" + " OR ".join(ors) + ")"
-    for text in negatives:
+    for text, _ in negatives:
         cond += f" AND NOT ({test})"
         params.append(param(text))
     return cond, params
@@ -165,10 +185,18 @@ def _has_punctuation(text: str) -> bool:
 
 
 def _term_pattern(text: str) -> str:
-    """Regular expression for one query term: the letters as typed, `*` any word characters, `?` one."""
-    out: list[str] = []
+    """Regular expression for one query term: the letters as typed, `*` any word characters, `?` one.
+
+    Like the word index, it matches at the start of a word (`kyo` is in kyoto, not in tokyo; `*kyo` is in both).
+    A term that starts with punctuation brings its own boundary, and CJK text has no spaces between its words, so
+    neither is anchored.
+    """
+    folded = textnorm.fold(text)
+    first = folded[:1]
+    anchored = bool(first) and (first.isalnum() or first in "*?_") and not textnorm.has_cjk(first)
+    out: list[str] = [r"(?<!\w)"] if anchored else []
     in_space = False
-    for ch in textnorm.fold(text):  # the stored text went through fold() too
+    for ch in folded:  # the stored text went through fold() too
         if ch.isspace():
             if not in_space:
                 out.append(r"\s+")
@@ -236,8 +264,9 @@ def _sorted_by_file(conn: sqlite3.Connection, best: dict[int, int | None], sort:
 
 
 class _ChunkMatcher:
-    """Does a chunk of stored text satisfy the query? The word index only knows whole words and folds case, so this
-    is the "contains" rule behind words found inside words, case sensitivity, wildcards and regular expressions.
+    """Does a chunk of stored text satisfy the query? The word index folds case, drops punctuation and cannot match
+    a wildcard at the start or inside a word, so this checks the text for case sensitivity, punctuation, wildcards
+    and regular expressions.
 
     It is called by SQLite for every chunk it scans. `timed_out` tells the caller that a pattern did not finish.
     """
@@ -250,7 +279,7 @@ class _ChunkMatcher:
         self.timed_out = False
 
     @classmethod
-    def for_terms(cls, groups: list[list[tuple[str, bool]]], negatives: list[str], *,
+    def for_terms(cls, groups: list[list[Term]], negatives: list[Term], *,
                   case_sensitive: bool, only_punctuated: bool = False) -> _ChunkMatcher:
         """`only_punctuated` leaves the other terms unchecked (they match anything): it is the second look at what
         the word index found, which already compared those without case and accents."""
@@ -260,7 +289,7 @@ class _ChunkMatcher:
             return regex.compile("" if only_punctuated and not _has_punctuation(text) else _term_pattern(text), flags)
 
         return cls([[pattern(text) for text, _ in group] for group in groups],
-                   [regex.compile(_term_pattern(text), flags) for text in negatives])
+                   [regex.compile(_term_pattern(text), flags) for text, _ in negatives])
 
     @staticmethod
     def _search(pattern: regex.Pattern[str], text: str) -> regex.Match[str] | None:
@@ -300,7 +329,7 @@ class _ChunkMatcher:
         return None if found is None else found[0]
 
     def lacks_negatives(self, body: str) -> bool:
-        """True when none of the excluded terms is inside the chunk (words found inside words count)."""
+        """True when none of the excluded terms is in the chunk."""
         text = textnorm.decode_display(body)
         try:
             return not any(self._search(p, text) for p in self.negatives)
@@ -414,26 +443,45 @@ class Found:
     closest: dict[int, tuple[int, int]] | None = None
     extensions: dict[int, str] | None = None  # file id -> extension (lower case, no dot, "" for none); same
 
+    @classmethod
+    def empty(cls) -> Found:
+        """Nothing found (yet): what a search that has just started shows."""
+        return cls(best={}, hits={}, indexed=set(), seen=set(), capped=False, negative_only=False, literal=False,
+                   case_sensitive=False, match=None, matcher=None, by_proximity=False)
+
+    def snapshot(self) -> Found:
+        """A copy that the search still going on does not change. It is not ranked by proximity: that reads the
+        text of every hit again, and would be redone for every copy."""
+        return Found(best=dict(self.best), hits=dict(self.hits), indexed=set(self.indexed), seen=set(self.seen),
+                     capped=self.capped, negative_only=self.negative_only, literal=self.literal,
+                     case_sensitive=self.case_sensitive, match=self.match, matcher=self.matcher, by_proximity=False)
+
 
 def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
          after: str | None = None, before: str | None = None, *, names: bool = False,
-         regex: bool = False, case_sensitive: bool = False, contains: bool = True,
+         regex: bool = False, case_sensitive: bool = False, scan: bool = True,
          kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
          min_width: int | None = None, min_height: int | None = None,
          min_duration_s: float | None = None, max_duration_s: float | None = None,
-         taken_after: str | None = None, taken_before: str | None = None) -> Found:
+         taken_after: str | None = None, taken_before: str | None = None,
+         progress: Callable[[Found], None] | None = None) -> Found:
     """The files whose text matches `query`; with `names`, also those whose folder or file name matches it.
     SearchError says why a query cannot be run.
 
-    Hits are ranked in three steps: the word index first (whole words and prefixes, accents ignored), then a
-    scan of the stored text for the same words *inside* other words (`contains`), then name matches, which have
-    `hits == 0` and no snippet. The scan reads every chunk, about a second and a half per GB of index.
-    `*` and `?` inside a word are wildcards.
+    A word matches the start of a word (`kyo` finds kyo and kyoto, not tokyo; accents and case are ignored), which
+    the word index answers at once. Hits are ranked in three steps: the word index, then a scan of the stored text
+    for what the index cannot answer, then name matches, which have `hits == 0` and no snippet. Only `regex` and a
+    `*` or `?` at the start or inside a word (`*kyo` finds tokyo, `t?kyo`, `ky*to`) need the scan, which reads
+    every chunk: on a 4 GB index 35-65 s when its pages are not in the disk cache, about 8 s when they are.
+    With `scan=False` the scan never runs and wild terms find nothing.
 
     `names`, `regex` and `case_sensitive` are independent. `case_sensitive` compares the typed letters exactly,
-    in contents and, with `names`, in names. `regex` makes the whole query one regular expression for the
-    contents (and, with `names`, for the path: folder, backslash, file name). Case sensitivity and regular
-    expressions cannot use the word index and always scan.
+    in contents and, with `names`, in names; in contents it checks the text of what the word index found, which
+    takes as long as the word is common. `regex` makes the whole query one regular expression for the contents
+    (and, with `names`, for the path: folder, backslash, file name).
+
+    `progress`, when given, receives a snapshot of the files found so far about every PROGRESS_EVERY_S while text
+    is checked or scanned, so that the page can show them before the search ends.
 
     `kind` and the other media filters narrow the results to images/videos with matching `media` fields; with
     an empty `query` and at least one media filter set, this browses by filter alone (no keyword required).
@@ -441,8 +489,10 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     """
     hit_limit = HIT_LIMIT  # read here so that a test can lower it
     groups, negatives = _parse(query)
-    # only exclusions ("-kyo"): every file whose text has none of them, which needs the scan to be known
-    negative_only = not regex and not groups and bool(negatives) and (contains or case_sensitive)
+    wild_negatives = [term for term in negatives if _is_wild(term[0])]
+    scanning = regex or (scan and (bool(wild_negatives) or any(_is_wild(text) for g in groups for text, _ in g)))
+    # only exclusions ("-kyo"): every file whose text has none of them
+    negative_only = not regex and not groups and bool(negatives)
     matcher = rx_path = None
     if regex:
         try:
@@ -454,7 +504,8 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
         has_query, match = True, None
     else:
         has_query = bool(groups) or negative_only
-        match = _to_match(groups, negatives)
+        # the index cannot see case: with case sensitivity the exclusions are checked on the text only
+        match = _to_match(groups, [] if case_sensitive else negatives)
         if has_query:
             matcher = _ChunkMatcher.for_terms(groups, negatives, case_sensitive=case_sensitive)
 
@@ -482,12 +533,17 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     media_join = "JOIN media m ON m.file_id = f.id" if media_where else ""
     chunk_join = f"FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) {media_join}"
 
-    best: dict[int, int | None] = {}  # file id -> best chunk rowid (None: name match only), in rank order
-    hits: dict[int, int] = {}
-    indexed: set[int] = set()  # the rowids in `best` that the word index found, so snippet() can show them
-    seen: set[int] = set()  # every chunk that matched
-    capped = False
-    literal = False  # the word index's answer has to be checked against the text (see below)
+    # what the index found for a term with punctuation is only a guess: "kyo)" is the word kyo to it
+    literal = not regex and any(_has_punctuation(text) for g in groups for text, _ in g)
+    found = Found(best={}, hits={}, indexed=set(), seen=set(), capped=False, negative_only=negative_only,
+                  literal=literal, case_sensitive=case_sensitive, match=match, matcher=matcher, by_proximity=False)
+    next_report = time.monotonic() + PROGRESS_EVERY_S
+
+    def report() -> None:
+        nonlocal next_report
+        if progress is not None and time.monotonic() >= next_report:
+            progress(found.snapshot())
+            next_report = time.monotonic() + PROGRESS_EVERY_S
 
     if not has_query:
         if not media_where:
@@ -496,28 +552,32 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
         sql = (f"SELECT f.id FROM files f {media_join} "
                f"WHERE {' AND '.join([*where, *media_where])} ORDER BY f.mtime_ns DESC LIMIT ?")
         fids = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
-        best = dict.fromkeys(fids)
-        capped = len(fids) >= hit_limit
+        found.best = dict.fromkeys(fids)
+        found.capped = len(fids) >= hit_limit
     elif negative_only:
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_excluded", 1, matcher.has_negative, deterministic=True)
-        sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
-               f"WHERE {' AND '.join([*where, *media_where, 'sindex_excluded(chunks.body)'])}")
-        try:
-            excluded = {r[0] for r in conn.execute(sql, [*params, *media_params])}
-        except sqlite3.OperationalError:
-            if matcher.timed_out:
-                raise SearchError("A pattern took too long on some text.") from None
-            raise  # a cancelled or timed-out search, or a real error
-        if not case_sensitive and (words := _to_match([[(text, False)] for text in negatives], [])) is not None:
-            # the scan compares accents, the word index does not: "-cafe" must drop "café" as a plain search finds it
+        excluded: set[int] = set()
+        if wild_negatives:
+            if not scan:
+                raise SearchError("An excluded word with a * or ? at its start or inside needs the scan of all text.")
             sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
-                   f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where])}")
+                   f"WHERE {' AND '.join([*where, *media_where, 'sindex_excluded(chunks.body)'])}")
+            try:
+                excluded = {r[0] for r in conn.execute(sql, [*params, *media_params])}
+            except sqlite3.OperationalError:
+                if matcher.timed_out:
+                    raise SearchError("A pattern took too long on some text.") from None
+                raise  # a cancelled or timed-out search, or a real error
+        if (words := _to_match([[term] for term in negatives], [])) is not None:
+            # the word index finds the other excluded words; with case sensitivity their letters are checked too
+            check = ["sindex_excluded(chunks.body)"] if case_sensitive else []
+            sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
+                   f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where, *check])}")
             excluded.update(r[0] for r in conn.execute(sql, [words, *params, *media_params]))
         if names:
             conn.create_function("sindex_key", 1, _name_key, deterministic=True)
-            cond, name_params = _name_condition([[(text, False)] for text in negatives], [],
-                                                case_sensitive=case_sensitive)
+            cond, name_params = _name_condition([[term] for term in negatives], [], case_sensitive=case_sensitive)
             sql = f"SELECT f.id FROM files f {media_join} WHERE {' AND '.join([cond, *where, *media_where])}"
             excluded.update(r[0] for r in conn.execute(sql, [*name_params, *params, *media_params]))
         # files without indexed text (binary, too big, failed) are not "without kyo", they are unknown
@@ -528,65 +588,79 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
             if fid in excluded:
                 continue
             if len(fids) == hit_limit:
-                capped = True
+                found.capped = True
                 break
             fids.append(fid)
-        best = dict.fromkeys(fids)
+        found.best = dict.fromkeys(fids)
     else:
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_chunk", 1, matcher, deterministic=True)
         conn.create_function("sindex_clean", 1, matcher.lacks_negatives, deterministic=True)
-        # what the index found for a term with punctuation is only a guess: "kyo)" is the word kyo to it
-        literal = not regex and any(_has_punctuation(text) for g in groups for text, _ in g)
         if literal:
             conn.create_function("sindex_literal", 1, _ChunkMatcher.for_terms(
                 groups, negatives, case_sensitive=case_sensitive, only_punctuated=True), deterministic=True)
 
         def add(rowid: int, *, from_index: bool) -> None:
-            if rowid in seen:
+            if rowid in found.seen:
                 return
-            seen.add(rowid)
+            found.seen.add(rowid)
             fid = rowid >> db.CHUNK_BITS
-            if fid not in best or best[fid] is None:
-                best[fid] = rowid
+            if fid not in found.best or found.best[fid] is None:
+                found.best[fid] = rowid
                 if from_index:
-                    indexed.add(rowid)
-            hits[fid] = hits.get(fid, 0) + 1
+                    found.indexed.add(rowid)
+            found.hits[fid] = found.hits.get(fid, 0) + 1
 
         def slow_pattern() -> SearchError:
             return SearchError(f"The regular expression took longer than {REGEX_CHUNK_TIMEOUT_S:g} s on some text; "
                                "make it simpler or more specific.")
 
         if match is not None:
-            # the word index cannot tell "kyo" from "tokyo", so what it found is checked against the exclusions
-            # on the stored text; the same text keeps the letters as they were written for case sensitivity
+            # what the index found is checked against the stored text, which keeps the letters as they were
+            # written, when case matters, a word has punctuation, or an exclusion has a wildcard
             exact = (["sindex_chunk(chunks.body)"] if case_sensitive
                      else ["sindex_literal(chunks.body)"] if literal
-                     else ["sindex_clean(chunks.body)"] if negatives else [])
-            sql = (f"SELECT chunks.rowid {chunk_join} "
-                   f"WHERE {' AND '.join(['chunks MATCH ?', *where, *media_where, *exact])} ORDER BY rank LIMIT ?")
+                     else ["sindex_clean(chunks.body)"] if wild_negatives else [])
+            cond = " AND ".join(["chunks MATCH ?", *where, *media_where, *exact])
+            args = [match, *params, *media_params, hit_limit]
             try:
-                rowids = [r[0] for r in conn.execute(sql, [match, *params, *media_params, hit_limit])]
+                if exact and progress is not None:
+                    # checking the text of every hit takes as long as the word is common, and ORDER BY rank would
+                    # check all of them before the first one comes out: hand them out as they come, rank at the end
+                    ranked = []
+                    for rowid, rank in conn.execute(f"SELECT chunks.rowid, rank {chunk_join} WHERE {cond} LIMIT ?",
+                                                    args):
+                        ranked.append((rank, rowid))
+                        add(rowid, from_index=True)
+                        report()
+                    for part in (found.best, found.hits, found.indexed, found.seen):
+                        part.clear()
+                    rowids = [rowid for _, rowid in sorted(ranked)]
+                else:
+                    rowids = [r[0] for r in conn.execute(
+                        f"SELECT chunks.rowid {chunk_join} WHERE {cond} ORDER BY rank LIMIT ?", args)]
             except sqlite3.OperationalError as e:
                 if matcher.timed_out:
                     raise slow_pattern() from e
                 raise SearchError(f"Query not understood: {e}") from e
-            capped = len(rowids) >= hit_limit
+            found.capped = len(rowids) >= hit_limit
             for rowid in rowids:
                 add(rowid, from_index=True)
 
-        if regex or case_sensitive or contains:
+        if scanning:
             sql = (f"SELECT chunks.rowid {chunk_join} "
                    f"WHERE {' AND '.join([*where, *media_where, 'sindex_chunk(chunks.body)'])} LIMIT ?")
+            scanned = 0
             try:
-                scanned = [r[0] for r in conn.execute(sql, [*params, *media_params, hit_limit])]
+                for (rowid,) in conn.execute(sql, [*params, *media_params, hit_limit]):
+                    scanned += 1
+                    add(rowid, from_index=False)
+                    report()
             except sqlite3.OperationalError:
                 if matcher.timed_out:
                     raise slow_pattern() from None
                 raise  # a cancelled or timed-out search, or a real error
-            capped = capped or len(scanned) >= hit_limit
-            for rowid in scanned:
-                add(rowid, from_index=False)
+            found.capped = found.capped or scanned >= hit_limit
 
         if names:
             # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
@@ -615,16 +689,14 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
                 raise SearchError(f"The regular expression took longer than {REGEX_PATH_TIMEOUT_S:g} s on "
                                   f"{slow[0]}; make it simpler or more specific.") from None
             for fid in by_name:
-                best.setdefault(fid, None)
-            capped = capped or len(by_name) >= hit_limit
+                found.best.setdefault(fid, None)
+            found.capped = found.capped or len(by_name) >= hit_limit
 
-    if len(best) > hit_limit:
-        best = dict(list(best.items())[:hit_limit])
-        capped = True
-
-    return Found(best=best, hits=hits, indexed=indexed, seen=seen, capped=capped, negative_only=negative_only,
-                 literal=literal, case_sensitive=case_sensitive, match=match, matcher=matcher,
-                 by_proximity=matcher is not None and not regex and any(len(group) >= 2 for group in groups))
+    if len(found.best) > hit_limit:
+        found.best = dict(list(found.best.items())[:hit_limit])
+        found.capped = True
+    found.by_proximity = matcher is not None and not regex and any(len(group) >= 2 for group in groups)
+    return found
 
 
 def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[int, int]]:

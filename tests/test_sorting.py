@@ -81,9 +81,10 @@ def test_sorting_also_orders_name_matches_and_inside_word_hits(cfg, tmp_path):
     (root / "kyo_c.txt").write_text("nothing", encoding="utf-8")  # by name only
     run_index(cfg, root)
 
-    assert order(cfg, "kyo", names=True, sort="name_asc") == ["a.txt", "b.txt", "kyo_c.txt"]
-    assert order(cfg, "kyo", names=True, sort="name_desc") == ["kyo_c.txt", "b.txt", "a.txt"]
-    assert order(cfg, "kyo", names=True) == ["a.txt", "b.txt", "kyo_c.txt"]  # relevance: index, scan, names
+    # "kyo" by the index, "*kyo" (anywhere in a word) by the scan
+    assert order(cfg, "kyo OR *kyo", names=True, sort="name_asc") == ["a.txt", "b.txt", "kyo_c.txt"]
+    assert order(cfg, "kyo OR *kyo", names=True, sort="name_desc") == ["kyo_c.txt", "b.txt", "a.txt"]
+    assert order(cfg, "kyo OR *kyo", names=True) == ["a.txt", "b.txt", "kyo_c.txt"]  # relevance: index, scan, names
 
 
 def test_an_exclusion_list_can_be_sorted_too(kyo_like):
@@ -94,7 +95,7 @@ def test_an_exclusion_list_can_be_sorted_too(kyo_like):
 def kyo_like(cfg, tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
-    for name, text in {"z.txt": "nothing", "m.txt": "other", "k.txt": "tokyo"}.items():
+    for name, text in {"z.txt": "nothing", "m.txt": "other", "k.txt": "kyoto"}.items():
         (root / name).write_text(text, encoding="utf-8")
     run_index(cfg, root)
     return cfg
@@ -123,7 +124,7 @@ def test_relevance_by_proximity_also_works_for_words_found_inside_others(cfg, tm
     (root / "near.txt").write_text("xalphax ybetay " + "filler " * 300, encoding="utf-8")
     run_index(cfg, root)
 
-    assert order(cfg, "alpha beta") == ["near.txt", "far.txt"]
+    assert order(cfg, "*alpha *beta") == ["near.txt", "far.txt"]
 
 
 def test_other_sorts_ignore_proximity(proximity):

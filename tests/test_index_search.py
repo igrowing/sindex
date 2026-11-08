@@ -172,10 +172,14 @@ def test_build_match_escapes_fts_syntax():
 
 
 def test_build_match_syntax():
-    assert build_match("a b") == '"a" "b"'
-    assert build_match("a b OR c* -d") == '("a" "b" OR "c"*) NOT ("d")'
+    # a bare word is a prefix, a quoted phrase only itself
+    assert build_match("a b") == '"a"* "b"*'
+    assert build_match("a b OR c* -d") == '("a"* "b"* OR "c"*) NOT ("d"*)'
     assert build_match('"x y" OR') == '"x y"'
-    assert build_match("OR a OR OR b") == '"a" OR "b"'
+    assert build_match('"x y"* -"z w"') == '("x y"*) NOT ("z w")'
+    assert build_match("OR a OR OR b") == '"a"* OR "b"*'
+    assert build_match("*a OR b") == '"b"*'  # a group with a wild term is left to the scan
+    assert build_match("*a b") is None
 
 
 @pytest.fixture
