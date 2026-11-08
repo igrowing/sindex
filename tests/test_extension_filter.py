@@ -1,5 +1,5 @@
-"""The "Show only files with extension(s)" and "Exclude files with extension(s)" menus: the extensions of the
-found files, and filtering the found files by them."""
+"""The "Exclude files with extension(s)" menu: the extensions of the found files, and filtering the found files
+by them."""
 
 import json
 import os
@@ -58,18 +58,13 @@ def test_a_file_without_an_extension_is_listed_as_an_empty_one(cfg, tmp_path):
     res = page(cfg, limit=50)
 
     assert res["extensions"] == [["", 1], ["txt", 1]]
-    assert names(page(cfg, only=frozenset({""}), limit=50)) == ["README"]
     assert names(page(cfg, skip=frozenset({""}), limit=50)) == ["a.txt"]
 
 
 def test_an_extension_is_the_part_after_the_last_dot_without_case(mixed):
-    res = page(mixed, only=frozenset({"txt"}), limit=50)
+    res = page(mixed, skip=frozenset({"md", "log"}), limit=50)
 
     assert names(res) == ["a.txt", "archive.tar.txt", "b.txt", "c.TXT"]
-
-
-def test_only_keeps_the_selected_extensions(mixed):
-    assert names(page(mixed, only=frozenset({"md", "log"}), limit=50)) == ["d.md", "e.md", "f.log"]
 
 
 def test_skip_removes_the_selected_extensions(mixed):
@@ -78,15 +73,15 @@ def test_skip_removes_the_selected_extensions(mixed):
 
 def test_the_extension_list_does_not_shrink_when_filtering(mixed):
     # otherwise the person could not select anything else once something is selected
-    res = page(mixed, only=frozenset({"md"}), limit=50)
+    res = page(mixed, skip=frozenset({"txt", "log"}), limit=50)
 
     assert res["total"] == 2 and res["found_total"] == 7
     assert [e for e, _ in res["extensions"]] == ["txt", "md", "log"]
 
 
 def test_filtering_comes_before_paging_and_after_sorting(mixed):
-    first = page(mixed, only=frozenset({"txt"}), sort="date_desc", limit=2)
-    second = page(mixed, only=frozenset({"txt"}), sort="date_desc", limit=2, offset=2)
+    first = page(mixed, skip=frozenset({"md", "log"}), sort="date_desc", limit=2)
+    second = page(mixed, skip=frozenset({"md", "log"}), sort="date_desc", limit=2, offset=2)
 
     assert [r["name"] for r in first["results"] + second["results"]] == ["archive.tar.txt", "c.TXT", "b.txt", "a.txt"]
     assert first["total"] == 4
@@ -95,7 +90,7 @@ def test_filtering_comes_before_paging_and_after_sorting(mixed):
 def test_the_filters_also_work_through_search(mixed):
     conn = db.connect(mixed.db_path, readonly=True)
     try:
-        res = search(conn, "common", only=frozenset({"md"}), limit=50)
+        res = search(conn, "common", skip=frozenset({"txt", "log"}), limit=50)
     finally:
         conn.close()
 
@@ -130,14 +125,12 @@ def test_the_api_filters_the_kept_search_without_searching_again(cfg, mixed, mon
 
     try:
         first = get("seq=1")
-        only = get("seq=2&reuse=1&only_ext=md,log")
         skip = get("seq=3&reuse=1&skip_ext=txt,.")  # "." stands for "no extension" (none among these)
-        both = get("seq=4&reuse=1&only_ext=txt&skip_ext=txt")  # not offered by the page; nothing is left
+        both = get("seq=4&reuse=1&skip_ext=txt,md,log")  # nothing is left
         assert len(calls) == 1, "the kept search was filtered, not searched again"
     finally:
         server.stop()
 
     assert first["extensions"][0] == ["txt", 4]
-    assert sorted(r["name"] for r in only["results"]) == ["d.md", "e.md", "f.log"] and only["total"] == 3
     assert sorted(r["name"] for r in skip["results"]) == ["d.md", "e.md", "f.log"]
     assert both["total"] == 0

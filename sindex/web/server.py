@@ -55,7 +55,7 @@ SCAN_SLOTS = 1
 FOUND_TTL_S = 120.0  # how long the files a tab found stay available for another sort order or page
 FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file and chunk numbers (about 100 KB)
 # what changes the view of a search, not what it finds
-_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "only_ext", "skip_ext"})
+_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "skip_ext"})
 _TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
 EXPORT_COLUMNS = ("path", "filename", "size_bytes", "modified", "content")
@@ -192,11 +192,10 @@ def _find_options(q: dict) -> dict:
 
 
 def _view_options(q: dict, *, export: bool) -> dict:
-    """search.present() arguments from the request parameters: the order, the page, the extension filters."""
+    """search.present() arguments from the request parameters: the order, the page, the excluded extensions."""
     return {
         "sort": q.get("sort") or "relevance", "limit": None if export else 20,
         "offset": 0 if export else max(0, int(q.get("offset", 0) or 0)),
-        "only": _extension_set(q["only_ext"]) if q.get("only_ext") else None,
         "skip": _extension_set(q.get("skip_ext", "")) or frozenset(),
     }
 

@@ -134,9 +134,6 @@ def test_the_export_keeps_the_sort_order_and_the_extension_filters(many, web):
     by_size = rows(call(web, "/api/export.csv?query=marker&sort=size_desc")[1])[1:]
     assert [int(r[2]) for r in by_size] == sorted((int(r[2]) for r in by_size), reverse=True)
 
-    only_md = rows(call(web, "/api/export.csv?query=marker&only_ext=md")[1])[1:]
-    assert len(only_md) == 5 and all(r[1].endswith(".md") for r in only_md)
-
     skip_md = rows(call(web, "/api/export.csv?query=marker&skip_ext=md")[1])[1:]
     assert len(skip_md) == COUNT - 5 and not any(r[1].endswith(".md") for r in skip_md)
 
@@ -147,7 +144,7 @@ def test_the_export_uses_the_kept_search_instead_of_searching_again(many, web, m
     monkeypatch.setattr(server_module, "find", lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
 
     assert call(web, "/api/search?tab=t1&seq=1&query=marker")[0] == 200
-    status, body = call(web, "/api/export.csv?tab=t1&reuse=1&query=marker&sort=name_desc&only_ext=txt")
+    status, body = call(web, "/api/export.csv?tab=t1&reuse=1&query=marker&sort=name_desc&skip_ext=md")
 
     assert status == 200 and len(rows(body)) - 1 == COUNT - 5
     assert len(calls) == 1, "the export filtered the kept search"

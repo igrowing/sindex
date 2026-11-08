@@ -719,7 +719,7 @@ def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[i
 
 
 def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", offset: int = 0,
-            limit: int | None = 20, only: frozenset[str] | None = None, skip: frozenset[str] = frozenset()) -> dict:
+            limit: int | None = 20, skip: frozenset[str] = frozenset()) -> dict:
     """One page of `found`, in the order of `sort` (one of SORTS), with a snippet for each file.
     `limit=None` is every file from `offset` on (the CSV export).
 
@@ -747,9 +747,8 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
         counts[ext] = counts.get(ext, 0) + 1
     # what is on offer to select: all found files, whatever is selected now
     offered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    if only is not None or skip:
-        best = {fid: rowid for fid, rowid in best.items()
-                if (only is None or extensions.get(fid) in only) and extensions.get(fid) not in skip}
+    if skip:
+        best = {fid: rowid for fid, rowid in best.items() if extensions.get(fid) not in skip}
     matcher = found.matcher
 
     results = []
@@ -785,11 +784,11 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
 
 def search(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
            after: str | None = None, before: str | None = None, offset: int = 0, limit: int = 20, *,
-           sort: str = "relevance", only: frozenset[str] | None = None, skip: frozenset[str] = frozenset(),
+           sort: str = "relevance", skip: frozenset[str] = frozenset(),
            **options: Any) -> dict:
     """find() and present() in one call, with a failure reported as {"error": ...}; `options` are those of find()."""
     try:
         return present(conn, find(conn, query, path, exts, after, before, **options),
-                       sort=sort, offset=offset, limit=limit, only=only, skip=skip)
+                       sort=sort, offset=offset, limit=limit, skip=skip)
     except SearchError as e:
         return {"results": [], "total": 0, "capped": False, "error": str(e)}

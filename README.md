@@ -160,15 +160,13 @@ found for two minutes, so choosing another sort or turning a page only re-orders
 all the text again; a new search, or any change of the words or filters, searches again. The menu is part of the page address
 (`sort=`), and `/api/search` takes the same values.
 
-Below the count, two dropdowns with checkboxes narrow the found files by extension: **Show only files with
-extension(s)** (generic choice ALL) and **Exclude files with extension(s)** (generic choice NONE). They list the
-extensions of all found files with their counts, not just those of the page on screen. Choosing an extension in one
-menu greys the other out until the first is back at its generic choice (or its last extension is unchecked). Like a
-sort, this only re-orders the kept search, so it is instant; a new search starts again with ALL and NONE. The choices
-are part of the page address (`only_ext=pdf,txt`, `skip_ext=md`; a dot stands for files without an extension, which
+Below the count, a dropdown with checkboxes, **Exclude files with extension(s)** (generic choice NONE), removes
+files from the found ones by extension. It lists the extensions of all found files with their counts, not just those of
+the page on screen. Like a sort, this only filters the kept search, so it is instant; a new search starts again with
+NONE. The choice is part of the page address (`skip_ext=md,log`; a dot stands for files without an extension, which
 are only indexed when `text_extensions` lists an empty one).
 
-**Export to CSV** (at the right end of the extension line) saves every file of the search on the page, not only the
+**Export to CSV** (at the right end of the line with the result count) saves every file of the search on the page, not only the
 page shown, in the current sort order and with the extension filters applied: at most the 2,000 files a search keeps.
 The browser saves it as an ordinary download named `sindex-<what you searched>-DATE.csv` (every run of characters that
 is not a letter, digit, `_` or `-` becomes one `_`, and the words are cut at 40 characters; `sindex-results-DATE.csv` when
