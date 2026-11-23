@@ -89,7 +89,7 @@ def cmd_search(args) -> int:
     cfg = _cfg(args)
     conn = db.connect(cfg.db_path, readonly=True)
     res = search(conn, " ".join(args.query), path=args.path, exts=args.ext, limit=args.limit,
-                 names=args.names, regex=args.regex, case_sensitive=args.case)
+                 names=args.names, names_only=args.names_only, regex=args.regex, case_sensitive=args.case)
     if res["error"]:
         print(res["error"], file=sys.stderr)
         return 1
@@ -329,18 +329,15 @@ def _install_service(*, start: bool) -> int:
     else:
         import winreg
 
-        import win32service
-
+        print("stopping the service if it runs, then copying the service host ...")
+        service.stop_service()  # a running host cannot be overwritten
         exe = _prepare_service_host()
-        win32serviceutil.InstallService(
-            "sindex.service.SindexService", service.SERVICE_NAME, service.SindexService._svc_display_name_,
-            startType=win32service.SERVICE_AUTO_START, exeName=str(exe),
-            description=service.SindexService._svc_description_, delayedstart=True)
+        existed = service.install_python_service(exe)
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                              rf"SYSTEM\CurrentControlSet\Services\{service.SERVICE_NAME}", 0, winreg.KEY_SET_VALUE)
         with key:
             winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, [f"PYTHONPATH={service.PROJECT_ROOT}"])
-        print(f"installed service '{service.SERVICE_NAME}' (host: {exe})")
+        print(f"{'updated' if existed else 'installed'} service '{service.SERVICE_NAME}' (host: {exe})")
     url = f"http://{cfg.web_host}:{cfg.web_port}/"
     exe = _cli_exe_path()
     register_context_menu(exe)
@@ -466,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ext", action="append")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--names", action="store_true", help="also match folder and file names")
+    p.add_argument("--names-only", action="store_true",
+                   help="match only folder and file names, not the contents (fast; implies --names)")
     p.add_argument("--regex", action="store_true",
                    help="the query is one regular expression for the contents (and, with --names, the full path)")
     p.add_argument("--case", action="store_true", help="match the typed letters exactly, in contents and names")

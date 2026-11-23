@@ -10,6 +10,7 @@ import pytest
 
 from sindex import config, control
 from sindex.service import Supervisor
+from sindex.usn import fixed_drives
 
 from .conftest import call
 
@@ -179,3 +180,13 @@ def test_the_settings_script_quotes_its_attribute_selectors():
     page = (Path(__file__).parent.parent / "sindex" / "web" / "static" / "settings.html").read_text(encoding="utf-8")
 
     assert not regex.findall(r"\[data-\w+=\$\{", page)
+
+
+
+def test_settings_api_lists_the_drives_that_stand_in_for_no_roots(web):
+    status, body = call(web, "/api/settings")
+
+    data = json.loads(body)
+    assert status == 200
+    assert data["values"]["roots"] == []  # the file stays empty; the drives are only shown
+    assert data["default_roots"] == fixed_drives() and data["default_roots"]

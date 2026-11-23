@@ -99,10 +99,10 @@ def has_wildcards(query: str) -> bool:
     return any(_is_wild(text) for text, _ in [*negatives, *(term for g in groups for term in g)])
 
 
-def is_slow(query: str, *, regex: bool, case_sensitive: bool) -> bool:
+def is_slow(query: str, *, regex: bool, case_sensitive: bool, names_only: bool = False) -> bool:
     """Whether the search reads stored text beyond what the word index returns, so it can take long: the page warns
-    about these and shows their results while they come in."""
-    return regex or case_sensitive or has_wildcards(query)
+    about these and shows their results while they come in. A names-only search reads no text, only the file list."""
+    return not names_only and (regex or case_sensitive or has_wildcards(query))
 
 
 def _to_match(groups: list[list[Term]], negatives: list[Term]) -> str | None:
@@ -458,7 +458,7 @@ class Found:
 
 
 def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: list[str] | None = None,
-         after: str | None = None, before: str | None = None, *, names: bool = False,
+         after: str | None = None, before: str | None = None, *, names: bool = False, names_only: bool = False,
          regex: bool = False, case_sensitive: bool = False, scan: bool = True,
          kind: str | None = None, camera: str | None = None, has_gps: bool | None = None,
          min_width: int | None = None, min_height: int | None = None,
@@ -475,6 +475,9 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     every chunk: on a 4 GB index 35-65 s when its pages are not in the disk cache, about 8 s when they are.
     With `scan=False` the scan never runs and wild terms find nothing.
 
+    `names_only` searches the folder and file names alone (it implies `names`): no stored text is read, so there are
+    no snippets and no scan, however many wildcards, `regex` or `case_sensitive` ask for.
+
     `names`, `regex` and `case_sensitive` are independent. `case_sensitive` compares the typed letters exactly,
     in contents and, with `names`, in names; in contents it checks the text of what the word index found, which
     takes as long as the word is common. `regex` makes the whole query one regular expression for the contents
@@ -488,9 +491,11 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     At most HIT_LIMIT files are kept (`capped` says it was reached).
     """
     hit_limit = HIT_LIMIT  # read here so that a test can lower it
+    names = names or names_only
     groups, negatives = _parse(query)
     wild_negatives = [term for term in negatives if _is_wild(term[0])]
-    scanning = regex or (scan and (bool(wild_negatives) or any(_is_wild(text) for g in groups for text, _ in g)))
+    scanning = not names_only and (
+        regex or (scan and (bool(wild_negatives) or any(_is_wild(text) for g in groups for text, _ in g))))
     # only exclusions ("-kyo"): every file whose text has none of them
     negative_only = not regex and not groups and bool(negatives)
     matcher = rx_path = None
@@ -505,7 +510,7 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     else:
         has_query = bool(groups) or negative_only
         # the index cannot see case: with case sensitivity the exclusions are checked on the text only
-        match = _to_match(groups, [] if case_sensitive else negatives)
+        match = None if names_only else _to_match(groups, [] if case_sensitive else negatives)
         if has_query:
             matcher = _ChunkMatcher.for_terms(groups, negatives, case_sensitive=case_sensitive)
 
@@ -534,7 +539,7 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     chunk_join = f"FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) {media_join}"
 
     # what the index found for a term with punctuation is only a guess: "kyo)" is the word kyo to it
-    literal = not regex and any(_has_punctuation(text) for g in groups for text, _ in g)
+    literal = not regex and not names_only and any(_has_punctuation(text) for g in groups for text, _ in g)
     found = Found(best={}, hits={}, indexed=set(), seen=set(), capped=False, negative_only=negative_only,
                   literal=literal, case_sensitive=case_sensitive, match=match, matcher=matcher, by_proximity=False)
     next_report = time.monotonic() + PROGRESS_EVERY_S
@@ -558,7 +563,9 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_excluded", 1, matcher.has_negative, deterministic=True)
         excluded: set[int] = set()
-        if wild_negatives:
+        if names_only:
+            pass  # the text is not searched, so no text excludes a file
+        elif wild_negatives:
             if not scan:
                 raise SearchError("An excluded word with a * or ? at its start or inside needs the scan of all text.")
             sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
@@ -569,7 +576,7 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
                 if matcher.timed_out:
                     raise SearchError("A pattern took too long on some text.") from None
                 raise  # a cancelled or timed-out search, or a real error
-        if (words := _to_match([[term] for term in negatives], [])) is not None:
+        if not names_only and (words := _to_match([[term] for term in negatives], [])) is not None:
             # the word index finds the other excluded words; with case sensitivity their letters are checked too
             check = ["sindex_excluded(chunks.body)"] if case_sensitive else []
             sql = (f"SELECT DISTINCT chunks.rowid >> {db.CHUNK_BITS} {chunk_join} "
@@ -580,11 +587,13 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
             cond, name_params = _name_condition([[term] for term in negatives], [], case_sensitive=case_sensitive)
             sql = f"SELECT f.id FROM files f {media_join} WHERE {' AND '.join([cond, *where, *media_where])}"
             excluded.update(r[0] for r in conn.execute(sql, [*name_params, *params, *media_params]))
-        # files without indexed text (binary, too big, failed) are not "without kyo", they are unknown
+        # files without indexed text (binary, too big, failed) are not "without kyo", they are unknown; but their
+        # names are known
+        status = [] if names_only else ["f.status IN (?, ?)"]
         sql = (f"SELECT f.id FROM files f {media_join} "
-               f"WHERE {' AND '.join(['f.status IN (?, ?)', *where, *media_where])} ORDER BY f.mtime_ns DESC")
+               f"WHERE {' AND '.join([*status, *where, *media_where]) or '1'} ORDER BY f.mtime_ns DESC")
         fids = []
-        for (fid,) in conn.execute(sql, ["ok", "truncated", *params, *media_params]):
+        for (fid,) in conn.execute(sql, [*([] if names_only else ["ok", "truncated"]), *params, *media_params]):
             if fid in excluded:
                 continue
             if len(fids) == hit_limit:
@@ -615,7 +624,7 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
             return SearchError(f"The regular expression took longer than {REGEX_CHUNK_TIMEOUT_S:g} s on some text; "
                                "make it simpler or more specific.")
 
-        if match is not None:
+        if match is not None:  # (never with names_only)
             # what the index found is checked against the stored text, which keeps the letters as they were
             # written, when case matters, a word has punctuation, or an exclusion has a wildcard
             exact = (["sindex_chunk(chunks.body)"] if case_sensitive
@@ -695,7 +704,8 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     if len(found.best) > hit_limit:
         found.best = dict(list(found.best.items())[:hit_limit])
         found.capped = True
-    found.by_proximity = matcher is not None and not regex and any(len(group) >= 2 for group in groups)
+    found.by_proximity = (matcher is not None and not regex and not names_only
+                          and any(len(group) >= 2 for group in groups))
     return found
 
 

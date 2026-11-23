@@ -32,9 +32,10 @@
     <div id="slowNote" class="slownote" role="status" hidden></div>
     <div id="progress" class="progress" role="progressbar" aria-label="Searching" hidden></div>
     <div class="checks">
-      <label class="check"><input id="names" type="checkbox"> Also in folder- and file-names</label>
-      <label class="check" title="The query becomes one regular expression for the file contents and, with the names box, for the full path (folder\file name). It reads all the text, so it is slow; results show while it runs."><input id="regex" type="checkbox"> Use RegEx</label>
+      <label class="check" title="Search also in the folder and file names, not only the file contents."><input id="names" type="checkbox"> Also in folder- and file-names</label>
+      <label class="check" title="Search only the folder and file names, not the file contents. It reads no text, so it is fast; results have no text snippet."><input id="namesOnly" type="checkbox"> Only in folder- and file-names</label>
       <label class="check" title="The typed letters must match exactly, in the file contents and, with the names box, in folder and file names. The text of every match is checked, so it is slower; results show while it runs."><input id="case" type="checkbox"> Case sensitive</label>
+      <label class="check" title="The query becomes one regular expression for the file contents and, with the names box, for the full path (folder\file name). It reads all the text, so it is slow; results show while it runs."><input id="regex" type="checkbox"> Use RegEx</label>
     </div>
     <div class="row filters">
       <label>In folder <input id="path" placeholder="D:\Documents"></label>
@@ -100,7 +101,7 @@
 <script>
 const TOKEN = {{TOKEN}};
 const $ = (id) => document.getElementById(id);
-const PAGE = 20;
+const PAGE = {{PAGE_SIZE}};  // files per page; 0 = all the results on one page
 const COMPLETE_AFTER = {{COMPLETE_AFTER}};  // seconds without typing before the search starts by itself; 0 = Enter only
 const TAB = Math.random().toString(36).slice(2, 12);  // lets the server stop this tab's superseded searches
 let offset = 0;
@@ -153,6 +154,7 @@ function params() {
   const p = new URLSearchParams({ query: $("query").value, offset });
   for (const k of ["path", "ext", "after", "before", ...MEDIA_KEYS]) if ($(k).value) p.set(k, $(k).value);
   if ($("names").checked) p.set("names", "1");
+  if ($("namesOnly").checked) p.set("names_only", "1");
   if ($("sort").value !== "relevance") p.set("sort", $("sort").value);
   if (EXT_MENU.sel.size)  // "no extension" travels as a dot
     p.set("skip_ext", [...EXT_MENU.sel].map(e => e || ".").join(","));
@@ -221,6 +223,7 @@ function hasWildcards(text) {
 // Says at once, under the search box, what makes this search slow (search.is_slow on the server).
 function updateSlowNote() {
   const why = [];
+  if ($("namesOnly").checked) { $("slowNote").hidden = true; return; }  // no text is read
   if ($("regex").checked) why.push("RegEx");
   else if (hasWildcards($("query").value)) why.push("wildcards");
   if ($("case").checked) why.push("case sensitive");
@@ -258,7 +261,7 @@ async function runSearch({ reuse = false, keepExt = false, poll = false } = {}) 
   if (!poll) $("summary").textContent = "Searching…";
   history.replaceState(null, "", "?" + p);
   const query = new URLSearchParams(p);
-  query.set("tab", TAB); query.set("seq", mine);
+  query.set("tab", TAB); query.set("seq", mine); query.set("per_page", PAGE);
   if (reuse) query.set("reuse", "1");
   const res = await fetch("/api/search?" + query, { signal: ctl.signal }).then(r => r.json())
     .catch(e => e.name === "AbortError" ? null : ({ error: String(e), results: [] }));
@@ -390,7 +393,7 @@ function pageWindow(current, total, slots) {
 
 function renderPager(total) {
   const pager = $("pager");
-  const totalPages = Math.max(1, Math.ceil(total / PAGE));
+  const totalPages = PAGE ? Math.max(1, Math.ceil(total / PAGE)) : 1;
   const current = Math.min(Math.floor(offset / PAGE) + 1, totalPages);
   pager.innerHTML = "";
   if (totalPages <= 1) return;
@@ -468,7 +471,9 @@ function onType() {
 }
 $("query").addEventListener("input", onType);
 $("form").onsubmit = (e) => { e.preventDefault(); offset = 0; runSearch(); };
-$("names").onchange = () => { offset = 0; runSearch(); };
+// "Only in names" implies "Also in names": the two boxes are shown as one choice, so ticking one clears the other
+$("names").onchange = () => { if ($("names").checked) $("namesOnly").checked = false; updateSlowNote(); offset = 0; runSearch(); };
+$("namesOnly").onchange = () => { if ($("namesOnly").checked) $("names").checked = false; updateSlowNote(); offset = 0; runSearch(); };
 $("sort").onchange = () => { offset = 0; runSearch({ reuse: true }); };
 for (const k of NAME_MODS) $(k).onchange = () => { updateSlowNote(); offset = 0; runSearch(); };
 for (const k of MEDIA_KEYS) $(k).addEventListener("change", () => { offset = 0; runSearch(); });
@@ -483,12 +488,13 @@ $("reindexBtn").onclick = async () => {
 
 const init = new URLSearchParams(location.search);
 for (const k of ["query", "path", "ext", "after", "before", ...MEDIA_KEYS]) if (init.get(k)) $(k).value = init.get(k);
-$("names").checked = init.get("names") === "1";
+$("names").checked = init.get("names") === "1" && init.get("names_only") !== "1";
+$("namesOnly").checked = init.get("names_only") === "1";
 if (init.get("sort")) $("sort").value = init.get("sort");
 if (init.get("skip_ext"))
   for (const e of init.get("skip_ext").split(",")) if (e) EXT_MENU.sel.add(e === "." ? "" : e);
 for (const k of NAME_MODS) $(k).checked = init.get(k) === "1";
-offset = +(init.get("offset") || 0);
+offset = PAGE ? +(init.get("offset") || 0) : 0;
 updateSlowNote();
 if (init.get("query") || hasMediaFilter()) runSearch({ keepExt: true });
 refreshStatus(); setInterval(refreshStatus, 5000);

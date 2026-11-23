@@ -107,6 +107,8 @@ class Config:
     # the search page starts a search by itself this long after the last keystroke (Enter always searches);
     # 0 = on Enter only
     search_complete_after_s: float = 1.0
+    # files per page of the search results; 0 = all the results on one page
+    results_per_page: int = 50
     # [storage]
     db_dir: str = ""  # where index.db lives; empty = the data directory
 
@@ -198,6 +200,7 @@ SPECS: dict[str, Spec] = {
     "sqlite_cache_mb": Spec(int, 1, 1024), "wal_autocheckpoint_pages": Spec(int, 100, 1_000_000),
     "usn_poll_seconds": Spec(int, 5, 86_400), "rescan_hours": Spec(int, 1, 8760),
     "search_complete_after_s": Spec(float, 0.5, 60, zero_ok=True),
+    "results_per_page": Spec(int, 1, 10_000, zero_ok=True),
 }
 
 
@@ -412,9 +415,10 @@ usn_poll_seconds = {usn_poll_seconds}
 rescan_hours = {rescan_hours}
 
 [storage]
-# Folder of index.db (empty = this data folder). It must be on a local drive: SQLite's write-ahead log
-# does not work over a network. To move an existing index, stop the service, move index.db* there, set this,
-# and start the service; without the files the index is simply rebuilt.
+# Folder of index.db (empty = the data folder, which is the normal case). Set it only to keep the index apart
+# from the settings, for example on a faster disk. It must be on a local drive: SQLite's write-ahead log does
+# not work over a network. To move an existing index there, stop the service, move index.db* and set this; without
+# the files the index is simply rebuilt. The Settings page changes the data folder, not this.
 db_dir = {db_dir}
 
 [web]
@@ -424,6 +428,8 @@ web_port = {web_port}
 token = {token}
 # A search starts when you press Enter, or by itself this many seconds after your last keystroke. 0 = Enter only.
 search_complete_after_s = {search_complete_after_s}
+# Files per page of the search results. 0 = all the results on one page.
+results_per_page = {results_per_page}
 """
 
 
@@ -499,10 +505,49 @@ def public_settings(cfg: Config) -> dict:
     }
 
 
+POINTER_NAME = "data-location.txt"
+
+
+def bootstrap_dir() -> Path:
+    """The one folder that is known before any setting is read: it holds the pointer to a moved data folder."""
+    return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "sindex"
+
+
 def default_data_dir() -> Path:
+    """SINDEX_HOME, else the folder the pointer file in the bootstrap folder names, else the bootstrap folder.
+    config.toml cannot say where its own folder is, hence the pointer."""
     if home := os.environ.get("SINDEX_HOME"):
         return Path(home)
-    return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "sindex"
+    root = bootstrap_dir()
+    try:
+        text = (root / POINTER_NAME).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return root
+    except (OSError, ValueError) as e:  # not the default folder: that would start a second, empty index
+        raise ConfigError({POINTER_NAME: f"cannot be read: {e}"}) from e
+    if not os.path.isabs(text):
+        raise ConfigError({POINTER_NAME: f"must hold the full path of the data folder, not {text!r}"})
+    return Path(text)
+
+
+def data_dir_is_movable(cfg: Config) -> bool:
+    """Whether the pointer decides where the data folder is. It does not when --data-dir or SINDEX_HOME did."""
+    if os.environ.get("SINDEX_HOME"):
+        return False
+    return os.path.normcase(default_data_dir().resolve()) == os.path.normcase(cfg.data_dir)
+
+
+def set_data_dir_pointer(folder: Path) -> None:
+    """Make `folder` the data folder of the next start (the bootstrap folder itself needs no pointer)."""
+    root = bootstrap_dir()
+    pointer = root / POINTER_NAME
+    if os.path.normcase(os.path.normpath(folder)) == os.path.normcase(os.path.normpath(root)):
+        pointer.unlink(missing_ok=True)
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = pointer.with_suffix(".tmp")
+    tmp.write_text(str(folder), encoding="utf-8")
+    os.replace(tmp, pointer)
 
 
 def load(data_dir: Path | None = None) -> Config:

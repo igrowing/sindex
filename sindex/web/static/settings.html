@@ -138,14 +138,28 @@
   </section>
 
   <section data-tab="maintenance">
-    <h2>Index storage</h2>
+    <h2>Data storage</h2>
     <dl class="kv">
-      <dt>Database</dt><dd id="dbPath">…</dd>
-      <dt>Size on disk</dt><dd id="dbSize">…</dd>
+      <dt>Data folder</dt><dd id="dataDir">…</dd>
+      <dt id="dbPathLabel" hidden>Index file</dt><dd id="dbPath" hidden></dd>
+      <dt>Index size</dt><dd id="dbSize">…</dd>
     </dl>
-    <p class="lead">To move it to another local drive: stop the service, move the <code>index.db*</code> files, set
-      <code>db_dir</code> in <code>config.toml</code>, and start the service. Network shares and removable drives
-      are refused, because SQLite's write-ahead log does not work there.</p>
+    <p class="lead">The data folder holds the settings (<code>config.toml</code>), the index, the logs and the
+      request files. To use another folder, type it and choose what to do: <i>Copy the data there</i> takes the
+      settings and the index along; <i>Use the data in that folder</i> switches to data that is already there, for
+      example an index built earlier or on another machine. The old folder is not touched, so delete it yourself
+      when you no longer need it. The change starts with the next start of the service, and indexing stays stopped
+      until then. The folder must be on a local drive: SQLite's write-ahead log does not work on network shares or
+      removable drives.</p>
+    <div class="acts">
+      <div class="act"><input id="dbFolder" placeholder="Folder, for example D:\sindex-data" spellcheck="false" style="flex:1 1 260px">
+        <select id="dbMode">
+          <option value="copy">Copy the data there</option>
+          <option value="use">Use the data in that folder</option>
+        </select>
+        <button type="button" class="plain" id="dbApplyBtn" style="min-width:0">Apply</button></div>
+    </div>
+    <p class="lead" id="dbMsg" style="margin-top:8px"></p>
   </section>
 
   <section id="healthSection" data-tab="health">
@@ -223,11 +237,12 @@ const GROUPS = {
     usn_poll_seconds: ["Look for changes every (seconds)", "How often the NTFS change journal is read."],
   },
   "f-search": {
+    results_per_page: ["Files per page", "How many found files the search page shows at once. 0 = all of them on one page. Applies the next time the search page is opened."],
     search_complete_after_s: ["Search after you stop typing (s)",
       "Seconds without typing before the search starts by itself. 0 = only on Enter. Applies the next time the search page is opened."],
   },
   "f-roots": {
-    roots: ["Folders to index", "Tick the folders to index; browse into a folder with its name or arrow. Nothing chosen = all fixed drives."],
+    roots: ["Folders to index", "Tick the folders to index; browse into a folder with its name or arrow. Until you choose, all local drives are listed and indexed."],
   },
   "f-text": {
     text_extensions: ["File types to read as text",
@@ -278,19 +293,29 @@ function fieldHtml(key, [label, hint]) {
 }
 function setField(key, value) {
   const el = $("f_" + key), kind = state.specs[key].kind;
-  if (PICKERS.includes(key)) { pickers[key].items = [...value]; renderPicker(key); }
+  if (PICKERS.includes(key)) {
+    // no roots set: the indexer takes every local drive, so the list shows them (and getField gives [] back
+    // while they are untouched, so that saving something else does not turn the default into a setting)
+    pickers[key].items = [...(key === "roots" && !value.length ? state.default_roots : value)];
+    renderPicker(key);
+  }
   else if (kind === "bool") el.checked = value;
   else if (kind === "list") el.value = value.join(state.specs[key].items.startsWith("ext") ? " " : "\n");
   else el.value = value;
 }
 function getField(key) {
   const el = $("f_" + key), kind = state.specs[key].kind;
-  if (PICKERS.includes(key)) return [...pickers[key].items];
+  if (PICKERS.includes(key)) return key === "roots" && usingDefaultRoots() ? [] : [...pickers[key].items];
   if (kind === "bool") return el.checked;
   if (kind === "list" && state.specs[key].items.startsWith("ext"))  // spaces, commas or lines; a dot or *. in front is optional
     return [...new Set(el.value.split(/[\s,;]+/).map(w => w.toLowerCase().replace(/^\*?\.+/, "")).filter(Boolean))];
   if (kind === "list") return el.value.split("\n").map(l => l.trim()).filter(Boolean);
   return el.value === "" ? NaN : Number(el.value);
+}
+function usingDefaultRoots() {
+  const items = pickers.roots.items;
+  return !state.values.roots.length && items.length === state.default_roots.length &&
+    items.every((p, i) => pathKey(p) === pathKey(state.default_roots[i]));
 }
 function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 
@@ -436,9 +461,13 @@ function toggle(key, path, on) {
 function renderPicker(key) {
   const el = $("f_" + key), items = pickers[key].items, list = el.querySelector(".pk-list");
   if (!el.querySelector(".pk-title")) return;  // not built yet
-  el.querySelector(".pk-title").textContent = `Chosen (${items.length})`;
+  const byDefault = key === "roots" && usingDefaultRoots();
+  el.querySelector(".pk-title").textContent = `Chosen (${items.length})` + (byDefault ? ": all local drives, the default" : "");
   list.innerHTML = "";
-  if (!items.length) { const d = document.createElement("div"); d.className = "pk-empty"; d.textContent = "Nothing chosen."; list.append(d); }
+  if (!items.length) {
+    const d = document.createElement("div"); d.className = "pk-empty";
+    d.textContent = key === "roots" ? "Nothing chosen: saving this indexes all local drives." : "Nothing chosen."; list.append(d);
+  }
   for (const path of items) {
     const row = document.createElement("div"); row.className = "pk-row chosen";
     const text = document.createElement("span"); text.className = "path"; text.textContent = path;
@@ -505,8 +534,16 @@ async function refresh() {
   const s = await fetch("/api/status").then(r => r.json()).catch(() => null);
   const idx = s && s.index;
   if (idx) {
-    $("dbPath").textContent = idx.db_path;
+    $("dataDir").textContent = idx.data_dir;
+    const dbFolder = idx.db_path.slice(0, idx.db_path.lastIndexOf("\\"));
+    const elsewhere = pathKey(dbFolder) !== pathKey(idx.data_dir);  // db_dir in config.toml puts the index apart
+    $("dbPath").textContent = idx.db_path; $("dbPath").hidden = $("dbPathLabel").hidden = !elsewhere;
     $("dbSize").textContent = idx.db_mb.toLocaleString() + " MB";
+    for (const id of ["dbFolder", "dbMode", "dbApplyBtn"]) $(id).disabled = !idx.data_dir_movable;
+    const sup = s.supervisor || {}, failed = sup.settings_error;
+    if (!idx.data_dir_movable) $("dbMsg").textContent = "The data folder was given with --data-dir or SINDEX_HOME, so it cannot be changed here.";
+    else if (sup.data_dir_moved_to) $("dbMsg").textContent = `Restart the service to use ${sup.data_dir_moved_to}. Indexing is stopped until then.`;
+    else if (failed && failed.startsWith("the data folder was not changed")) $("dbMsg").textContent = "Not applied: " + failed;
     const last = idx.last_maintenance, wait = idx.maintenance_pending || [];
     $("maintInfo").textContent = (wait.length ? `Waiting for the queue to empty: ${wait.join(", ")}. ` : "") +
       (last ? `Last: ${last.action} on ${new Date(last.at * 1000).toLocaleString()}, ${last.seconds} s, ${last.mb_before} MB → ${last.mb_after} MB.` : "");
@@ -527,6 +564,20 @@ $("reindexBtn").onclick = async () => {
   const path = $("reindexPath").value.trim(); if (!path) return;
   toast((await post("/api/reindex", { path })).ok ? "Reindex queued" : "Failed");
   $("reindexPath").value = "";
+};
+
+$("dbApplyBtn").onclick = async () => {
+  const folder = $("dbFolder").value.trim(), mode = $("dbMode").value;
+  if (!folder) return;
+  const ask = mode === "copy"
+    ? `Copy the settings and the index to ${folder}? Indexing stops now and stays stopped until the service is restarted.`
+    : `Switch to the data in ${folder}? Indexing stops now and stays stopped until the service is restarted.`;
+  if (!confirm(ask)) return;
+  const res = await post("/api/data-folder", { folder, mode });
+  if (!res.ok) { $("dbMsg").textContent = "Not applied: " + (res.data.error || "failed"); return; }
+  $("dbMsg").textContent = "Queued. Copying a big index takes a while; this line tells when the service can be restarted.";
+  $("dbFolder").value = "";
+  for (const wait of [3000, 10000, 30000, 60000]) setTimeout(refresh, wait);
 };
 
 $("save").onclick = save;

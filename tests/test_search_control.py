@@ -449,3 +449,21 @@ def test_a_failed_search_is_not_kept(cfg, many, monkeypatch):
         assert server._server.found._entries == {}
     finally:
         server.stop()
+
+
+def test_results_per_page_defaults_to_fifty_and_zero_means_one_page():
+    assert config.Config().results_per_page == 50
+    assert config.validate_changes({"results_per_page": 0}) == {"results_per_page": 0}
+    assert config.validate_changes({"results_per_page": 25}) == {"results_per_page": 25}
+    for bad in (-1, 1.5, "x", 10_001):
+        with pytest.raises(config.ConfigError):
+            config.validate_changes({"results_per_page": bad})
+
+
+def test_the_search_page_carries_the_saved_page_size(web):
+    _, body = call(web, "/")
+    assert "const PAGE = 50;" in body.decode("utf-8")
+
+    config.apply(web.data_dir, {"results_per_page": 0})
+    _, body = call(web, "/")
+    assert "const PAGE = 0;" in body.decode("utf-8")

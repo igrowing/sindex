@@ -186,3 +186,21 @@ def test_a_runaway_regex_over_the_contents_is_stopped_too(cfg, tmp_path):
 
     assert "took longer than" in error and "some text" in error
     assert time.monotonic() - started < 10
+
+
+def test_the_api_takes_names_only(web, named):  # noqa: F811
+    def found(qs):
+        data = json.loads(call(web, "/api/search?" + qs)[1])
+        return {r["name"] for r in data["results"]}
+
+    assert found("query=zebra&names_only=1") == {"zebra-plan.txt"}  # notes.txt has zebra in its text only
+    assert found("query=zebra&names_only=1&names=1") == {"zebra-plan.txt"}  # it implies the other box
+    assert found("query=ZEBRA&names_only=1&case=1") == set()
+    assert found("query=zebra%5B-%5D.%2B&names_only=1&regex=1") == {"zebra-plan.txt"}
+
+
+def test_the_cli_searches_names_only(named, capsys):  # noqa: F811
+    code = cli.main(["--data-dir", str(named.data_dir), "search", "--names-only", "zebra"])
+
+    out = capsys.readouterr().out
+    assert code == 0 and "zebra-plan.txt" in out and "notes.txt" not in out

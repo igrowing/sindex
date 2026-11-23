@@ -269,3 +269,41 @@ def test_cjk_text_is_found_in_the_middle_of_a_run(cfg, tmp_path):
 
     assert names(cfg, "京都") == {"tokyo.txt"}  # 京都, in the middle
     assert names(cfg, "京都", case_sensitive=True) == {"tokyo.txt"}
+
+
+def test_names_only_searches_the_names_and_not_the_contents(kyo):
+    assert names(kyo, "kyo", names_only=True) == {"kyo_name.txt"}  # a1..a5 have kyo in the text only
+    assert names(kyo, "nothing", names_only=True) == set()  # in the text of a8.txt and kyo_name.txt, not in a name
+    assert names(kyo, "nothing", names=True) == {"a8.txt", "kyo_name.txt"}  # which the "also" box would find
+
+
+def test_names_only_results_have_no_snippet_and_no_hits(kyo):
+    res = results(kyo, "kyo", names_only=True)
+
+    assert [r["name"] for r in res["results"]] == ["kyo_name.txt"]
+    assert res["results"][0]["hits"] == 0 and res["results"][0]["snippet"] == ""
+
+
+def test_names_only_reads_no_text_for_wildcards_regex_or_case(kyo):
+    assert names(kyo, "*yo_name", names_only=True) == {"kyo_name.txt"}
+    assert names(kyo, "kyo_nam?", names_only=True) == {"kyo_name.txt"}
+    assert names(kyo, r"kyo_name\.txt$", names_only=True, regex=True) == {"kyo_name.txt"}
+    assert names(kyo, "KYO_name", names_only=True, case_sensitive=True) == set()
+    assert names(kyo, "kyo_name", names_only=True, case_sensitive=True) == {"kyo_name.txt"}
+    # a pattern that matches text in a1.txt does not find it, only the path counts
+    assert names(kyo, "visit", names_only=True, regex=True) == set()
+
+
+def test_names_only_matches_the_folder_too(kyo, tmp_path):
+    assert names(kyo, "docs", names_only=True) == {f"a{n}.txt" for n in range(1, 9)} | {"kyo_name.txt"}
+
+
+def test_names_only_with_an_exclusion_lists_every_file_without_it_in_the_name(kyo):
+    # the text is not searched, so even a file without indexed text would be listed: all nine files are known
+    assert names(kyo, "-kyo", names_only=True) == {f"a{n}.txt" for n in range(1, 9)}
+    assert names(kyo, "docs -a1", names_only=True) == {f"a{n}.txt" for n in range(2, 9)} | {"kyo_name.txt"}
+
+
+def test_names_only_is_not_a_slow_search():
+    assert not is_slow("*kyo", regex=True, case_sensitive=True, names_only=True)
+    assert is_slow("*kyo", regex=False, case_sensitive=False, names_only=False)

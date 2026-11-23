@@ -42,6 +42,8 @@ py -3.12 -m venv .venv            # Python 3.12+ (tested with 3.14)
 .venv\Scripts\sindex --data-dir .\data search "sample" --ext csv
 # --names also matches folder and file names (a scan of the file list, so slower)
 .venv\Scripts\sindex --data-dir .\data search "invoice" --names
+# --names-only matches only the folder and file names, never the contents (no text is read, so it is fast)
+.venv\Scripts\sindex --data-dir .\data search "invoice" --names-only
 
 # or run everything (indexer + web UI at http://127.0.0.1:8765/) until Ctrl+C
 .venv\Scripts\sindex --data-dir .\data run --root D:\Download  # for scanning of specific folder
@@ -123,7 +125,7 @@ plain HTTP, not HTTPS. It also wires up three more ways to reach the same search
 
 `sindex remove` undoes all three.
 
-The service keeps its data in `%ProgramData%\sindex`:
+The service keeps its data in `%ProgramData%\sindex` (or the folder chosen under *Data storage* in Settings):
 
 | File | Purpose |
 |---|---|
@@ -135,7 +137,8 @@ The service keeps its data in `%ProgramData%\sindex`:
 ## Searching
 
 A search starts when you press Enter, or by itself `search_complete_after_s` seconds (default 1,
-`[web]`; 0 = Enter only) after your last keystroke. Changing the text stops a running search, and a moving line under
+`[web]`; 0 = Enter only) after your last keystroke. The results come
+`results_per_page` (default 50, `[web]`; 0 = all on one page) files at a time. Changing the text stops a running search, and a moving line under
 the search box shows that one is running. A search has three steps, in this order of ranking:
 
 1. the word index: every word finds the words that *start* with it (`kyo` finds `kyo` and `kyoto`, not `tokyo`; a
@@ -193,9 +196,12 @@ An exclusion (`-kyo`) drops every file with a word that starts with the term (`k
 names box also excludes files with it in their path). Files without indexed text (binary, too big, failed) are left
 out of that list, because it is not known what they contain.
 
-Three independent checkboxes sit under the search box: **Also in folder- and file-names**, **Use RegEx** and **Case
-sensitive** (`sindex search --names --regex --case` on the command line). Names adds the folder and file names to the
-search. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
+Four checkboxes sit under the search box: **Also in folder- and file-names**, **Only in folder- and file-names**,
+**Use RegEx** and **Case sensitive** (`sindex search --names` or `--names-only`, `--regex`, `--case` on the command
+line). Names adds the folder and file names to the search. Only in names searches the folder and file names alone
+(`names_only=1` in `/api/search`): it reads no stored text, so it is fast whatever the wildcards, RegEx or Case
+sensitive ask for, its results have no snippet, and an exclusion alone (`-kyo`) lists every file whose path lacks the
+word, also those without indexed text. The two names boxes are one choice: ticking one clears the other. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
 in contents it checks the text of every file the word index found, so a very common word takes longer.
 Use RegEx turns the whole query into one Python regular expression for the contents (`^` and `$` match at line
 starts and ends) and, with the names box, for the full path (`D:\folder\file.txt`); case is ignored unless Case
@@ -267,10 +273,18 @@ three; a tab with a rejected value is marked and opened. It covers:
   `config.toml` is merged into the patterns. A separate checkbox, *Index photo and video metadata*, turns on the
   EXIF/XMP/IPTC and container-tag reading described above, with its own *Skip media files larger than* limit; it
   is one more rule that triggers a rescan when changed.
-- **Index storage:** where `index.db` is and how big it is. To move it, stop the service, move the `index.db*` files,
-  set `db_dir` in `config.toml` and start the service. The folder must exist and be on a local fixed drive (SQLite's
-  write-ahead log does not work on network shares); otherwise the indexer refuses to start and says why in its status.
-  The index folder is never indexed.
+- **Data storage:** the data folder (settings, index, logs, request files), the size of the index, and a field to
+  change the folder. *Copy the data there* stops the indexer and copies `config.toml` and the index (when it is in
+  the data folder) to the new folder, which must not hold data of sindex yet; *Use the data in that folder*
+  switches to data that is already there, for example an index built earlier or on another machine (it needs an
+  `index.db` of this or an older version, or a `config.toml`, or both). The old folder is not touched: delete it
+  yourself once the new one works. `config.toml` cannot say where its own folder is, so the choice is written to
+  `%ProgramData%\sindex\data-location.txt` and read at every start; it takes effect when the service is restarted,
+  and indexing stays stopped until then. The folder must exist and be on a local fixed drive (SQLite's
+  write-ahead log does not work on network shares). A folder given with `--data-dir` or `SINDEX_HOME` cannot be
+  changed here. The index can still be kept apart from the data folder with `db_dir` in `config.toml`; the page then
+  also shows the index file, the indexer refuses to start with a `db_dir` that is not a local folder and says why
+  in its status, and the index folder is never indexed.
 - **Indexing health:** the files that ended as error, too big, not text, cut short or empty, with their error, and a
   retry for one file or for a whole group (after raising a size limit, for example).
 - **Maintenance:** rebuild everything, optimize the search index, compact the database (both run when the queue is

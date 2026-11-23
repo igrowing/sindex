@@ -274,3 +274,17 @@ def test_a_name_with_non_latin_letters_travels_in_the_header(many, web):  # noqa
     header = disposition(web, "日本語")
 
     assert unquote(header.split("''", 1)[1]).startswith("sindex-日本語-")
+
+
+def test_the_page_size_comes_from_the_request_and_zero_lists_everything(many, web):
+    def get(qs):
+        status, body = call(web, "/api/search?query=marker&" + qs)
+        assert status == 200
+        return json.loads(body)
+
+    assert len(get("")["results"]) == 20  # no size asked: the old default
+    assert len(get("per_page=7")["results"]) == 7
+    assert len(get("per_page=7&offset=21")["results"]) == 4
+    everything = get("per_page=0")
+    assert len(everything["results"]) == COUNT == everything["total"]
+    assert get("per_page=-3")["error"] and get("per_page=x")["error"]

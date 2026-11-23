@@ -29,9 +29,10 @@ from xml.sax.saxutils import escape as xml_escape
 
 import regex
 
-from .. import config, control, db
+from .. import config, control, datadir, db
 from ..config import Config
 from ..search import Found, find, is_slow, present, search
+from ..usn import fixed_drives
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ SCAN_SLOTS = 1
 FOUND_TTL_S = 120.0  # how long the files a tab found stay available for another sort order or page
 FOUND_TABS = 8  # tabs whose search is kept; each holds at most HIT_LIMIT file and chunk numbers (about 100 KB)
 # what changes the view of a search, not what it finds
-_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "skip_ext"})
+_PAGE_PARAMS = frozenset({"sort", "offset", "tab", "seq", "reuse", "skip_ext", "per_page"})
 _TAB_ID = regex.compile(r"[A-Za-z0-9]{1,32}")
 _PROGRESS_OPS = 20_000  # SQLite virtual-machine steps between two looks at the cancel flag
 EXPORT_COLUMNS = ("path", "filename", "size_bytes", "modified", "content")
@@ -180,6 +181,7 @@ def _find_options(q: dict) -> dict:
     return {
         "path": q.get("path") or None, "exts": exts or None,
         "after": q.get("after") or None, "before": q.get("before") or None, "names": q.get("names") == "1",
+        "names_only": q.get("names_only") == "1",
         "regex": q.get("regex") == "1", "case_sensitive": q.get("case") == "1",
         "kind": q.get("kind") or None, "camera": q.get("camera") or None,
         "has_gps": {"1": True, "0": False}.get(q.get("has_gps")),
@@ -193,8 +195,11 @@ def _find_options(q: dict) -> dict:
 
 def _view_options(q: dict, *, export: bool) -> dict:
     """search.present() arguments from the request parameters: the order, the page, the excluded extensions."""
+    per_page = int(q.get("per_page") or 20)  # the page sends the size it was served with; 0 = every result
+    if per_page < 0:
+        raise ValueError("per_page cannot be negative")
     return {
-        "sort": q.get("sort") or "relevance", "limit": None if export else 20,
+        "sort": q.get("sort") or "relevance", "limit": None if export or per_page == 0 else per_page,
         "offset": 0 if export else max(0, int(q.get("offset", 0) or 0)),
         "skip": _extension_set(q.get("skip_ext", "")) or frozenset(),
     }
@@ -343,11 +348,17 @@ class _Handler(BaseHTTPRequestHandler):
             if "{{COMPLETE_AFTER}}" in page:
                 after = config.load(self.server.cfg.data_dir).search_complete_after_s  # as saved, no restart needed
                 page = page.replace("{{COMPLETE_AFTER}}", json.dumps(after))
+            if "{{PAGE_SIZE}}" in page:
+                size = config.load(self.server.cfg.data_dir).results_per_page
+                page = page.replace("{{PAGE_SIZE}}", json.dumps(size))
             return self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         if url.path == "/style.css":
             return self._send(200, (STATIC / "style.css").read_bytes(), "text/css; charset=utf-8")
         if url.path == "/api/settings":
-            return self._json(config.public_settings(config.load(self.server.cfg.data_dir)))
+            data = config.public_settings(config.load(self.server.cfg.data_dir))
+            # what the indexer takes for roots while none are set (Indexer.__init__); only shown, never saved
+            data["default_roots"] = fixed_drives()
+            return self._json(data)
         if url.path == "/api/health":
             return self._health(query)
         if url.path == "/api/browse":
@@ -396,6 +407,8 @@ class _Handler(BaseHTTPRequestHandler):
             control.resume(cfg)
         elif path == "/api/settings":
             return self._change_settings(body)
+        elif path == "/api/data-folder":
+            return self._change_data_folder(body)
         elif path == "/api/retry" and body.get("status") in control.RETRY_STATUSES:
             control.request_retry(cfg, body["status"])
         elif path == "/api/rebuild":
@@ -427,6 +440,19 @@ class _Handler(BaseHTTPRequestHandler):
         except config.ConfigError as e:
             return self._json({"error": str(e), "errors": e.errors}, 400)
         control.request_settings(self.server.cfg, changes)
+        self._json({"ok": True})
+
+    def _change_data_folder(self, body: dict) -> None:
+        # checked here so that the UI hears about a bad folder at once; the supervisor checks again and copies the
+        # files while the indexer is stopped
+        folder, mode = body.get("folder"), body.get("mode")
+        if not isinstance(folder, str) or not isinstance(mode, str):
+            return self._json({"error": "a folder and a mode are needed"}, 400)
+        try:
+            datadir.plan(self.server.cfg, folder.strip(), mode)
+        except datadir.DataFolderError as e:
+            return self._json({"error": str(e)}, 400)
+        control.request_data_folder(self.server.cfg, folder.strip(), mode)
         self._json({"ok": True})
 
     def _token_ok(self) -> bool:
@@ -498,7 +524,8 @@ class _Handler(BaseHTTPRequestHandler):
             kept.ticket.extend(POLL_GRACE_S)
             return self._present_kept(q, kept)
         if kept is None and tab and not export and is_slow(q.get("query", ""), regex=q.get("regex") == "1",
-                                                            case_sensitive=q.get("case") == "1"):
+                                                            case_sensitive=q.get("case") == "1",
+                                                            names_only=q.get("names_only") == "1"):
             if not self.server.cfg.db_path.exists():
                 return {"results": [], "total": 0, "error": "The index does not exist yet."}
             try:
@@ -603,7 +630,8 @@ class _Handler(BaseHTTPRequestHandler):
         sup = self.server.supervisor
         if sup is not None:
             data["supervisor"] = {"running": sup.running, "restarts": sup.restarts, "last_exit": sup.last_exit,
-                                  "settings_error": sup.settings_error}
+                                  "settings_error": sup.settings_error,
+                                  "data_dir_moved_to": str(sup.moved_to) if sup.moved_to else None}
         conn = self._connect()
         if conn is not None:
             try:

@@ -10,7 +10,7 @@ import subprocess
 import time
 import uuid
 
-from . import db
+from . import config, db
 from .config import Config
 from .usn import fixed_drives
 
@@ -67,6 +67,12 @@ def request_settings(cfg: Config, changes: dict) -> None:
     tmp = requests / f"{name}.tmp"
     tmp.write_text(json.dumps(changes), encoding="utf-8")
     os.replace(tmp, tmp.with_suffix(".json"))
+
+
+def request_data_folder(cfg: Config, folder: str, mode: str) -> None:
+    """Ask the supervisor to copy the data to `folder` ("copy") or to switch to the data in it ("use"). It acts
+    with the indexer stopped, because only the indexer writes the database and a file in use cannot be copied whole."""
+    request_settings(cfg, {"data_folder": {"folder": folder, "mode": mode}})
 
 
 def take_settings_requests(cfg: Config) -> list[dict]:
@@ -201,6 +207,7 @@ def index_stats(conn: sqlite3.Connection, cfg: Config) -> dict:
     queued = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
     return {"files": by_status, "total_files": sum(by_status.values()), "queued": queued,
             "db_mb": round(db_size_bytes(cfg) / 1048576, 1), "db_path": str(cfg.db_path),
+            "data_dir": str(cfg.data_dir), "data_dir_movable": config.data_dir_is_movable(cfg),
             "maintenance_pending": db.get_meta(conn, "maintenance_pending", []),
             "last_maintenance": db.get_meta(conn, "last_maintenance"),
             "media": media_stats(conn)}

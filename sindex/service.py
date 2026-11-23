@@ -16,7 +16,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, control
+from . import config, control, datadir
 from .indexer import EXIT_RECYCLE
 from .web.server import WebServer
 
@@ -65,6 +65,8 @@ class Supervisor:
         self.restarts = 0
         self.last_exit: int | None = None
         self.settings_error: str | None = None  # why the last settings request was not applied
+        self._data_folder: tuple[str, str] | None = None  # (folder, mode) of a queued change of the data folder
+        self.moved_to: Path | None = None  # the data folder of the next start, once it was changed
 
     @property
     def running(self) -> bool:
@@ -105,8 +107,11 @@ class Supervisor:
         changed = False
         for changes in control.take_settings_requests(self.cfg):
             try:
-                config.apply(self.cfg.data_dir, changes)
-            except (config.ConfigError, OSError) as e:
+                if isinstance(changes, dict) and "data_folder" in changes:
+                    self._queue_data_folder(changes["data_folder"])
+                else:
+                    config.apply(self.cfg.data_dir, changes)
+            except (config.ConfigError, datadir.DataFolderError, OSError) as e:
                 log.error("settings not applied: %s", e)
                 self.settings_error = str(e)
             else:
@@ -114,6 +119,28 @@ class Supervisor:
                 self.settings_error = None
                 changed = True
         return changed
+
+    def _queue_data_folder(self, request: object) -> None:
+        if not (isinstance(request, dict) and isinstance(request.get("folder"), str)
+                and isinstance(request.get("mode"), str)):
+            raise config.ConfigError({"data_folder": "must be a folder and a mode"})
+        datadir.plan(self.cfg, request["folder"], request["mode"])  # refused now, not after the indexer stopped
+        self._data_folder = (request["folder"], request["mode"])
+
+    def _switch_data_folder(self) -> None:
+        """Carry out the queued change of the data folder. Runs between two indexers, so nothing writes the index."""
+        if self._data_folder is None:
+            return
+        folder, mode = self._data_folder
+        self._data_folder = None
+        try:
+            self.moved_to = datadir.switch(self.cfg, folder, mode)
+        except datadir.DataFolderError as e:
+            log.error("data folder not changed to %s: %s", folder, e)
+            self.settings_error = f"the data folder was not changed to {folder}: {e}"
+        else:
+            log.info("data folder of the next start: %s (%s)", self.moved_to, mode)
+            self.settings_error = None
 
     def _wait_before_restart(self, seconds: float) -> bool:
         """Sleep before restarting a failed indexer, but not through a settings change (it may be the fix).
@@ -132,6 +159,12 @@ class Supervisor:
         backoff = 30.0
         while not self.stop.is_set():
             started = time.monotonic()
+            self._switch_data_folder()
+            if self.moved_to is not None:
+                # an indexer here would go on writing to the old folder, which the next start no longer reads
+                log.info("indexing stays stopped until the service is restarted")
+                self.stop.wait()
+                return
             self.proc = self._spawn()
             log.info("indexer started (pid %d)", self.proc.pid)
             settings_changed = False
@@ -159,6 +192,7 @@ class Supervisor:
 
 PROGRAM_DIR_NAME = "sindex"
 ERROR_SERVICE_DOES_NOT_EXIST = 1060
+ERROR_SERVICE_EXISTS = 1073
 
 
 def program_dir() -> Path:
@@ -208,6 +242,27 @@ def install_executable_service(exe: Path) -> bool:
     finally:
         win32service.CloseServiceHandle(scm)
     return existed
+
+
+def install_python_service(exe: Path) -> bool:
+    """Register the service that runs from the Python environment, or update the registration of the one that is
+    there (the host `exe` may have moved or the settings changed). Returns whether it was there before.
+    Needs administrator rights."""
+    import pywintypes
+
+    settings = {"startType": win32service.SERVICE_AUTO_START, "exeName": str(exe),
+                "description": SindexService._svc_description_, "delayedstart": True}
+    try:
+        win32serviceutil.InstallService("sindex.service.SindexService", SERVICE_NAME,
+                                        SindexService._svc_display_name_, **settings)
+    except pywintypes.error as e:
+        if e.winerror != ERROR_SERVICE_EXISTS:
+            raise
+    else:
+        return False
+    win32serviceutil.ChangeServiceConfig("sindex.service.SindexService", SERVICE_NAME,
+                                         displayName=SindexService._svc_display_name_, **settings)
+    return True
 
 
 def stop_service(timeout: float = 60.0) -> bool:

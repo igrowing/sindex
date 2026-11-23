@@ -12,6 +12,8 @@ from .textnorm import BIGRAM_SEP, RUN_END, RUN_START
 from .usn import is_local_folder
 
 SCHEMA_VERSION = 1
+INDEX_NAME = "index.db"
+_INDEX_TABLES = frozenset({"meta", "files", "chunks", "queue"})  # what a file needs to be taken for an index
 
 # Queue stages and their default priorities (lower runs first).
 STAGE_DIR = "dir"
@@ -86,15 +88,45 @@ class DbLocationError(Exception):
     """index.db cannot live where the configuration puts it."""
 
 
-def check_location(path: Path) -> None:
+def check_location(path: Path, what: str = "index folder") -> None:
     """The folder of `path` must exist and be on a local drive: the write-ahead log needs shared memory
     and file locks that network shares do not provide, and a database there gets corrupted."""
     folder = Path(path).parent
     if not folder.is_dir():
-        raise DbLocationError(f"the index folder {folder} does not exist (db_dir in config.toml)")
+        raise DbLocationError(f"the {what} {folder} does not exist")
     if not is_local_folder(str(folder)):
-        raise DbLocationError(f"the index folder {folder} is not on a local drive; SQLite cannot keep its "
+        raise DbLocationError(f"the {what} {folder} is not on a local drive; SQLite cannot keep its "
                               "write-ahead log on a network share or a removable drive")
+
+
+def check_index_file(path: Path) -> None:
+    """`path` must be an index of this program (or an older one): a pre-built index is taken on trust otherwise, and
+    a wrong file would only show up later as an indexer that fails on every start."""
+    try:
+        conn = connect(path, readonly=True)
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            version = get_meta(conn, "schema_version") if "meta" in tables else None
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as e:  # not a database at all, damaged, or locked for good
+        raise DbLocationError(f"{path} cannot be read as an index: {e}") from e
+    if not _INDEX_TABLES <= tables or version is None:
+        raise DbLocationError(f"{path} is a database, but not an index of sindex")
+    if not isinstance(version, int) or version > SCHEMA_VERSION:
+        raise DbLocationError(f"{path} was made by a newer sindex (schema {version}, this one reads {SCHEMA_VERSION})")
+
+
+def checkpoint(path: Path) -> None:
+    """Merge the write-ahead log into `path`, so that the one file holds the whole index (for copying it).
+    The indexer must not be running: DbLocationError if the log cannot be emptied."""
+    conn = connect(path)
+    try:
+        busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        conn.close()
+    if busy:
+        raise DbLocationError(f"{path} is in use by another program; try again when nothing reads it")
 
 
 def connect(path: Path, *, readonly: bool = False, wal_pages: int | None = None,
