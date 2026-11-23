@@ -311,6 +311,11 @@ def _relaunch_elevated(params: list[str]) -> int:
     return 0
 
 
+def _restart_after_install(*, requested: bool, was_running: bool) -> bool:
+    """A reinstall stops the service to replace its files; one that ran comes back without being asked."""
+    return requested or was_running
+
+
 def _install_service(*, start: bool) -> int:
     import pywintypes
     import win32serviceutil
@@ -321,7 +326,7 @@ def _install_service(*, start: bool) -> int:
     if service.frozen():
         target = service.program_dir()
         print(f"stopping the service if it runs, then copying the program to {target} ...")
-        service.stop_service()
+        was_running = service.stop_service()
         service.copy_program(Path(sys.executable).parent, target)
         exe = target / Path(sys.executable).name
         existed = service.install_executable_service(exe)
@@ -330,7 +335,7 @@ def _install_service(*, start: bool) -> int:
         import winreg
 
         print("stopping the service if it runs, then copying the service host ...")
-        service.stop_service()  # a running host cannot be overwritten
+        was_running = service.stop_service()  # a running host cannot be overwritten
         exe = _prepare_service_host()
         existed = service.install_python_service(exe)
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
@@ -349,10 +354,10 @@ def _install_service(*, start: bool) -> int:
     if (searches := _search_connector_dir()) is not None:
         connector = create_search_connector(f"{url}opensearch.xml", searches)
         print(f"created search connector {connector}")
-    if start:
+    if _restart_after_install(requested=start, was_running=was_running):
         try:
             win32serviceutil.StartService(service.SERVICE_NAME)
-            print(f"service started; the web UI is at {url}")
+            print(f"service {'restarted' if was_running else 'started'}; the web UI is at {url}")
         except pywintypes.error as e:
             print(f"could not start the service: {e.strerror}", file=sys.stderr)
             return 1
@@ -480,7 +485,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--query", help="search words to run at once")
     p.set_defaults(func=cmd_ui)
     p = sub.add_parser("install", help="install the Windows service (admin)")
-    p.add_argument("--start", action="store_true", help="start the service after installing it")
+    p.add_argument("--start", action="store_true",
+                   help="start the service after installing it (one that ran before is restarted anyway)")
     p.add_argument("--wait", action="store_true", help="wait for Enter at the end (for a window that closes)")
     p.set_defaults(func=cmd_install)
     for name, func, help_ in (("remove", cmd_remove, "remove the Windows service (admin)"),

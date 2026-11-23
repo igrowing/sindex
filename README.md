@@ -76,6 +76,9 @@ Pick one. Both register the same Windows service and need administrator rights.
 start http://127.0.0.1:8765/
 ```
 
+Installing again (after an update) stops the service to replace its files and starts it again if it was running; a
+service that was stopped stays stopped unless you pass `--start`.
+
 To uninstall, run `sindex remove`. The service host is copied to `.venv\sindex-service\`, so keep the venv in place
 while the service is installed.
 

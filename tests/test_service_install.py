@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import pywintypes
 
-from sindex import service
+from sindex import cli, service
 
 EXE = Path(r"C:\venv\sindex-service\pythonservice.exe")
 ALREADY_THERE = pywintypes.error(1073, "CreateService", "The specified service already exists.")
@@ -63,3 +63,12 @@ def test_any_other_failure_of_the_install_is_not_hidden(fake):
         service.install_python_service(EXE)
 
     assert [call[0] for call in util.calls] == ["install"]
+
+
+def test_a_reinstall_restarts_a_service_that_was_running():
+    assert cli._restart_after_install(requested=False, was_running=True)
+
+
+def test_an_install_leaves_a_stopped_or_new_service_stopped_unless_asked():
+    assert not cli._restart_after_install(requested=False, was_running=False)
+    assert cli._restart_after_install(requested=True, was_running=False)
