@@ -5,3 +5,6 @@ build/
 dist/
 .*/
 /data/
+
+# the CI workflows live in a dot folder, which the rule above would hide
+!/.github/

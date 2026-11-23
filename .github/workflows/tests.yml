@@ -1,0 +1,42 @@
+name: tests
+
+# Lint and unit tests on every push to any branch. Tags are not matched by `branches`, so a tag push is handled by
+# release.yml, which calls this workflow first and only builds when it passes.
+on:
+  push:
+    branches: ["**"]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # sindex targets Windows 11 only (ctypes/pywin32, NTFS change journal, registry), so no other OS makes sense
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the lowest version pyproject.toml allows; 3.14 is what development runs on
+        python-version: ["3.12", "3.14"]
+    env:
+      PYTHONIOENCODING: utf-8  # console output of non-ASCII text, as AGENTS.md asks for scripts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check sindex tests
+
+      - name: Unit tests
+        # two tests of test_usn.py skip unless the shell is elevated; the hosted runner's is, so they may run here
+        run: python -m pytest

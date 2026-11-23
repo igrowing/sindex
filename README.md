@@ -64,6 +64,16 @@ Build it once on a machine that has the project (Python 3.12+):
 .venv\Scripts\python packaging\build.py       # -> dist\sindex\sindex.exe (a folder of about 25 MB)
 ```
 
+### Automatic builds (GitHub Actions)
+
+- **Every push to any branch** runs `ruff check sindex tests` and the unit tests on Windows, on Python 3.12 (the
+  lowest version `pyproject.toml` allows) and 3.14 (`.github/workflows/tests.yml`).
+- **Every new tag** runs the same checks first, then builds `dist\sindex\sindex.exe` and publishes a GitHub release
+  with `sindex-<tag>-windows-x64.zip` (the whole `dist\sindex` folder) and its `.sha256`
+  (`.github/workflows/release.yml`). The tag must equal the version in `pyproject.toml`, with or without a leading
+  `v`; otherwise the release stops before building, since the executable shows that version. To release: raise the
+  version in `pyproject.toml`, commit and push, then `git tag v<version>` and `git push origin v<version>`.
+
 ## Install as a service
 
 Pick one. Both register the same Windows service and need administrator rights.
