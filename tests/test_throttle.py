@@ -36,11 +36,17 @@ print(json.dumps({"priority": k.GetPriorityClass(proc), "eco": bool(state.StateM
 """
 NORMAL_PRIORITY_CLASS = 0x20
 IDLE_PRIORITY_CLASS = 0x40
+BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 
 
-def process_state(**settings) -> dict:
+def process_state(*, start_class: int = subprocess.NORMAL_PRIORITY_CLASS, **settings) -> dict:
+    """What apply_process_limits made of a child process that started in the priority class `start_class`.
+
+    The class is given explicitly: a child that is not told one inherits the parent's when that is below normal, and
+    the parent is not always at normal (the steps of a GitHub Actions runner start below normal).
+    """
     out = subprocess.run([sys.executable, "-c", CHILD, json.dumps(settings)], cwd=PROJECT_ROOT,
-                         capture_output=True, text=True, check=True)
+                         capture_output=True, text=True, check=True, creationflags=start_class)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
@@ -56,6 +62,13 @@ def test_process_limits_can_all_be_turned_off():
     assert state["priority"] == NORMAL_PRIORITY_CLASS
     if state["eco_readable"]:
         assert not state["eco"], "turning it off must opt out of EcoQoS explicitly"
+
+
+def test_process_limits_that_are_off_leave_the_priority_class_alone():
+    # the indexer is started by the service, which decides its class; turning the switches off must not change it
+    state = process_state(start_class=subprocess.BELOW_NORMAL_PRIORITY_CLASS,
+                          efficiency_mode=False, background_io=False, idle_priority=False)
+    assert state["priority"] == BELOW_NORMAL_PRIORITY_CLASS
 
 
 def test_switches_are_independent():
