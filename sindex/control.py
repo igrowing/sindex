@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 
 from . import config, db
 from .config import Config
@@ -17,6 +19,8 @@ from .usn import fixed_drives
 log = logging.getLogger(__name__)
 
 RETRY_STATUSES = ("error", "too_big", "binary", "truncated", "empty")  # what the health list can show
+USE_ROWS = 200  # folders disk_use() lists below one folder; the others are only counted
+USE_TOP = 30  # folders it lists by default when ranking all folders
 MAINTENANCE_ACTIONS = ("optimize", "vacuum")
 SETTINGS_DIR = "settings-requests"  # not requests/: the indexer takes everything in there for a reindex request
 
@@ -213,6 +217,141 @@ def index_stats(conn: sqlite3.Connection, cfg: Config) -> dict:
             "maintenance_pending": db.get_meta(conn, "maintenance_pending", []),
             "last_maintenance": db.get_meta(conn, "last_maintenance"),
             "media": media_stats(conn)}
+
+
+@dataclass(slots=True)
+class _Folder:
+    """A folder's share of the index while disk_use() walks the tree: its own files and, once its subfolders are
+    closed, theirs too."""
+
+    path: str
+    key: str  # lower case, for comparing
+    files: int = 0
+    names: int = 0
+    text: int = 0
+    unmeasured: int = 0
+    own_files: int = 0
+    own_names: int = 0
+    own_text: int = 0
+    subfolders: int = 0  # with something indexed in them
+
+
+def _chain(path: str) -> list[str]:
+    """`path` and the folders above it, from the drive down: C:\\, C:\\Users, C:\\Users\\me."""
+    drive, rest = os.path.splitdrive(path)
+    chain = [drive + "\\"]
+    for part in rest.split("\\"):
+        if part:
+            chain.append(os.path.join(chain[-1], part))
+    return chain
+
+
+def disk_use(conn: sqlite3.Connection, cfg: Config, path: str = "", *, anywhere: bool = False,
+             limit: int | None = None) -> dict:
+    """What takes the space in the index, by folder, like `du`. A folder counts everything below it.
+
+    Lists the folders right below `path` ("" for the drives), biggest first, or with `anywhere` the biggest folders
+    at any depth. The stored text of a folder is exact (files.text_bytes); its share of the whole index file (word
+    index, file list and the rest) is estimated as proportional to its text. Files of an older index that the
+    indexer has not measured yet count as no text (`unmeasured`).
+
+    The folders come sorted so that every folder is followed by everything below it, and are added up on a stack
+    of the folders above the current one: memory is the depth of the tree plus the folders right below `path` (or
+    the `limit` biggest), not a total for each of the tens of thousands of folders.
+    """
+    limit = limit or (USE_TOP if anywhere else USE_ROWS)
+    root = os.path.normpath(path) if path else ""
+    if root.endswith(":"):  # normpath leaves "C:" without the backslash that makes it the drive's root folder
+        root += "\\"
+    root_key = root.lower()
+    files, text, unmeasured = conn.execute(
+        "SELECT count(*), coalesce(sum(text_bytes), 0), coalesce(sum(text_bytes IS NULL), 0) FROM files").fetchone()
+    names = conn.execute("SELECT count(*) FROM names").fetchone()[0]
+    db_bytes = db_size_bytes(cfg)
+    per_text = db_bytes / text if text else 0.0
+
+    where, params = "", []
+    if root and not anywhere:
+        where, params = "WHERE d.path = ? OR d.path LIKE ? ESCAPE '^'", [root, db.like_under(root)]
+    # a backslash sorts after "-" or " ", which would put "C:\x-y" between "C:\x" and "C:\x\a"; as char(1)
+    # it sorts before everything, so a folder's subfolders follow it directly
+    rows = conn.execute(
+        f"""SELECT d.path, coalesce(f.files, 0), coalesce(n.names, 0), coalesce(f.text, 0), coalesce(f.unmeasured, 0)
+            FROM dirs d
+            LEFT JOIN (SELECT dir_id, count(*) AS files, sum(coalesce(text_bytes, 0)) AS text,
+                              sum(text_bytes IS NULL) AS unmeasured FROM files GROUP BY dir_id) f ON f.dir_id = d.id
+            LEFT JOIN (SELECT dir_id, count(*) AS names FROM names GROUP BY dir_id) n ON n.dir_id = d.id
+            {where}
+            ORDER BY replace(d.path, '\\', char(1)) COLLATE NOCASE""", params)
+
+    def row(f: _Folder) -> dict:
+        return {"path": f.path, "name": os.path.basename(f.path.rstrip("\\")) or f.path, "files": f.files,
+                "names": f.names, "text_bytes": f.text, "own_text_bytes": f.own_text, "unmeasured": f.unmeasured,
+                "index_bytes": round(f.text * per_text), "share": f.text / text if text else 0.0}
+
+    def size(f: _Folder) -> tuple[int, int]:
+        return f.text, f.files + f.names
+
+    picked: list[tuple[tuple[int, int], int, _Folder]] = []  # anywhere: a heap of the biggest
+    below: list[_Folder] = []  # otherwise: the folders right below `root`
+    here: _Folder | None = None
+    order = 0  # breaks ties in the heap, which cannot compare folders
+    stack: list[_Folder] = []
+
+    def close() -> None:
+        nonlocal here, order
+        f = stack.pop()
+        if stack:
+            up = stack[-1]
+            up.files += f.files
+            up.names += f.names
+            up.text += f.text
+            up.unmeasured += f.unmeasured
+        if anywhere:
+            if not (f.own_files or f.own_names) and f.subfolders == 1:
+                return  # a folder on the way to a single subfolder only repeats that subfolder's numbers
+            order += 1
+            item = (size(f), order, f)
+            if len(picked) < limit:
+                heapq.heappush(picked, item)
+            elif item[0] > picked[0][0]:
+                heapq.heapreplace(picked, item)
+        elif f.key == root_key:
+            here = f
+        elif (stack[-1].key if stack else "") == root_key:
+            below.append(f)
+
+    for folder, n_files, n_names, n_text, n_unmeasured in rows:
+        chain = _chain(folder)
+        keys = [c.lower() for c in chain]
+        while stack and (len(stack) > len(keys) or stack[len(stack) - 1].key != keys[len(stack) - 1]):
+            close()  # done with the folders that are not on this one's way down
+        for depth in range(len(stack), len(chain)):
+            if stack:
+                stack[-1].subfolders += 1
+            stack.append(_Folder(chain[depth], keys[depth]))
+        f = stack[-1]
+        f.files += n_files
+        f.names += n_names
+        f.text += n_text
+        f.unmeasured += n_unmeasured
+        f.own_files, f.own_names, f.own_text = n_files, n_names, n_text
+    while stack:
+        close()
+
+    if anywhere:
+        listed = [f for _, _, f in sorted(picked, key=lambda item: item[0], reverse=True)]
+    else:
+        listed = sorted(below, key=size, reverse=True)
+    chain = _chain(root) if root else []
+    return {
+        "path": root, "chain": chain, "anywhere": anywhere,
+        "db_bytes": db_bytes, "text_bytes": text, "files": files, "names": names, "unmeasured": unmeasured,
+        "here": None if here is None or not (here.own_files or here.own_names) else {
+            "files": here.own_files, "names": here.own_names, "text_bytes": here.own_text,
+            "index_bytes": round(here.own_text * per_text), "share": here.own_text / text if text else 0.0},
+        "rows": [row(f) for f in listed[:limit]], "more": max(0, len(listed) - limit),
+    }
 
 
 def problem_files(conn: sqlite3.Connection, status: str, *, limit: int = 100, offset: int = 0) -> list[dict]:

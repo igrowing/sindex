@@ -48,6 +48,7 @@ EXIT_CONFIG = 2  # the configuration cannot be used; restarting does not help un
 EXIT_RECYCLE = 3
 DIR_REASONS = REASON_RENAME_OLD | REASON_RENAME_NEW | REASON_DELETE
 QUEUE_BATCH = 50  # queue rows looked at per round
+MEASURE_BATCH = 500  # files of an older index whose stored text is measured per idle round (see _measure_text)
 PROGRESS_EVERY = 1000  # log a progress line after this many indexed files
 STDIN_POLL_SECONDS = 1.0  # how often the supervisor's stdin pipe is checked
 MAX_CHUNKS = (1 << db.CHUNK_BITS) - 1  # chunks of one file: the rowid range reserved for it
@@ -77,6 +78,7 @@ class _Job:
     kind: str
     stage: str
     seq: int = 0  # chunks stored so far
+    text_bytes: int = 0  # their size; a file is read by one stage (scanner.queue_target), so this is all its text
 
 
 class Indexer:
@@ -108,6 +110,7 @@ class Indexer:
         self.batch_max_chars = max(1_000_000, cfg.sqlite_cache_mb * 1_000_000 // 2)
         self._status_state = ""
         self._status_at = 0.0
+        self._measured_up_to = 0  # file ids below this have their text measured (see _measure_text)
         self.conn: sqlite3.Connection
 
     # ---- control plane -------------------------------------------------
@@ -266,6 +269,26 @@ class Indexer:
         log.info("maintenance %s done in %.1f s: %.0f MB -> %.0f MB", action, seconds, mb_before, mb_after)
         return True
 
+    def _measure_text(self) -> bool:
+        """Fill in files.text_bytes for files indexed before schema 3, one batch per idle round. It reads their
+        stored text once and rewrites the files table's pages once; new files get it as they are indexed."""
+        rows = self.conn.execute(
+            "SELECT id FROM files WHERE id > ? AND text_bytes IS NULL AND status != 'indexing' ORDER BY id LIMIT ?",
+            (self._measured_up_to, MEASURE_BATCH)).fetchall()
+        if not rows:
+            return False
+        self._status("measuring", f"stored text of {len(rows)} files", force=True)
+        self._begin()
+        for (file_id,) in rows:
+            self.throttle.checkpoint()
+            self.conn.execute("UPDATE files SET text_bytes = ? WHERE id = ?",
+                              (db.stored_text_bytes(self.conn, file_id), file_id))
+        self._commit()
+        self._measured_up_to = rows[-1][0]
+        if len(rows) < MEASURE_BATCH:
+            log.info("stored text measured for the files of an older index")
+        return True
+
     # ---- main loop -----------------------------------------------------
 
     def run(self) -> int:
@@ -324,7 +347,7 @@ class Indexer:
                 return EXIT_RECYCLE
             if not did:
                 self._commit()
-                if self._run_maintenance():
+                if self._run_maintenance() or self._measure_text():
                     continue
                 if self.until_idle:
                     return EXIT_OK
@@ -626,11 +649,12 @@ class Indexer:
             self.conn.execute("INSERT INTO chunks (rowid, body, source) VALUES (?, ?, ?)",
                               ((job.file_id << db.CHUNK_BITS) + job.seq, msg.text, CHUNK_SOURCE[job.stage]))
             job.seq += 1
+            job.text_bytes += len(msg.text.encode("utf-8"))
             self.batch_chars += len(msg.text)
             return
         del self.jobs[msg.job]
-        self.conn.execute("UPDATE files SET status = ?, encoding = ?, error = ? WHERE id = ?",
-                          (msg.status, msg.encoding, msg.error, job.file_id))
+        self.conn.execute("UPDATE files SET status = ?, encoding = ?, error = ?, text_bytes = ? WHERE id = ?",
+                          (msg.status, msg.encoding, msg.error, job.text_bytes, job.file_id))
         if msg.media is not None:
             db.upsert_media(self.conn, job.file_id, msg.media)
         self._file_done(job.path, job.stage, extracted=True)
@@ -694,12 +718,13 @@ class Indexer:
                VALUES (?, ?, ?, ?, 'indexing', ?)
                ON CONFLICT (dir_id, name) DO UPDATE SET
                  name = excluded.name, size = excluded.size, mtime_ns = excluded.mtime_ns,
-                 status = 'indexing', encoding = NULL, error = NULL, indexed_at = excluded.indexed_at
+                 status = 'indexing', encoding = NULL, error = NULL, indexed_at = excluded.indexed_at,
+                 text_bytes = NULL
                RETURNING id""",
             (dir_id, name, st.st_size, st.st_mtime_ns, time.time())).fetchone()[0]
         db.delete_chunks(conn, file_id, source=CHUNK_SOURCE[stage])
         if st.st_size > max_bytes(kind, self.cfg):
-            conn.execute("UPDATE files SET status = 'too_big' WHERE id = ?", (file_id,))
+            conn.execute("UPDATE files SET status = 'too_big', text_bytes = 0 WHERE id = ?", (file_id,))
             return True, None
         return True, _Job(file_id, path, kind, stage)
 

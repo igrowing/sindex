@@ -295,6 +295,19 @@ three; a tab with a rejected value is marked and opened. It covers:
   changed here. The index can still be kept apart from the data folder with `db_dir` in `config.toml`; the page then
   also shows the index file, the indexer refuses to start with a `db_dir` that is not a local folder and says why
   in its status, and the index folder is never indexed.
+
+  Below it, *What takes the space* works like `du | sort -n`: the folders below the current one, biggest first,
+  each counting everything below it, with its files, listed names, stored text, estimated share of the index and
+  a bar. A folder name opens it, the path above leads back up; *Biggest anywhere* ranks the folders at any depth
+  (a folder that only leads to one subfolder is left out, it would repeat that subfolder's numbers). The text is
+  exact: the indexer records each file's text size as it stores it (`files.text_bytes`), and measures the files of
+  an index from before this, a batch at a time, while it is idle. The share of the index file (word index, file
+  list and the rest) is estimated as proportional to the text. *Skip…* adds the folder to *Folders to skip* after
+  saying what it would remove; the indexer restarts and removes its files, and *Compact database* then gives the
+  space back to Windows. The section is added up when the tab is opened: on an index of 105,000 files and 227,000
+  listed names in 32,000 folders it took 0.5 s for the drives or the biggest anywhere and 0.16 s inside one folder,
+  with memory for the depth of the tree and the rows shown, not for every folder. `sindex du [PATH] [--top N]`
+  prints the same in the terminal.
 - **Indexing health:** the files that ended as error, too big, not text, cut short or empty, with their error, and a
   retry for one file or for a whole group (after raising a size limit, for example).
 - **Maintenance:** rebuild everything, optimize the search index, compact the database (both run when the queue is
@@ -366,4 +379,4 @@ minute to show up in search. The indexer's status file is rewritten at most ever
 
 ## CLI
 
-`sindex [--data-dir DIR] run | index | search | status | pause | resume | reindex PATH | install | remove | start | stop`
+`sindex [--data-dir DIR] run | index | search | status | du [PATH] [--top N] | pause | resume | reindex PATH | install | remove | start | stop`

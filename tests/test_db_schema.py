@@ -1,4 +1,4 @@
-"""Schema 2: folders in `dirs`, listed files in `names`, and the conversion of a schema 1 index."""
+"""Schema 2 and 3: folders in `dirs`, listed files in `names`, and the conversion of a schema 1 index."""
 
 import sqlite3
 
@@ -45,7 +45,7 @@ def test_a_schema_1_index_is_converted_keeping_ids_text_and_media(tmp_path):
 
     db.init(conn)
 
-    assert db.get_meta(conn, "schema_version") == 2
+    assert db.get_meta(conn, "schema_version") == 3  # through schema 2
     assert conn.execute("SELECT id, path FROM dirs ORDER BY id").fetchall() == [(1, "D:\\docs"), (2, "d:\\DOCS\\sub")]
     assert conn.execute("SELECT id, dir_id, name, status FROM files ORDER BY id").fetchall() == [
         (7, 1, "a.txt", "ok"), (12, 2, "c.jpg", "ok"), (13, 2, "d.pdf", "error")]
@@ -62,7 +62,7 @@ def test_the_converted_index_enforces_one_row_per_file(tmp_path):
     db.init(conn)
 
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO files VALUES (99, 1, 'A.TXT', 1, 1, 'ok', NULL, NULL, 1)")
+        conn.execute("INSERT INTO files VALUES (99, 1, 'A.TXT', 1, 1, 'ok', NULL, NULL, 1, NULL)")
     conn.close()
 
 

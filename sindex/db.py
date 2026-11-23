@@ -14,7 +14,7 @@ from .usn import is_local_folder
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2  # 2: folders in their own table, files listed by name in `names`
+SCHEMA_VERSION = 3  # 2: folders in their own table, files listed by name in `names`; 3: files.text_bytes
 INDEX_NAME = "index.db"
 _INDEX_TABLES = frozenset({"meta", "files", "chunks", "queue"})  # what a file needs to be taken for an index
 
@@ -50,7 +50,8 @@ _FILES_COLUMNS = """
     status TEXT NOT NULL,        -- ok | truncated | empty | binary | too_big | error | indexing
     encoding TEXT,
     error TEXT,
-    indexed_at REAL NOT NULL
+    indexed_at REAL NOT NULL,
+    text_bytes INTEGER           -- stored text (UTF-8 bytes); NULL while indexing and until measured (schema < 3)
 """
 _FILES_PLACE = "CREATE UNIQUE INDEX IF NOT EXISTS files_place ON files (dir_id, name)"
 _DIRS = """CREATE TABLE IF NOT EXISTS dirs (
@@ -176,8 +177,11 @@ def init(conn: sqlite3.Connection) -> None:
     if sqlite3.sqlite_version_info < (3, 35):
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is too old (need FTS5, 3.35+)")
     has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
-    if has_meta and get_meta(conn, "schema_version") == 1:
+    version = get_meta(conn, "schema_version") if has_meta else None
+    if version == 1:
         _migrate_to_v2(conn)
+    if version in (1, 2):
+        _migrate_to_v3(conn)
     conn.executescript(SCHEMA)
     conn.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
 
@@ -217,6 +221,21 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
     finally:
         conn.execute("PRAGMA foreign_keys = ON")
     log.info("index converted to schema 2 in %.1f s", time.monotonic() - started)
+
+
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    """Schema 2 -> 3: files.text_bytes, the size of a file's stored text, for the disk use report. Adding a column
+    rewrites nothing; the indexer measures the files that are already there while it is idle."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    conn.execute("BEGIN")
+    try:
+        if "text_bytes" not in columns:  # a schema 1 index got the column with its new files table
+            conn.execute("ALTER TABLE files ADD COLUMN text_bytes INTEGER")
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (json.dumps(3),))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default=None):
@@ -298,6 +317,13 @@ def list_name(conn: sqlite3.Connection, dir_id: int, name: str) -> None:
 
 def unlist_name(conn: sqlite3.Connection, dir_id: int, name: str) -> None:
     conn.execute("DELETE FROM names WHERE dir_id = ? AND name = ?", (dir_id, name))
+
+
+def stored_text_bytes(conn: sqlite3.Connection, file_id: int) -> int:
+    """UTF-8 bytes of the text stored for a file (0 when it has none)."""
+    lo, hi = chunk_range(file_id)
+    return conn.execute("SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM chunks WHERE rowid BETWEEN ? AND ?",
+                        (lo, hi)).fetchone()[0]
 
 
 def delete_file(conn: sqlite3.Connection, file_id: int) -> None:

@@ -74,9 +74,23 @@
   .pk-add { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--line); }
   .pk-add input { flex: 1; font-size: 13px; }
   .field.invalid .picker > div { outline: 2px solid var(--danger); }
+  h3 { font-size: 14px; margin: 0 0 4px; }
+  .use-bar { display: flex; gap: 8px 16px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .crumbs { font-size: 13px; flex: 1 1 auto; word-break: break-all; }
+  .crumbs button, .files.use button.go { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer;
+                                          font: inherit; text-align: left; word-break: break-all; }
+  .files.use th { text-align: right; font-weight: normal; color: var(--muted); font-size: 12px; padding: 0 10px 4px 0; }
+  .files.use th:first-child { text-align: left; }
+  .files.use td { text-align: right; white-space: nowrap; word-break: normal; }
+  .files.use td:first-child { text-align: left; white-space: normal; word-break: break-all; }
+  .u-bar { width: 20%; min-width: 90px; }
+  .u-bar div { position: relative; height: 8px; background: var(--line); border-radius: 4px; }
+  .u-bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 4px; }
+  .u-bar small { color: var(--muted); }
   @media (max-width: 720px) {
     .field { grid-template-columns: 1fr 130px; } .field .hint { grid-column: 1 / 3; }
     .pair, .picker { grid-template-columns: 1fr; }
+    .files.use .opt { display: none; }
   }
 </style>
 </head>
@@ -160,6 +174,21 @@
         <button type="button" class="plain" id="dbApplyBtn" style="min-width:0">Apply</button></div>
     </div>
     <p class="lead" id="dbMsg" style="margin-top:8px"></p>
+    <hr>
+    <h3>What takes the space</h3>
+    <p class="lead">Like <code>du</code>: a folder counts everything below it. Its stored text is exact; its share of
+      the index (word index, file list and the rest) is estimated from the text. Skipping a folder you never search
+      makes the index smaller: its files leave the index at the next scan, which starts at once. Afterwards,
+      <i>Compact database</i> below gives the space back to Windows.</p>
+    <div class="use-bar">
+      <nav class="crumbs" id="useCrumbs"></nav>
+      <div class="tabs" id="useMode">
+        <button type="button" data-mode="below" class="on">By folder</button>
+        <button type="button" data-mode="anywhere">Biggest anywhere</button>
+      </div>
+    </div>
+    <table class="files use" id="useTable"></table>
+    <p class="lead" id="useNote"></p>
   </section>
 
   <section id="healthSection" data-tab="health">
@@ -352,6 +381,7 @@ function clearErrors() {
 const SETTING_TABS = ["speed", "schedule", "index", "search"];  // the tabs whose fields the Save button stores
 function showTab(name) {
   if (!document.querySelector(`#pages button[data-tab="${name}"]`)) name = "speed";
+  if (name === "maintenance" && !use.loaded) loadUsage();  // it reads the whole file list, so only when looked at
   document.querySelectorAll("section[data-tab]").forEach(sec => sec.hidden = sec.dataset.tab !== name);
   document.querySelectorAll("#pages button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
   $("savebar").hidden = !SETTING_TABS.includes(name);
@@ -551,6 +581,93 @@ async function refresh() {
       (last ? `Last: ${last.action} on ${new Date(last.at * 1000).toLocaleString()}, ${last.seconds} s, ${last.mb_before} MB → ${last.mb_after} MB.` : "");
   }
 }
+
+// ---- what takes the space: folders by their share of the index, like du ------------------------------
+const use = { loaded: false, path: "", anywhere: false };
+
+function excluded(path) {  // skipped already, itself or a folder above it
+  return (state ? state.values.exclude_paths : []).some(p => pathKey(path) === pathKey(p) || pathKey(path).startsWith(pathKey(p) + "\\"));
+}
+
+async function loadUsage() {
+  use.loaded = true;
+  const q = new URLSearchParams({ path: use.path });
+  if (use.anywhere) q.set("anywhere", "1");
+  $("useNote").textContent = "Adding up…";
+  const r = await fetch("/api/usage?" + q, { headers: { "X-Sindex-Token": TOKEN } });
+  const res = await r.json().catch(() => ({ error: "unexpected answer from the server" }));
+  if (!r.ok || res.error) { $("useTable").innerHTML = ""; $("useNote").textContent = res.error || "Failed"; return; }
+  document.querySelectorAll("#useMode button").forEach(b => b.classList.toggle("on", (b.dataset.mode === "anywhere") === use.anywhere));
+
+  const crumbs = $("useCrumbs"); crumbs.innerHTML = "";
+  const step = (label, path) => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = label;
+    b.onclick = () => { Object.assign(use, { path, anywhere: false }); loadUsage(); }; crumbs.append(b);
+  };
+  if (use.anywhere) crumbs.textContent = "All folders, biggest first";
+  else {
+    step("This computer", "");
+    res.chain.forEach((p, i) => { crumbs.append(" \u203a "); step(i ? p.slice(p.lastIndexOf("\\") + 1) : p, p); });
+  }
+
+  const rows = res.rows.map(r => ({ ...r, drill: !use.anywhere }));
+  if (res.here) rows.push({ ...res.here, path: null, name: "(files in this folder)" });
+  rows.sort((a, b) => b.text_bytes - a.text_bytes);
+  const table = $("useTable");
+  table.innerHTML = `<tr><th>Folder</th><th class="opt">Files</th><th class="opt">Names</th><th>Text</th>` +
+    `<th class="opt">\u2248 In index</th><th>Share</th><th></th></tr>`;
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    if (r.path) {
+      const go = document.createElement("button"); go.type = "button"; go.className = "go";
+      go.textContent = use.anywhere ? r.path : r.name; go.title = r.path;
+      go.onclick = () => { Object.assign(use, { path: r.path, anywhere: false }); loadUsage(); };
+      name.append(go);
+    } else name.textContent = r.name;
+    const pct = (r.share * 100);
+    tr.append(name);
+    tr.insertAdjacentHTML("beforeend", `<td class="opt">${r.files.toLocaleString()}</td><td class="opt">${r.names.toLocaleString()}</td>` +
+      `<td>${fmtSize(r.text_bytes)}</td><td class="opt">${fmtSize(r.index_bytes)}</td>` +
+      `<td class="u-bar"><div><span style="width:${Math.min(100, pct).toFixed(1)}%"></span></div><small>${pct < 0.1 && pct > 0 ? "<0.1" : pct.toFixed(1)}%</small></td>`);
+    const act = document.createElement("td");
+    if (r.path) {
+      const skip = document.createElement("button"); skip.type = "button"; skip.className = "plain";
+      const drive = /^[A-Za-z]:\\?$/.test(r.path);
+      skip.textContent = excluded(r.path) ? "Skipped" : "Skip\u2026";
+      skip.disabled = drive || excluded(r.path);
+      skip.title = drive ? "A whole drive: choose the folders to index under What to index instead" : "Leave this folder out of the index";
+      skip.onclick = () => skipFolder(r);
+      act.append(skip);
+    }
+    tr.append(act); table.append(tr);
+  }
+  const notes = [`The index is ${fmtSize(res.db_bytes)}: ${fmtSize(res.text_bytes)} of text in ${res.files.toLocaleString()} files` +
+    (res.names ? `, and ${res.names.toLocaleString()} files listed by name.` : ".")];
+  if (res.more) notes.push(`${res.more.toLocaleString()} smaller folders are not listed.`);
+  if (res.unmeasured) notes.push(`The text of ${res.unmeasured.toLocaleString()} files of an older index is still being measured ` +
+    "(the indexer does it while idle); they count as no text until then.");
+  if (!rows.length) notes.push("Nothing indexed here.");
+  $("useNote").textContent = notes.join(" ");
+}
+
+async function skipFolder(r) {
+  const ask = `Leave ${r.path} out of the index?\n\n${r.files.toLocaleString()} files with ${fmtSize(r.text_bytes)} of text ` +
+    `(about ${fmtSize(r.index_bytes)} of the index)` + (r.names ? ` and ${r.names.toLocaleString()} names` : "") +
+    " will no longer be found. The indexer restarts and removes them; Compact database afterwards gives the space back to Windows.";
+  if (!confirm(ask)) return;
+  const exclude = [...state.values.exclude_paths, r.path];
+  const { ok, data } = await post("/api/settings", { changes: { exclude_paths: exclude } });
+  if (!ok) { toast("Not saved: " + (data.error || Object.values(data.errors || {}).join("; "))); return; }
+  state.values.exclude_paths = exclude;
+  toggle("exclude_paths", r.path, true);  // the list on What to index, without touching other unsaved edits
+  toast("Skipped; the indexer restarts and removes its files");
+  loadUsage();
+}
+
+document.querySelectorAll("#useMode button").forEach(b => b.onclick = () => {
+  use.anywhere = b.dataset.mode === "anywhere"; loadUsage();
+});
 
 async function request(path, body, done, confirmText) {
   if (confirmText && !confirm(confirmText)) return;

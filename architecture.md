@@ -387,7 +387,9 @@ A folder path is stored once, in `dirs`, and files refer to it by number. `names
 read (`index_all_names`), with only what a search in names needs: no row id, size or date. A file is in `files` or in
 `names`, never both. Schema 1 kept the path in every `files` row and again in its unique index; `db.init()` converts
 such an index in one transaction. On a copy of a real index (597,177 files in 57,330 folders) the file list went from
-138.9 MB to 44.1 MB: `files` 24.3 MB, `dirs` 11.9 MB, `names` 7.8 MB for 324,727 listed files.
+138.9 MB to 44.1 MB: `files` 24.3 MB, `dirs` 11.9 MB, `names` 7.8 MB for 324,727 listed files. Schema 3 adds
+`files.text_bytes`, the size of a file's stored text, for the disk use report (`control.disk_use`); it is a plain
+`ALTER TABLE`, and the indexer measures the files of an older index while idle.
 
 ```mermaid
 erDiagram
@@ -413,6 +415,7 @@ erDiagram
         TEXT encoding
         TEXT error
         REAL indexed_at
+        INTEGER text_bytes "stored text; NULL until measured"
     }
     chunks {
         INTEGER rowid "file_id << 16 + seq"

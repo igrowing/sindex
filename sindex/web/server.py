@@ -366,6 +366,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._health(query)
         if url.path == "/api/browse":
             return self._browse(query)
+        if url.path == "/api/usage":
+            return self._usage(query)
         if url.path == "/api/log":
             return self._log(query)
         if url.path == "/api/search":
@@ -470,6 +472,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(control.list_folders(q.get("path", "")))
         except ValueError as e:
             self._json({"error": str(e)}, 400)
+
+    def _usage(self, q: dict) -> None:
+        # names the folders of the whole computer, like _browse
+        if not self._token_ok():
+            return self._json({"error": "bad token"}, 403)
+        try:
+            limit = max(1, min(int(q.get("limit") or 0) or control.USE_ROWS, control.USE_ROWS))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        conn = self._connect()
+        if conn is None:
+            return self._json({"error": "The index does not exist yet."}, 404)
+        try:
+            data = control.disk_use(conn, self.server.cfg, q.get("path", ""), anywhere=q.get("anywhere") == "1",
+                                    limit=limit if q.get("limit") else None)
+        finally:
+            conn.close()
+        self._json(data)
 
     def _log(self, q: dict) -> None:
         # logs name the files and folders that were indexed

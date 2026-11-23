@@ -100,6 +100,35 @@ def cmd_search(args) -> int:
     return 0
 
 
+def _mb(n: int) -> str:
+    return f"{n / 1e6:,.1f} MB"
+
+
+def cmd_du(args) -> int:
+    cfg = _cfg(args)
+    if not cfg.db_path.exists():
+        print("The index does not exist yet.", file=sys.stderr)
+        return 1
+    conn = db.connect(cfg.db_path, readonly=True)
+    try:
+        use = control.disk_use(conn, cfg, args.path or "", anywhere=args.top is not None, limit=args.top)
+    finally:
+        conn.close()
+    print(f"index {_mb(use['db_bytes'])}: text {_mb(use['text_bytes'])} of {use['files']:,} files, "
+          f"{use['names']:,} names listed")
+    if use["unmeasured"]:
+        print(f"({use['unmeasured']:,} files of an older index are not measured yet and count as no text)")
+    print(f"{'text':>12} {'~ in index':>12} {'files':>9} {'names':>9}  folder")
+    rows = list(use["rows"])
+    if use["here"]:
+        rows.append({**use["here"], "path": "(files in " + use["path"] + " itself)"})
+    for r in sorted(rows, key=lambda r: r["text_bytes"], reverse=True):
+        print(f"{_mb(r['text_bytes']):>12} {_mb(r['index_bytes']):>12} {r['files']:>9,} {r['names']:>9,}  {r['path']}")
+    if use["more"]:
+        print(f"... and {use['more']:,} smaller folders")
+    return 0
+
+
 def cmd_status(args) -> int:
     cfg = _cfg(args)
     out = {"indexer": control.indexer_status(cfg)}
@@ -475,6 +504,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--case", action="store_true", help="match the typed letters exactly, in contents and names")
     p.set_defaults(func=cmd_search)
     sub.add_parser("status", help="show indexer status").set_defaults(func=cmd_status)
+    p = sub.add_parser("du", help="what takes the space in the index, by folder (like du)")
+    p.add_argument("path", nargs="?", help="list the folders below this one (default: the drives)")
+    p.add_argument("--top", type=int, metavar="N", help="the N biggest folders at any depth instead")
+    p.set_defaults(func=cmd_du)
     sub.add_parser("pause", help="pause indexing").set_defaults(func=cmd_pause)
     sub.add_parser("resume", help="resume indexing").set_defaults(func=cmd_resume)
     p = sub.add_parser("reindex", help="re-extract files or folders")
