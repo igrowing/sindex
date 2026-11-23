@@ -230,7 +230,8 @@ class Indexer:
         if status not in control.RETRY_STATUSES:
             raise ValueError(f"cannot retry files with status {status!r}")
         self._begin()
-        cursor = self.conn.execute("SELECT dir, name FROM files WHERE status = ?", (status,))
+        cursor = self.conn.execute(
+            "SELECT d.path, f.name FROM files f JOIN dirs d ON d.id = f.dir_id WHERE f.status = ?", (status,))
         count = 0
         while rows := cursor.fetchmany(500):
             for d, name in rows:
@@ -353,12 +354,14 @@ class Indexer:
         if db.get_meta(self.conn, "roots") == roots:
             return
         removed = 0
-        for (d,) in self.conn.execute("SELECT DISTINCT dir FROM files").fetchall():
+        for dir_id, d in self.conn.execute("SELECT id, path FROM dirs").fetchall():
             if self.filter.root_of(d) is None:
                 self.conn.execute("BEGIN")
-                for (fid,) in self.conn.execute("SELECT id FROM files WHERE dir = ?", (d,)).fetchall():
+                for (fid,) in self.conn.execute("SELECT id FROM files WHERE dir_id = ?", (dir_id,)).fetchall():
                     db.delete_file(self.conn, fid)
                     removed += 1
+                removed += self.conn.execute("DELETE FROM names WHERE dir_id = ?", (dir_id,)).rowcount
+                self.conn.execute("DELETE FROM dirs WHERE id = ?", (dir_id,))
                 self.conn.execute("COMMIT")
         db.set_meta(self.conn, "roots", roots)
         if removed:
@@ -488,6 +491,9 @@ class Indexer:
             return  # parent gone (its own record covers it) or outside the index
         if ch.is_dir:
             db.enqueue(self.conn, ch.path, db.STAGE_DIR, reason="usn")
+        elif self.filter.lists_name(ch.path):
+            # nothing to extract: listed or dropped right away, a queue row would only double the writes
+            self._prepare_file(ch.path, db.STAGE_TEXT, force=False)
         else:
             stage, priority = scanner.queue_target(os.path.basename(ch.path), self.cfg)
             db.enqueue(self.conn, ch.path, stage, reason="usn", priority=priority)
@@ -654,8 +660,9 @@ class Indexer:
         """
         conn = self.conn
         d, name = os.path.split(path)
-        row = conn.execute("SELECT id, size, mtime_ns, status FROM files WHERE dir = ? AND name = ?",
-                           (d, name)).fetchone()
+        dir_id = db.find_dir(conn, d)
+        row = None if dir_id is None else conn.execute(
+            "SELECT id, size, mtime_ns, status FROM files WHERE dir_id = ? AND name = ?", (dir_id, name)).fetchone()
         kind = self.filter.file_kind(path)
         name_only = kind is None and self.filter.lists_name(path)
         try:
@@ -665,27 +672,31 @@ class Indexer:
         except OSError as e:
             log.debug("cannot stat %s: %s", path, e)
             return False, None  # transient (locked, access denied): keep what we have
-        if st is None or not os.path.isfile(path) or st.st_file_attributes & SKIP_FILE_ATTRS:
+        gone = st is None or not os.path.isfile(path) or st.st_file_attributes & SKIP_FILE_ATTRS
+        if gone or name_only:
             if row:
-                db.delete_file(conn, row[0])
+                db.delete_file(conn, row[0])  # deleted, excluded, or its content is not read any more
+            if gone and dir_id is not None:
+                db.unlist_name(conn, dir_id, name)
+                db.drop_dir_if_empty(conn, dir_id)
+            elif name_only:
+                db.list_name(conn, db.add_dir(conn, d) if dir_id is None else dir_id, name)
             return False, None
-        if name_only:
-            if row and not force and row[3] == db.NAME_ONLY and row[1] == st.st_size and row[2] == st.st_mtime_ns:
-                return False, None
-            db.set_name_only(conn, d, name, st.st_size, st.st_mtime_ns, had_text=bool(row) and row[3] != db.NAME_ONLY)
-            return False, None
-        if (row and not force and row[1] == st.st_size and row[2] == st.st_mtime_ns
-                and row[3] not in ("indexing", db.NAME_ONLY)):
+        if row and not force and row[1] == st.st_size and row[2] == st.st_mtime_ns and row[3] != "indexing":
             return False, None  # unchanged ('indexing' is a leftover of an interrupted run: redo)
 
+        if dir_id is None:
+            dir_id = db.add_dir(conn, d)
+        elif row is None:
+            db.unlist_name(conn, dir_id, name)  # it was listed by name while its content was not read
         file_id = conn.execute(
-            """INSERT INTO files (dir, name, size, mtime_ns, status, indexed_at)
+            """INSERT INTO files (dir_id, name, size, mtime_ns, status, indexed_at)
                VALUES (?, ?, ?, ?, 'indexing', ?)
-               ON CONFLICT (dir, name) DO UPDATE SET
+               ON CONFLICT (dir_id, name) DO UPDATE SET
                  name = excluded.name, size = excluded.size, mtime_ns = excluded.mtime_ns,
                  status = 'indexing', encoding = NULL, error = NULL, indexed_at = excluded.indexed_at
                RETURNING id""",
-            (d, name, st.st_size, st.st_mtime_ns, time.time())).fetchone()[0]
+            (dir_id, name, st.st_size, st.st_mtime_ns, time.time())).fetchone()[0]
         db.delete_chunks(conn, file_id, source=CHUNK_SOURCE[stage])
         if st.st_size > max_bytes(kind, self.cfg):
             conn.execute("UPDATE files SET status = 'too_big' WHERE id = ?", (file_id,))

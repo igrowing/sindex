@@ -226,7 +226,7 @@ def test_names_come_after_content_matches_and_respect_filters(named):
     assert [(r["name"], r["hits"]) for r in res["results"]] == [("notes.txt", 1), ("zebra-plan.txt", 0)]
     assert res["results"][0]["snippet"] and not res["results"][1]["snippet"]
     assert res["total"] == 2
-    root = min(r[0] for r in conn.execute("SELECT dir FROM files"))  # the parent of the other folders
+    root = min(r[0] for r in conn.execute("SELECT path FROM dirs"))  # the parent of the other folders
     only_txt = search(conn, "zebra", exts=["txt"], path=root, names=True)
     assert {r["name"] for r in only_txt["results"]} == {"notes.txt", "zebra-plan.txt"}
     assert {r["name"] for r in search(conn, "zebra", exts=["pdf"], names=True)["results"]} == set()

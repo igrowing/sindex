@@ -206,9 +206,12 @@ line). Names adds the folder and file names to the search. Only in names searche
 sensitive ask for, its results have no snippet, and an exclusion alone (`-kyo`) lists every file whose path lacks the
 word, also those without indexed text. The two names boxes are one choice: ticking one clears the other.
 Files whose content sindex cannot read (`.doc`, `.zip`, ...) are in the names only if `index_all_names` is on
-(Settings, "List the names of files that cannot be read", off by default): it stores one row per such file, with no
-text, so the index grows by about 350 bytes per file (59,000 names added 20 MB, and 56 MB of writes, to a scan) and names searches scan more rows. A file excluded by
-extension or name is never listed. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
+(Settings, "List the names of files that cannot be read", off by default): it stores one small row per such file
+(folder number and name; no text, size or date), about 24 bytes each: 324,727 names took 7.8 MB. A scan of 305,000
+files that listed 58,900 names wrote 13 MB more than one without them. Names searches scan more rows, a listed
+file's size and date are read from the disk when it is shown, and a date filter leaves listed files out. A file
+excluded by extension or name is never listed.
+Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
 in contents it checks the text of every file the word index found, so a very common word takes longer.
 Use RegEx turns the whole query into one Python regular expression for the contents (`^` and `$` match at line
 starts and ends) and, with the names box, for the full path (`D:\folder\file.txt`); case is ignored unless Case

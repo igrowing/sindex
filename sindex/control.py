@@ -204,6 +204,8 @@ def media_stats(conn: sqlite3.Connection) -> dict:
 
 def index_stats(conn: sqlite3.Connection, cfg: Config) -> dict:
     by_status = dict(conn.execute("SELECT status, count(*) FROM files GROUP BY status").fetchall())
+    if listed := conn.execute("SELECT count(*) FROM names").fetchone()[0]:
+        by_status[db.NAME_ONLY] = listed
     queued = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
     return {"files": by_status, "total_files": sum(by_status.values()), "queued": queued,
             "db_mb": round(db_size_bytes(cfg) / 1048576, 1), "db_path": str(cfg.db_path),
@@ -217,7 +219,7 @@ def problem_files(conn: sqlite3.Connection, status: str, *, limit: int = 100, of
     """Files that ended with `status` (see RETRY_STATUSES), for the health list."""
     if status not in RETRY_STATUSES:
         raise ValueError(f"no such status {status!r}")
-    rows = conn.execute("SELECT dir, name, size, error FROM files WHERE status = ? ORDER BY dir, name LIMIT ? OFFSET ?",
-                        (status, limit, offset))
+    rows = conn.execute("SELECT d.path, f.name, f.size, f.error FROM files f JOIN dirs d ON d.id = f.dir_id "
+                        "WHERE f.status = ? ORDER BY d.path, f.name LIMIT ? OFFSET ?", (status, limit, offset))
     return [{"path": os.path.join(d, n), "dir": d, "name": n, "size": size, "error": error}
             for d, n, size, error in rows]

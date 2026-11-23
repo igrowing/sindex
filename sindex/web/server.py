@@ -93,13 +93,16 @@ def _local_time(seconds: float) -> str:
 
 def results_csv(results: list[dict]) -> str:
     """The files of a search as CSV: folder, file name, size in bytes, date and time of the file (local time) and the
-    text that the page shows for the file, without its highlighting. Files found by name only have no text."""
+    text that the page shows for the file, without its highlighting. Files found by name only have no text, and a
+    file listed by name that has gone from the disk has no size and date either."""
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\r\n")
     writer.writerow(EXPORT_COLUMNS)
     for r in results:
         content = " ".join(html_unescape(_MARK.sub("", r["snippet"])).split())
-        writer.writerow([_cell(r["dir"]), _cell(r["name"]), r["size"], _local_time(r["mtime"]), _cell(content)])
+        modified = "" if r["mtime"] is None else _local_time(r["mtime"])
+        writer.writerow([_cell(r["dir"]), _cell(r["name"]), "" if r["size"] is None else r["size"], modified,
+                         _cell(content)])
     return out.getvalue()
 
 
@@ -659,11 +662,15 @@ class _Handler(BaseHTTPRequestHandler):
     def _rss_item(self, r: dict) -> str:
         link = "file:///" + quote(r["path"].replace("\\", "/"), safe="/:")
         snippet = regex.sub(r"</?mark>", "", html_unescape(r["snippet"])) if r["snippet"] else ""
-        modified = datetime.fromtimestamp(r["mtime"], tz=UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        modified = size = ""  # a file listed by name that has gone from the disk has neither
+        if r["mtime"] is not None:
+            stamp = datetime.fromtimestamp(r["mtime"], tz=UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+            modified = f"<A:DateModified>{stamp}</A:DateModified>"
+        if r["size"] is not None:
+            size = f"<A:Size>{r['size']}</A:Size>"
         return (
             f"<item><title>{xml_escape(r['name'])}</title><link>{link}</link>"
-            f"<description>{xml_escape(snippet)}</description>"
-            f"<A:DateModified>{modified}</A:DateModified><A:Size>{r['size']}</A:Size></item>"
+            f"<description>{xml_escape(snippet)}</description>{modified}{size}</item>"
         )
 
     def _search_rss(self, q: dict) -> None:

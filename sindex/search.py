@@ -8,7 +8,7 @@ import os
 import sqlite3
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -131,14 +131,15 @@ def _like_pattern(text: str) -> str:
     return escaped.replace("*", "%").replace("?", "_")
 
 
-def _name_condition(groups: list[list[Term]], negatives: list[Term], *,
+def _name_condition(groups: list[list[Term]], negatives: list[Term], *, name: str,
                     case_sensitive: bool = False) -> tuple[str, list[str]]:
-    """SQL for "the path contains the words", built from the same parse as the content query.
+    """SQL for "the path contains the words", built from the same parse as the content query. `name` is the column
+    of the file name (f.name or n.name); the folder is `d.path`.
 
     The words are compared without case and accents unless `case_sensitive` (then exactly as typed, with
     GLOB). `*` and `?` inside a word are wildcards.
     """
-    path = "f.dir || '\\' || f.name"
+    path = f"d.path || '\\' || {name}"
     if case_sensitive:
         test = f"({path}) GLOB ?"
 
@@ -228,15 +229,57 @@ def _closest_together(positions: list[list[int]]) -> tuple[int, int]:
     return best
 
 
-def _file_rows(conn: sqlite3.Connection, ids: list[int]) -> dict[int, tuple[str, str, int, int]]:
-    """file id -> (folder, name, size, mtime_ns) for these files."""
-    rows: dict[int, tuple[str, str, int, int]] = {}
-    for i in range(0, len(ids), 500):
-        batch = ids[i:i + 500]
-        marks = ", ".join("?" for _ in batch)
+@dataclass(frozen=True, slots=True)
+class Listed:
+    """A file of the `names` table: listed by its folder and name alone, without an id, text, size or date."""
+
+    dir_id: int
+    name: str
+
+
+Key = int | Listed  # what a search found: the id of a file with text (or none), or a file listed by name
+
+
+def _batches(items: list, size: int = 500) -> Iterator[tuple[list, str]]:
+    """`items` in parts small enough for one `IN (...)`, each with its question marks."""
+    for i in range(0, len(items), size):
+        batch = items[i:i + size]
+        yield batch, ", ".join("?" for _ in batch)
+
+
+def _folders(conn: sqlite3.Connection, dir_ids: list[int]) -> dict[int, str]:
+    folders: dict[int, str] = {}
+    for batch, marks in _batches(dir_ids):
+        folders.update(conn.execute(f"SELECT id, path FROM dirs WHERE id IN ({marks})", batch).fetchall())
+    return folders
+
+
+def _on_disk(path: str) -> tuple[int | None, int | None]:
+    """(size, mtime_ns) of a file listed by name, which the index does not keep."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None  # gone (or locked) since the last scan, which drops it; shown without size and date
+    return st.st_size, st.st_mtime_ns
+
+
+def _file_rows(conn: sqlite3.Connection, keys: list[Key], *,
+               on_disk: bool) -> dict[Key, tuple[str, str, int | None, int | None]]:
+    """key -> (folder, name, size, mtime_ns) for these files. A file listed by name gets its size and date from the
+    disk when `on_disk` asks for them (None when they cannot be read), and None for both otherwise."""
+    rows: dict[Key, tuple[str, str, int | None, int | None]] = {}
+    ids = [k for k in keys if not isinstance(k, Listed)]
+    for batch, marks in _batches(ids):
         for fid, folder, name, size, mtime in conn.execute(
-                f"SELECT id, dir, name, size, mtime_ns FROM files WHERE id IN ({marks})", batch):
+                "SELECT f.id, d.path, f.name, f.size, f.mtime_ns FROM files f JOIN dirs d ON d.id = f.dir_id "
+                f"WHERE f.id IN ({marks})", batch):
             rows[fid] = (folder, name, size, mtime)
+    listed = [k for k in keys if isinstance(k, Listed)]
+    folders = _folders(conn, sorted({k.dir_id for k in listed}))
+    for k in listed:
+        if (folder := folders.get(k.dir_id)) is not None:  # else dropped from the index since it was found
+            size, mtime = _on_disk(os.path.join(folder, k.name)) if on_disk else (None, None)
+            rows[k] = (folder, k.name, size, mtime)
     return rows
 
 
@@ -245,22 +288,25 @@ def extension_of(name: str) -> str:
     return os.path.splitext(name)[1].lstrip(".").lower()
 
 
-def _extensions(conn: sqlite3.Connection, found: Found) -> dict[int, str]:
+def _extensions(conn: sqlite3.Connection, found: Found) -> dict[Key, str]:
     if found.extensions is None:
-        found.extensions = {fid: extension_of(row[1]) for fid, row in _file_rows(conn, list(found.best)).items()}
+        found.extensions = {key: extension_of(row[1])
+                            for key, row in _file_rows(conn, list(found.best), on_disk=False).items()}
     return found.extensions
 
 
-def _sorted_by_file(conn: sqlite3.Connection, best: dict[int, int | None], sort: str) -> dict[int, int | None]:
-    """`best` (file id -> chunk) in the order of the file's path, name, size or date; equal files keep their order."""
-    rows = {fid: (folder.casefold(), name.casefold(), size, mtime)
-            for fid, (folder, name, size, mtime) in _file_rows(conn, list(best)).items()}
+def _sorted_by_file(conn: sqlite3.Connection, best: dict[Key, int | None], sort: str) -> dict[Key, int | None]:
+    """`best` (file -> chunk) in the order of the file's path, name, size or date; equal files keep their order.
+    A file without a size or date (listed by name, and gone from the disk) comes last either way."""
     column, _, direction = sort.partition("_")
-    keys = {"path": lambda r: (r[0], r[1]), "name": lambda r: (r[1], r[0]), "size": lambda r: r[2],
-            "date": lambda r: r[3]}
-    ordered = sorted((fid for fid in best if fid in rows), key=lambda fid: keys[column](rows[fid]),
-                     reverse=direction == "desc")
-    return {fid: best[fid] for fid in ordered}
+    rows = _file_rows(conn, list(best), on_disk=column in ("size", "date"))
+    value: Callable[[tuple[str, str, int | None, int | None]], Any] = {
+        "path": lambda r: (r[0].casefold(), r[1].casefold()), "name": lambda r: (r[1].casefold(), r[0].casefold()),
+        "size": lambda r: r[2], "date": lambda r: r[3]}[column]
+    known = [key for key in best if key in rows and value(rows[key]) is not None]
+    unknown = [key for key in best if key in rows and value(rows[key]) is None]
+    ordered = sorted(known, key=lambda key: value(rows[key]), reverse=direction == "desc") + unknown
+    return {key: best[key] for key in ordered}
 
 
 class _ChunkMatcher:
@@ -407,6 +453,22 @@ def _media_condition(*, kind: str | None, camera: str | None, has_gps: bool | No
     return where, params
 
 
+def _place_condition(path: str | None, exts: list[str] | None, *, table: str) -> tuple[list[str], list]:
+    """SQL conditions (against `table`, the alias of files or names) for the folder and the extensions."""
+    where: list[str] = []
+    params: list = []
+    if path:
+        root = os.path.normpath(path)
+        # the folders are picked once, not compared again for every file in them
+        where.append(f"{table}.dir_id IN (SELECT id FROM dirs WHERE path = ? OR path LIKE ? ESCAPE '^')")
+        params += [root, db.like_under(root)]
+    if exts:
+        where.append("(" + " OR ".join(f"{table}.name LIKE ? ESCAPE '^'" for _ in exts) + ")")
+        params += ["%." + e.lower().lstrip(".").replace("^", "^^").replace("%", "^%").replace("_", "^_")
+                   for e in exts]
+    return where, params
+
+
 def _date_ns(value: str | None, *, end: bool = False) -> int | None:
     if not value:
         return None
@@ -427,7 +489,7 @@ class Found:
     """What a search found, before it is sorted and cut into pages. The web server keeps it for a while, so that
     another sort order or page does not search (read all the text) again."""
 
-    best: dict[int, int | None]  # file id -> best chunk rowid (None: name match only), in search order
+    best: dict[Key, int | None]  # file -> best chunk rowid (None: name match only), in search order
     hits: dict[int, int]  # file id -> number of chunks that matched
     indexed: set[int]  # the rowids in `best` that the word index found, so snippet() can show them
     seen: set[int]  # every chunk that matched
@@ -441,7 +503,7 @@ class Found:
     # file id -> (distance, chunk rowid) of the chunk in which the searched words are closest to each other;
     # worked out when first asked for
     closest: dict[int, tuple[int, int]] | None = None
-    extensions: dict[int, str] | None = None  # file id -> extension (lower case, no dot, "" for none); same
+    extensions: dict[Key, str] | None = None  # file -> extension (lower case, no dot, "" for none); same
 
     @classmethod
     def empty(cls) -> Found:
@@ -476,7 +538,9 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     With `scan=False` the scan never runs and wild terms find nothing.
 
     `names_only` searches the folder and file names alone (it implies `names`): no stored text is read, so there are
-    no snippets and no scan, however many wildcards, `regex` or `case_sensitive` ask for.
+    no snippets and no scan, however many wildcards, `regex` or `case_sensitive` ask for. The names searched include
+    the files whose content is not read (index_all_names); the index keeps no date or media fields for those, so a
+    date or media filter leaves them out.
 
     `names`, `regex` and `case_sensitive` are independent. `case_sensitive` compares the typed letters exactly,
     in contents and, with `names`, in names; in contents it checks the text of what the word index found, which
@@ -514,16 +578,7 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
         if has_query:
             matcher = _ChunkMatcher.for_terms(groups, negatives, case_sensitive=case_sensitive)
 
-    where = []
-    params: list = []
-    if path:
-        root = os.path.normpath(path)
-        where.append("(f.dir = ? OR f.dir LIKE ? ESCAPE '^')")
-        params += [root, db.like_under(root)]
-    if exts:
-        where.append("(" + " OR ".join("f.name LIKE ? ESCAPE '^'" for _ in exts) + ")")
-        params += ["%." + e.lower().lstrip(".").replace("^", "^^").replace("%", "^%").replace("_", "^_")
-                   for e in exts]
+    where, params = _place_condition(path, exts, table="f")
     if (lo := _date_ns(after)) is not None:
         where.append("f.mtime_ns >= ?")
         params.append(lo)
@@ -537,6 +592,15 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
         taken_after=taken_after, taken_before=taken_before)
     media_join = "JOIN media m ON m.file_id = f.id" if media_where else ""
     chunk_join = f"FROM chunks JOIN files f ON f.id = (chunks.rowid >> {db.CHUNK_BITS}) {media_join}"
+    named_files = f"FROM files f JOIN dirs d ON d.id = f.dir_id {media_join}"  # for a condition on the path
+    # the files listed by name alone: no date or media fields to filter them by
+    listed_too = names and not media_where and after is None and before is None
+    listed_where, listed_params = _place_condition(path, exts, table="n")
+
+    def listed(cond: str, cond_params: list, *, limit: int) -> list[Key]:
+        sql = (f"SELECT n.dir_id, n.name FROM names n JOIN dirs d ON d.id = n.dir_id "
+               f"WHERE {' AND '.join([cond, *listed_where])} LIMIT ?")
+        return [Listed(dir_id, name) for dir_id, name in conn.execute(sql, [*cond_params, *listed_params, limit])]
 
     # what the index found for a term with punctuation is only a guess: "kyo)" is the word kyo to it
     literal = not regex and not names_only and any(_has_punctuation(text) for g in groups for text, _ in g)
@@ -584,23 +648,30 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
             excluded.update(r[0] for r in conn.execute(sql, [words, *params, *media_params]))
         if names:
             conn.create_function("sindex_key", 1, _name_key, deterministic=True)
-            cond, name_params = _name_condition([[term] for term in negatives], [], case_sensitive=case_sensitive)
-            sql = f"SELECT f.id FROM files f {media_join} WHERE {' AND '.join([cond, *where, *media_where])}"
+            cond, name_params = _name_condition([[term] for term in negatives], [], name="f.name",
+                                                case_sensitive=case_sensitive)
+            sql = f"SELECT f.id {named_files} WHERE {' AND '.join([cond, *where, *media_where])}"
             excluded.update(r[0] for r in conn.execute(sql, [*name_params, *params, *media_params]))
         # files without indexed text (binary, too big, failed) are not "without kyo", they are unknown; but their
         # names are known
         status = [] if names_only else ["f.status IN (?, ?)"]
         sql = (f"SELECT f.id FROM files f {media_join} "
                f"WHERE {' AND '.join([*status, *where, *media_where]) or '1'} ORDER BY f.mtime_ns DESC")
-        fids = []
+        keys: list[Key] = []
         for (fid,) in conn.execute(sql, [*([] if names_only else ["ok", "truncated"]), *params, *media_params]):
             if fid in excluded:
                 continue
-            if len(fids) == hit_limit:
+            if len(keys) == hit_limit:
                 found.capped = True
                 break
-            fids.append(fid)
-        found.best = dict.fromkeys(fids)
+            keys.append(fid)
+        if names_only and listed_too and not found.capped:
+            cond, name_params = _name_condition([[term] for term in negatives], [], name="n.name",
+                                                case_sensitive=case_sensitive)
+            more = listed(f"NOT {cond}", name_params, limit=hit_limit - len(keys) + 1)
+            found.capped = len(keys) + len(more) > hit_limit
+            keys += more[:hit_limit - len(keys)]
+        found.best = dict.fromkeys(keys)
     else:
         assert matcher is not None, "a query has a matcher"
         conn.create_function("sindex_chunk", 1, matcher, deterministic=True)
@@ -672,9 +743,9 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
             found.capped = found.capped or scanned >= hit_limit
 
         if names:
-            # the names are not in the FTS index, so this scans the files table; that is why it is opt-in
+            # the names are not in the FTS index, so this scans the files and names tables; that is why it is opt-in
+            slow: list[str] = []  # the first path the pattern did not finish on
             if rx_path is not None:
-                slow: list[str] = []  # the first path the pattern did not finish on
 
                 def path_matches(text: str) -> bool:
                     try:
@@ -684,21 +755,28 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
                         raise
 
                 conn.create_function("sindex_re", 1, path_matches, deterministic=True)
-                cond, name_params = "sindex_re(f.dir || ? || f.name)", ["\\"]
+
+                def name_condition(name: str) -> tuple[str, list[str]]:
+                    return f"sindex_re(d.path || ? || {name})", ["\\"]
             else:
                 conn.create_function("sindex_key", 1, _name_key, deterministic=True)
-                cond, name_params = _name_condition(groups, negatives, case_sensitive=case_sensitive)
-            sql = (f"SELECT f.id FROM files f {media_join} "
-                   f"WHERE {' AND '.join([cond, *where, *media_where])} LIMIT ?")
+
+                def name_condition(name: str) -> tuple[str, list[str]]:
+                    return _name_condition(groups, negatives, name=name, case_sensitive=case_sensitive)
+            cond, name_params = name_condition("f.name")
+            sql = f"SELECT f.id {named_files} WHERE {' AND '.join([cond, *where, *media_where])} LIMIT ?"
             try:
-                by_name = [r[0] for r in conn.execute(sql, [*name_params, *params, *media_params, hit_limit])]
+                by_name: list[Key] = [r[0] for r in conn.execute(
+                    sql, [*name_params, *params, *media_params, hit_limit])]
+                if listed_too:
+                    by_name += listed(*name_condition("n.name"), limit=hit_limit)
             except sqlite3.OperationalError:
-                if not (rx_path is not None and slow):
+                if not slow:
                     raise
                 raise SearchError(f"The regular expression took longer than {REGEX_PATH_TIMEOUT_S:g} s on "
                                   f"{slow[0]}; make it simpler or more specific.") from None
-            for fid in by_name:
-                found.best.setdefault(fid, None)
+            for key in by_name:
+                found.best.setdefault(key, None)
             found.capped = found.capped or len(by_name) >= hit_limit
 
     if len(found.best) > hit_limit:
@@ -709,13 +787,13 @@ def find(conn: sqlite3.Connection, query: str, path: str | None = None, exts: li
     return found
 
 
-def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[int, tuple[int, int]]:
+def _closest_chunks(conn: sqlite3.Connection, found: Found) -> dict[Key, tuple[int, int]]:
     """For each file with two or more searched words: how close they come in its best chunk, and which chunk that
     is. A file has many chunks; the one the word index ranks first is not necessarily the one with the words
     together, and the one with the words together is the one to rank the file by and to show."""
     if found.closest is None:
         assert found.matcher is not None, "proximity needs the words of the query"
-        closest: dict[int, tuple[int, int]] = {}
+        closest: dict[Key, tuple[int, int]] = {}
         for rowid in found.seen:
             fid = rowid >> db.CHUNK_BITS
             if fid not in found.best:
@@ -762,10 +840,20 @@ def present(conn: sqlite3.Connection, found: Found, *, sort: str = "relevance", 
     matcher = found.matcher
 
     results = []
-    for fid, rowid in list(best.items())[offset:None if limit is None else offset + limit]:
+    page = list(best.items())[offset:None if limit is None else offset + limit]
+    listed = _file_rows(conn, [key for key, _ in page if isinstance(key, Listed)], on_disk=True)
+    for fid, rowid in page:
+        if isinstance(fid, Listed):
+            if (row := listed.get(fid)) is not None:
+                folder, name, size, mtime = row
+                results.append({"path": os.path.join(folder, name), "dir": folder, "name": name, "size": size,
+                                "mtime": None if mtime is None else mtime / 1e9, "status": db.NAME_ONLY,
+                                "hits": 0, "snippet": "", "media": None})
+            continue
         f = conn.execute(
-            "SELECT f.dir, f.name, f.size, f.mtime_ns, f.status, m.kind, m.width, m.height, m.duration_s, "
-            "m.taken_at, m.camera FROM files f LEFT JOIN media m ON m.file_id = f.id WHERE f.id = ?",
+            "SELECT d.path, f.name, f.size, f.mtime_ns, f.status, m.kind, m.width, m.height, m.duration_s, "
+            "m.taken_at, m.camera FROM files f JOIN dirs d ON d.id = f.dir_id "
+            "LEFT JOIN media m ON m.file_id = f.id WHERE f.id = ?",
             (fid,)).fetchone()
         if f is None:
             continue

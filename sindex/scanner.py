@@ -50,7 +50,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
     reason = "force" if force else "scan"
     queued = 0
     dirs = 0
-    listed = 0  # files kept by name alone that were added, changed or dropped
+    listed = 0  # names of files whose content is not read that were added or dropped
     stack = [top] if not filt.dir_excluded(top) else []
     conn.execute("BEGIN")
     try:
@@ -58,7 +58,8 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
             d = stack.pop()
             throttle.checkpoint()
             seen: dict[str, tuple[str, int, int]] = {}
-            named: dict[str, tuple[str, int, int]] = {}  # the same for files whose content is not read
+            named: dict[str, str] = {}  # files whose content is not read: kept by their name alone
+            subdirs: list[str] = []
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -69,36 +70,48 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
                         attrs = st.st_file_attributes
                         if attrs & A_DIRECTORY:
                             if not filt.skip_dir_entry(e.path, e.name, attrs):
-                                stack.append(e.path)
+                                subdirs.append(e.path)
                         else:
                             ext = file_ext(e.name)
                             kind = kind_of(ext, cfg)
                             if (kind or lists_name_only(ext, cfg)) and not filt.skip_file_entry(e.path, e.name, attrs):
-                                (seen if kind else named)[e.name.lower()] = (e.name, st.st_size, st.st_mtime_ns)
+                                if kind:
+                                    seen[e.name.lower()] = (e.name, st.st_size, st.st_mtime_ns)
+                                else:
+                                    named[e.name.lower()] = e.name
+                # the stack pops the last one first: folders are walked in ascending order, so that new ones are
+                # numbered in path order and the rows of all of them are appended at the ends of the tables and
+                # their indexes, which fills pages instead of splitting them
+                subdirs.sort(key=str.lower, reverse=True)
+                stack.extend(subdirs)
             except (FileNotFoundError, NotADirectoryError):
                 pass  # gone: every file we know here gets queued (and then removed)
             except OSError as e:
                 log.debug("cannot list %s: %s", d, e)
                 continue  # unreadable is not the same as deleted
 
-            for file_id, name, size, mtime_ns, status in conn.execute(
-                    "SELECT id, name, size, mtime_ns, status FROM files WHERE dir = ?", (d,)).fetchall():
-                entry = seen.pop(name.lower(), None)
-                if (listing := named.pop(name.lower(), None)) is not None:
-                    # written here, not queued: there is no text to extract, so a queue row would only double the writes
-                    if status != db.NAME_ONLY or listing[1] != size or listing[2] != mtime_ns:
-                        db.set_name_only(conn, d, listing[0], listing[1], listing[2], had_text=status != db.NAME_ONLY)
+            dir_id = db.find_dir(conn, d)
+            if dir_id is not None:
+                for file_id, name, size, mtime_ns in conn.execute(
+                        "SELECT id, name, size, mtime_ns FROM files WHERE dir_id = ?", (dir_id,)).fetchall():
+                    entry = seen.pop(name.lower(), None)
+                    if name.lower() in named:
+                        db.delete_file(conn, file_id)  # its content is not read any more: it stays by name alone
+                    elif force or entry is None or entry[1] != size or entry[2] != mtime_ns:
+                        stage, prio = queue_target(name, cfg, force=force)
+                        db.enqueue(conn, os.path.join(d, name), stage, reason=reason, priority=prio)
+                        queued += 1
+                for (name,) in conn.execute("SELECT name FROM names WHERE dir_id = ?", (dir_id,)).fetchall():
+                    if named.pop(name.lower(), None) is None:
+                        db.unlist_name(conn, dir_id, name)  # gone, readable now, or excluded
                         listed += 1
-                elif entry is None and status == db.NAME_ONLY:
-                    conn.execute("DELETE FROM files WHERE id = ?", (file_id,))  # gone, or no longer listed
-                    listed += 1
-                elif force or entry is None or entry[1] != size or entry[2] != mtime_ns or status == db.NAME_ONLY:
-                    stage, prio = queue_target(name, cfg, force=force)
-                    db.enqueue(conn, os.path.join(d, name), stage, reason=reason, priority=prio)
-                    queued += 1
-            for name, size, mtime_ns in named.values():
-                db.set_name_only(conn, d, name, size, mtime_ns, had_text=False)
-                listed += 1
+            if named:
+                # written here, not queued: there is no text to extract, so a queue row would only double the writes
+                if dir_id is None:
+                    dir_id = db.add_dir(conn, d)
+                for key in sorted(named):  # in key order, appended to the folder's part of the table
+                    db.list_name(conn, dir_id, named[key])
+                listed += len(named)
             for name, _, _ in seen.values():
                 stage, prio = queue_target(name, cfg, force=force)
                 db.enqueue(conn, os.path.join(d, name), stage, reason=reason, priority=prio)
@@ -112,18 +125,17 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
                 conn.execute("BEGIN")
 
         # directories we have files for that vanished or became excluded
-        stale = conn.execute(
-            "SELECT DISTINCT dir FROM files WHERE dir = ? OR dir LIKE ? ESCAPE '^'",
-            (top, db.like_under(top)),
-        )
-        for (d,) in stale:  # streamed from the cursor, not materialized
+        stale = conn.execute("SELECT id, path FROM dirs WHERE path = ? OR path LIKE ? ESCAPE '^'",
+                             (top, db.like_under(top)))
+        for dir_id, d in stale:  # streamed from the cursor, not materialized; `dirs` is not changed meanwhile
             throttle.checkpoint()
             if filt.dir_excluded(d) or not os.path.isdir(d):
-                listed += conn.execute("DELETE FROM files WHERE dir = ? AND status = ?", (d, db.NAME_ONLY)).rowcount
-                for (name,) in conn.execute("SELECT name FROM files WHERE dir = ?", (d,)).fetchall():
+                listed += conn.execute("DELETE FROM names WHERE dir_id = ?", (dir_id,)).rowcount
+                for (name,) in conn.execute("SELECT name FROM files WHERE dir_id = ?", (dir_id,)).fetchall():
                     stage, prio = queue_target(name, cfg)
                     db.enqueue(conn, os.path.join(d, name), stage, reason="scan", priority=prio)
                     queued += 1
+        db.drop_empty_dirs(conn, top)  # the folders of queued files go when the indexer removes their last file
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")

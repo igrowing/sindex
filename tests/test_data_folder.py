@@ -23,8 +23,8 @@ def home(tmp_path, monkeypatch):
 def _make_index(path, name="kept.txt"):
     conn = db.connect(path)
     db.init(conn)
-    conn.execute("INSERT INTO files (dir, name, size, mtime_ns, status, indexed_at) VALUES ('d', ?, 1, 1, 'ok', 1)",
-                 (name,))
+    conn.execute("INSERT INTO files (dir_id, name, size, mtime_ns, status, indexed_at) VALUES (?, ?, 1, 1, 'ok', 1)",
+                 (db.add_dir(conn, "d"), name))
     conn.close()
 
 

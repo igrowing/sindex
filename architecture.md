@@ -170,7 +170,7 @@ Hard boundaries:
 |---|---|
 | `config.py` | `Config` dataclass, TOML load / validate / render / apply, `Spec`, logging setup. |
 | `filters.py` | `PathFilter`: roots, exclusion globs, hidden files, `file_kind()`. |
-| `scanner.py` | One-directory-at-a-time walk that reconciles a subtree with the `files` table and fills `queue`. |
+| `scanner.py` | One-directory-at-a-time walk that reconciles a subtree with the `files` and `names` tables and fills `queue`. |
 | `usn.py` | NTFS change journal (`Journal`, `Change`, `JournalError`), drive discovery. |
 | `throttle.py` | `Throttle` (duty cycle, pause rules, read rate), `ThrottledReader`, Job Object and priority setup. |
 | `indexer.py` | The indexer process: queue loop, write batching, volumes, requests, maintenance, status file. |
@@ -383,14 +383,30 @@ classDiagram
 One SQLite file (`index.db`) in WAL mode. `chunks` is an FTS5 table; a file's chunks occupy a reserved rowid range, so
 no separate mapping table is needed: `file_id = chunks.rowid >> 16`.
 
+A folder path is stored once, in `dirs`, and files refer to it by number. `names` holds the files whose content is not
+read (`index_all_names`), with only what a search in names needs: no row id, size or date. A file is in `files` or in
+`names`, never both. Schema 1 kept the path in every `files` row and again in its unique index; `db.init()` converts
+such an index in one transaction. On a copy of a real index (597,177 files in 57,330 folders) the file list went from
+138.9 MB to 44.1 MB: `files` 24.3 MB, `dirs` 11.9 MB, `names` 7.8 MB for 324,727 listed files.
+
 ```mermaid
 erDiagram
+    dirs ||--o{ files : "id = dir_id"
+    dirs ||--o{ names : "id = dir_id"
     files ||--o{ chunks : "rowid >> CHUNK_BITS = id"
     files ||--o| media : "file_id"
+    dirs {
+        INTEGER id PK "numbered in path order"
+        TEXT path "NOCASE, UNIQUE"
+    }
+    names {
+        INTEGER dir_id PK "WITHOUT ROWID"
+        TEXT name PK "NOCASE"
+    }
     files {
         INTEGER id PK
-        TEXT dir "NOCASE"
-        TEXT name "NOCASE, UNIQUE with dir"
+        INTEGER dir_id
+        TEXT name "NOCASE, UNIQUE with dir_id"
         INTEGER size
         INTEGER mtime_ns
         TEXT status "indexing, ok, truncated, empty, binary, too_big, error"

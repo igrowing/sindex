@@ -7,10 +7,9 @@ from sindex.extract import MediaFields
 
 
 def _make_file(conn, dir_: str, name: str) -> int:
-    conn.execute(
-        "INSERT INTO files (dir, name, size, mtime_ns, status, indexed_at) VALUES (?, ?, 0, 0, 'ok', ?)",
-        (dir_, name, time.time()))
-    return conn.execute("SELECT id FROM files WHERE dir = ? AND name = ?", (dir_, name)).fetchone()[0]
+    return conn.execute(
+        "INSERT INTO files (dir_id, name, size, mtime_ns, status, indexed_at) VALUES (?, ?, 0, 0, 'ok', ?) "
+        "RETURNING id", (db.add_dir(conn, dir_), name, time.time())).fetchone()[0]
 
 
 def test_upsert_media_inserts_a_row(cfg, tmp_path):
