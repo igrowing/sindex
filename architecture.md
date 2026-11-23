@@ -70,7 +70,7 @@ flowchart TB
 
     Ind -->|"read + write"| DB
     Web -.->|"read-only"| DB
-    CLI -.->|"read-only (search, status)"| DB
+    CLI -.->|"read-only (search, status, du)"| DB
     Web -->|"writes requests"| Files
     Ind -->|"reads requests, writes status"| Files
     Sup -->|"writes"| Cfg
@@ -111,6 +111,7 @@ flowchart TB
         search["search.py"]
         control["control.py"]
         scanner["scanner.py"]
+        datadir["datadir.py"]
     end
 
     subgraph L2["Rules and OS access"]
@@ -132,9 +133,13 @@ flowchart TB
     service --> indexer
     service --> webs
     service --> control
+    service --> datadir
     webs --> search
     webs --> control
+    webs --> datadir
     webs --> db
+    webs --> config
+    webs --> usn
     indexer --> scanner
     indexer --> db
     indexer --> control
@@ -144,12 +149,20 @@ flowchart TB
     indexer --> throttle
     scanner --> db
     scanner --> filters
+    scanner --> extract
+    scanner --> throttle
     search --> db
     search --> textnorm
     control --> db
+    control --> config
+    control --> usn
+    datadir --> db
+    datadir --> config
     db --> usn
     db --> textnorm
+    db --> extract
     filters --> config
+    filters --> extract
     extract --> config
     extract --> throttle
     extract --> textnorm
@@ -169,20 +182,21 @@ Hard boundaries:
 | Module | Responsibility |
 |---|---|
 | `config.py` | `Config` dataclass, TOML load / validate / render / apply, `Spec`, logging setup. |
-| `filters.py` | `PathFilter`: roots, exclusion globs, hidden files, `file_kind()`. |
+| `filters.py` | `PathFilter`: roots, exclusion globs, hidden files, `file_kind()` (content is read) and `lists_name()` (only the name is kept). |
 | `scanner.py` | One-directory-at-a-time walk that reconciles a subtree with the `files` and `names` tables and fills `queue`. |
 | `usn.py` | NTFS change journal (`Journal`, `Change`, `JournalError`), drive discovery. |
 | `throttle.py` | `Throttle` (duty cycle, pause rules, read rate), `ThrottledReader`, Job Object and priority setup. |
-| `indexer.py` | The indexer process: queue loop, write batching, volumes, requests, maintenance, status file. |
-| `extract/__init__.py` | `kind_of`, `max_bytes`, `Context`, `MediaFields`, dispatch `extract()`. |
+| `indexer.py` | The indexer process: queue loop, write batching, volumes, requests, maintenance, measuring the stored text of an older index, status file. |
+| `extract/__init__.py` | `kind_of`, `lists_name_only`, `file_ext`, `max_bytes`, `Context`, `MediaFields`, dispatch `extract()`. |
 | `extract/job.py` | `Task`, `Chunk`, `Result` messages and `run_job()`, which turns a file into normalized chunks. |
 | `extract/pool.py` | `InlineRunner` and `ProcessPool`, behind one interface. |
 | `textnorm.py` | Case/accent folding, CJK bigrams, Greek/Hebrew/Arabic marks, chunking. |
-| `db.py` | Schema, `connect()`, queue and media helpers, location check. |
-| `search.py` | Query language, `build_match()`, `search()`, snippets. |
-| `control.py` | Control-file writers (pause, requests, settings), status and statistics readers, log reader. |
-| `service.py` | `Supervisor`, `SindexService` (pywin32), install helpers, `run_core`. |
-| `web/server.py` | HTTP routes, token and Host checks, `SearchRegistry` for cancelling superseded searches. |
+| `db.py` | Schema (version 3) and its conversion from older ones, `connect()`, folder (`dirs`), listed-name (`names`), queue and media helpers, location check. |
+| `search.py` | Query language, `build_match()`, `find()` (what matches) and `present()` (sorted page with snippets), `search()` for both, the names modes. |
+| `control.py` | Control-file writers (pause, requests, settings, data folder), status and statistics readers, `disk_use()` (what takes the space, by folder), folder browser, log reader. |
+| `datadir.py` | Moving the data folder (config, index, logs): `plan()` checks, `switch()` copies or adopts; run by the supervisor between two indexers. |
+| `service.py` | `Supervisor` (also applies settings and data-folder changes), `SindexService` (pywin32), install helpers, `run_core`. |
+| `web/server.py` | HTTP routes, token and Host checks, `SearchRegistry` for cancelling superseded searches, `FoundCache` that keeps a tab's finished or running search for another sort or page. |
 | `cli.py` | Subcommands, shortcuts, context menu, App Paths, Explorer search connector, elevation. |
 
 ---
@@ -213,6 +227,7 @@ classDiagram
         +skip_file_entry() bool
         +dir_excluded(path) bool
         +file_kind(path) str
+        +lists_name(path) bool
     }
 
     class Throttle {
@@ -264,6 +279,7 @@ classDiagram
         -_commit()
         -_prepare_file()
         -_on_message(msg)
+        -_measure_text() bool
     }
 
     class Volume {
@@ -299,7 +315,7 @@ classDiagram
 
     class InlineRunner
     class ProcessPool
-    class Worker {
+    class _Worker {
         <<dataclass>>
         +Process process
         +Connection conn
@@ -325,6 +341,8 @@ classDiagram
         +int job
         +str status
         +str error
+        +str encoding
+        +bool recycle
         +MediaFields media
     }
 
@@ -361,13 +379,13 @@ classDiagram
 
     Runner <|.. InlineRunner
     Runner <|.. ProcessPool
-    ProcessPool o-- Worker
+    ProcessPool o-- _Worker
     Indexer ..> Task : submits
     Chunk ..> Indexer : stored by
     Result ..> Indexer : closes a job
     InlineRunner ..> Result
     ProcessPool ..> Chunk
-    Worker ..> Context : run_job()
+    _Worker ..> Context : run_job()
     Context --> Throttle
     Context --> MediaFields
     Result --> MediaFields
@@ -385,8 +403,11 @@ no separate mapping table is needed: `file_id = chunks.rowid >> 16`.
 
 A folder path is stored once, in `dirs`, and files refer to it by number. `names` holds the files whose content is not
 read (`index_all_names`), with only what a search in names needs: no row id, size or date. A file is in `files` or in
-`names`, never both. Schema 1 kept the path in every `files` row and again in its unique index; `db.init()` converts
-such an index in one transaction. On a copy of a real index (597,177 files in 57,330 folders) the file list went from
+`names`, never both; statistics and search results show a listed file with the status `name_only`. A folder number is
+dropped again when its last file or name goes. Folders are walked in ascending path order, so new folder numbers and
+the rows after them are appended at the ends of the tables and indexes instead of splitting pages. Schema 1 kept the
+path in every `files` row and again in its unique index; `db.init()` converts such an index (1 to 2 to 3) in one
+transaction per step. On a copy of a real index (597,177 files in 57,330 folders) the file list went from
 138.9 MB to 44.1 MB: `files` 24.3 MB, `dirs` 11.9 MB, `names` 7.8 MB for 324,727 listed files. Schema 3 adds
 `files.text_bytes`, the size of a file's stored text, for the disk use report (`control.disk_use`); it is a plain
 `ALTER TABLE`, and the indexer measures the files of an older index while idle.
@@ -433,6 +454,9 @@ erDiagram
         REAL lat
         REAL lon
         TEXT codec
+        TEXT ocr_hash "reserved"
+        TEXT ocr_lang "reserved"
+        REAL ocr_at "reserved"
     }
     queue {
         TEXT path PK "with stage"
@@ -451,12 +475,12 @@ erDiagram
     }
     meta {
         TEXT key PK
-        TEXT value "JSON: rules, maintenance_pending, last_maintenance"
+        TEXT value "JSON: schema_version, rules, roots, maintenance_pending, last_maintenance, queue_priorities_migrated"
     }
 ```
 
 `queue`, `volumes` and `meta` carry the indexer's persistent state, which is why a recycle or crash loses nothing.
-`ocr_*` columns and the `ocr` stage are reserved for a later phase.
+The `ocr_*` columns of `media` and the `ocr` stage are reserved for a later phase.
 
 **Queue priorities** (lower number first): forced reindex 1, directory scan 5, easy text 10, photo/video metadata 12,
 hard formats (PDF, Office, RTF) 15. Cheap files become searchable first.
@@ -485,8 +509,9 @@ sequenceDiagram
         I->>I: scanner.scan(top) - queue changed files
     else stage is text or meta
         I->>D: BEGIN (if no open batch)
-        I->>I: _prepare_file: stat, unchanged? too big? gone?
-        I->>D: INSERT/UPSERT files row (status = indexing)
+        I->>I: _prepare_file: stat, unchanged? too big? gone? only listed by name?
+        Note over I,D: a file whose content is not read (index_all_names) only gets a row in names:<br/>no Task, no chunks, no queue round trip
+        I->>D: find or add the folder in dirs, INSERT/UPSERT files row (status = indexing)
         I->>D: DELETE old chunks of this source
         I->>R: submit(Task(job, path, kind, max_chunks))
         R->>W: Task over pipe
@@ -500,7 +525,7 @@ sequenceDiagram
         end
         W-->>R: Result(job, status, error, encoding, media)
         R-->>I: Result
-        I->>D: UPDATE files SET status, encoding, error
+        I->>D: UPDATE files SET status, encoding, error, text_bytes
         opt image or video
             I->>D: upsert media row
         end
@@ -535,8 +560,10 @@ flowchart LR
     out --> chunks["textnorm.chunks + normalize"]
 ```
 
-`kind_of(ext, cfg)` decides the kind from the extension and the configuration. Files without a configured extension
-are not indexed, and media kinds are only produced when `index_media_metadata` is on.
+`kind_of(ext, cfg)` decides the kind from the extension and the configuration. Media kinds are only produced when
+`index_media_metadata` is on. A file without a kind is not read, and is not in the index at all unless
+`index_all_names` is on and the extension is not excluded (`lists_name_only`): then its folder and name are kept in
+`names`. The scanner writes those rows itself and never queues them, since there is no text to extract.
 
 ---
 
@@ -554,7 +581,7 @@ flowchart TD
     q --> wrap{"journal id changed or<br/>next_usn below lowest?"}
     wrap -->|yes| flag["needs_scan = True"]
     wrap -->|no| read["Journal.read(): changes since next_usn<br/>filtered by _wanted()"]
-    read --> chg["_on_change: skip excluded parents<br/>dir change: stage dir<br/>file change: stage from queue_target()"]
+    read --> chg["_on_change: skip excluded parents<br/>dir change: stage dir<br/>file of an unreadable type: listed or dropped at once<br/>other file change: stage from queue_target()"]
     chg --> enq
     chg --> save["save next_usn in the same transaction"]
     poll -->|no| qproc
@@ -568,9 +595,12 @@ flowchart TD
 * Reading the journal needs administrator rights. Without them, or on a volume without a journal, the indexer falls
   back to a periodic rescan (`rescan_hours`).
 * A deleted or newly excluded file is queued too; `_prepare_file` then finds it missing or filtered and removes its
-  rows.
-* When indexing rules change (`exclude_globs`, extensions, hidden files, size limits, media switch), the new rules
-  are stored in `meta` only after the rescan they cause has finished, so an interrupted rescan restarts.
+  rows. Listed names are not queued: the scanner and `_on_change` add or drop them directly.
+* A scan walks the folders of a subtree in ascending path order and commits every 200 folders.
+* When indexing rules change (`exclude_paths`, `exclude_globs`, `exclude_extensions`, `text_extensions`, hidden
+  files, the media switch, `index_all_names`), the new rules are stored in `meta` only after the rescan they cause has
+  finished, so an interrupted rescan restarts. The size limits are not among them: after raising one, the Health tab's
+  Retry queues the `too_big` files again.
 
 ---
 
@@ -586,26 +616,31 @@ sequenceDiagram
     participant B as Browser (index.html)
     participant H as web _Handler
     participant S as SearchRegistry
-    participant Q as search.search()
+    participant Q as search.find() and present()
     participant D as index.db (read-only)
 
-    U->>B: types
-    B->>H: GET /api/search?query=...&quick=1&tab=T&seq=n (after 0.2 s)
+    U->>B: types, then pauses (search_complete_after_s) or presses Enter
+    B->>H: GET /api/search?query=...&tab=T&seq=n&per_page=N
     H->>H: Host header check (DNS-rebinding guard)
     H->>S: begin(tab, seq, 30 s)
     Note over S: a newer seq of the same tab<br/>cancels the older ticket
     H->>D: db.connect(readonly=True)
-    H->>Q: search(conn, query, hit_limit=200)
+    H->>Q: find(conn, query, filters, names, regex, case)
     Q->>Q: _parse + _to_match (FTS5 MATCH string)
-    Q->>D: chunks MATCH ? JOIN files ORDER BY rank LIMIT
+    Q->>D: chunks MATCH ? JOIN files JOIN dirs ORDER BY rank LIMIT HIT_LIMIT (2000)
+    opt names or names only
+        Q->>D: scan files and names (folder + name)
+    end
     Note over D,S: SQLite progress handler polls ticket.should_stop()
-    D-->>Q: rowids
+    D-->>Q: file ids, chunk rowids, listed names
+    Q-->>H: Found (kept in FoundCache for 2 minutes)
+    H->>Q: present(found, sort, offset, limit)
     Q->>D: snippet() for the page of results
     Q-->>H: results, total, capped
     H->>S: end(tab, ticket)
     H-->>B: JSON
-    B->>H: GET /api/search?... (full limit 2000, after search_complete_after_s)
-    H-->>B: JSON (replaces the quick result)
+    B->>H: GET /api/search?...&reuse=1 (another sort, page or extension filter)
+    H-->>B: JSON from the kept Found, without searching again
 ```
 
 Search features, all in `search.py`:
@@ -615,9 +650,14 @@ Search features, all in `search.py`:
 * What the word index cannot answer reads stored text, through Python functions registered on the connection:
   a `*` or `?` at the start or inside a word (`*kyo`) and regular expressions scan every chunk; case sensitivity
   and punctuation check the text of the chunks the index returned. `search.is_slow()` names these searches.
-* Optional `names` mode that also scans folder and file names (a table scan, so opt-in).
+* Optional `names` mode that also scans folder and file names (a table scan, so opt-in), and `names_only`, which
+  searches the names alone: no stored text is read, so it is never slow, whatever wildcards, RegEx or case ask for,
+  and its results have no snippet. Names come from `files` and, for files whose content is not read
+  (`index_all_names`), from `names`; the size and date of those are read from the disk when a result is shown or
+  sorted.
 * Filters: path, extensions, modified date range, and the media filters (camera, GPS, size, duration, date taken).
-  With media filters and no words it browses by filter alone, newest first.
+  A date or media filter leaves listed files out, since the index keeps neither for them. With media filters and no
+  words it browses by filter alone, newest first.
 * At most two fast searches run at once; one over 30 s is stopped. Slow searches run one at a time in the
   background with no time limit, as long as their page keeps polling them (below).
 
@@ -661,10 +701,11 @@ connector, described by `/opensearch.xml`), and the `sindex <words>` shortcut th
 |---|---|---|---|
 | `/`, `/settings`, `/log` and `/style.css` | GET | none | Static pages, with `{{TOKEN}}` and `{{VERSION}}` substituted |
 | `/api/search`, `/api/search.rss`, `/opensearch.xml` | GET | none | Search |
+| `/api/search/cancel` | GET | none | Stop the running search of a browser tab (the page calls it when the text changes) |
 | `/api/export.csv` | GET | none | All files of the page's search as CSV (same parameters as `/api/search`) |
 | `/api/status`, `/api/settings`, `/api/health` | GET | none | State, current settings, problem files |
-| `/api/browse`, `/api/log` | GET | token | Folder picker, log viewer (they reveal local paths) |
-| `/api/pause`, `/api/resume`, `/api/reindex`, `/api/retry`, `/api/rebuild`, `/api/maintenance`, `/api/settings`, `/api/open` | POST | token | Control actions |
+| `/api/browse`, `/api/log`, `/api/usage` | GET | token | Folder picker, log viewer, disk use by folder (they reveal local paths) |
+| `/api/pause`, `/api/resume`, `/api/reindex`, `/api/retry`, `/api/rebuild`, `/api/maintenance`, `/api/settings`, `/api/data-folder`, `/api/open` | POST | token | Control actions |
 
 All requests must carry a `Host` of `127.0.0.1`, `localhost` or `[::1]` with the configured port. POSTs are
 serialized by a lock and verified with a constant-time token comparison.
@@ -681,7 +722,7 @@ flowchart LR
     subgraph writers["Writers (web UI, CLI)"]
         wp["control.pause / resume"]
         wr["control.request_reindex / retry / rebuild / maintenance"]
-        ws["control.request_settings"]
+        ws["control.request_settings / request_data_folder"]
     end
 
     subgraph files["Data directory"]
@@ -718,8 +759,9 @@ flowchart LR
 | `{"path": ...}` | `Indexer._handle_request` | Enqueue a forced `dir` or file entry. |
 | `{"status": ...}` | `Indexer._retry_status` | Requeue every file that ended with that status. |
 | `{"rebuild": true}` | `Indexer._handle_request` | Enqueue a forced scan of every root. |
-| `{"maintenance": ...}` | `Indexer._run_maintenance` | `optimize` (FTS merge) or `compact` (VACUUM), run only when the queue is empty. |
+| `{"maintenance": ...}` | `Indexer._run_maintenance` | `optimize` (FTS merge) or `vacuum` (VACUUM, "Compact database" in the UI), run only when the queue is empty. |
 | settings request | `Supervisor._apply_settings` | Validated by the web layer, written to `config.toml` by the service, then the indexer restarts. A rejected change leaves the file as it was and is shown in the status. |
+| data folder request (also in `settings-requests/`) | `Supervisor._queue_data_folder`, `_switch_data_folder` | Checked at once by `datadir.plan()`, carried out between two indexers by `datadir.switch()`, which copies the data or adopts the folder and records it for the next start; the indexer stays stopped until the service is restarted. |
 
 The page validates before it writes a request, and the supervisor validates again, because `config.toml` may have been
 edited by hand in between.
@@ -728,7 +770,8 @@ edited by hand in between.
 
 ## 9. Indexer lifecycle (state diagram)
 
-States follow `status.json` (`state`) plus the process-level outcomes the supervisor reacts to.
+States follow `status.json` (`state`) plus the process-level outcomes the supervisor reacts to. The file also says
+`working` for the moment after a pause ends.
 
 ```mermaid
 stateDiagram-v2
@@ -743,7 +786,9 @@ stateDiagram-v2
     Indexing --> Scanning: dir entry reached
     Indexing --> Idle: queue empty (commit, small FTS merge)
     Idle --> Maintenance: request pending and queue empty
-    Maintenance --> Idle: optimize or compact finished
+    Maintenance --> Idle: optimize or vacuum finished
+    Idle --> Measuring: files of an older index lack text_bytes
+    Measuring --> Idle: a batch of 500 files measured (repeats until none are left)
 
     Idle --> Paused: user flag, battery, outside schedule, system busy
     Indexing --> Paused
@@ -822,8 +867,10 @@ count so the limit holds for the whole indexer.
 
 ## 11. Design rules that the diagrams rely on
 
-1. **One writer.** Only `indexer.py` (with `scanner.py` and the `db.py` helpers it drives) writes `index.db`. The web
-   layer and CLI open it with `db.connect(..., readonly=True)`.
+1. **One writer.** Only `indexer.py` (with `scanner.py` and the `db.py` helpers it drives) writes `index.db`, and
+   it converts an older schema when it starts. The web layer and CLI open it with `db.connect(..., readonly=True)`.
+   The one other touch is `datadir.switch()`, which merges the write-ahead log (`db.checkpoint()`) before copying the
+   index, and only while no indexer runs.
 2. **The queue is the source of truth for pending work.** Everything the indexer wants to do later is a row in
    `queue`, so recycling, crashes and restarts are safe.
 3. **Never half a file.** A file's rows are visible only after its `Result` arrives and its batch commits. Commits wait
@@ -849,14 +896,15 @@ flowchart LR
     exe["sindex.exe"] --> svc["service<br/>(started by SCM)"]
     exe --> idx["indexer<br/>(started by the service)"]
     exe --> wrk["multiprocessing spawn<br/>(parsing workers, via freeze_support)"]
-    exe --> cmds["install, remove, start, stop,<br/>run, index, search, status,<br/>pause, resume, reindex, ui"]
+    exe --> cmds["install, remove, start, stop,<br/>run, index, search, status, du,<br/>pause, resume, reindex, ui"]
     svc -->|Popen| idx
     idx -->|spawn| wrk
 ```
 
 `sindex install` copies the program folder to `%ProgramFiles%\sindex`, registers the service (delayed automatic start,
 LocalSystem), and creates the Desktop and Start menu shortcuts, the folder context-menu verb, the App Paths entry and
-the Explorer search connector. `sindex remove` undoes all of them.
+the Explorer search connector. It stops a running service to replace its files and starts it again if it was running
+(or with `--start`). `sindex remove` undoes all of them.
 
 ---
 
@@ -983,11 +1031,11 @@ flowchart TB
         host{"Host header is 127.0.0.1,<br/>localhost or [::1] with our port?"}
         route["GET routes: search, status, pages"]
         tok{"Token valid?<br/>(constant-time compare)"}
-        priv["POST routes, /api/browse, /api/log:<br/>control files and settings"]
+        priv["POST routes, /api/browse, /api/log, /api/usage:<br/>control files and settings"]
         host -->|yes| route
         host -->|"no (DNS rebinding)"| deny["403 forbidden"]
         route --> tok
-        tok -->|"needed by POST, browse, log"| priv
+        tok -->|"needed by POST, browse, log, usage"| priv
         tok -->|"invalid"| deny
     end
 ```
@@ -996,7 +1044,7 @@ flowchart TB
 |---|---|
 | Another computer reads the index | The server listens on `127.0.0.1`. `config.check_web_host` accepts only an IPv4 loopback address: `config.load` raises `ConfigError` (the service does not start) and `WebServer.start` refuses to start on anything else or on a socket bound elsewhere. |
 | A web page in a browser reaches the server under a foreign name (DNS rebinding) | The `Host` header must be `127.0.0.1`, `localhost` or `[::1]` with the configured port. |
-| A web page or program pauses the indexer, changes settings, browses folders or reads logs | The token (`X-Sindex-Token`, compared with `hmac.compare_digest`) on every POST, `/api/browse` and `/api/log`. Settings are validated before they are written. |
+| A web page or program pauses the indexer, changes settings, browses folders, reads logs or lists the folders of the index | The token (`X-Sindex-Token`, compared with `hmac.compare_digest`) on every POST, `/api/browse`, `/api/log` and `/api/usage`. Settings are validated before they are written. |
 | Oversized or malformed requests | `MAX_BODY` bounds the body; bodies must be a JSON object; at most two fast searches run at once and stop after 30 s; one slow search runs at a time and stops 10 s after its page stops polling. |
 
 **Not protected, on purpose:**
