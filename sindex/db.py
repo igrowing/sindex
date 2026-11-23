@@ -15,6 +15,8 @@ SCHEMA_VERSION = 1
 INDEX_NAME = "index.db"
 _INDEX_TABLES = frozenset({"meta", "files", "chunks", "queue"})  # what a file needs to be taken for an index
 
+NAME_ONLY = "name_only"  # files.status of a file that is listed by its name alone
+
 # Queue stages and their default priorities (lower runs first).
 STAGE_DIR = "dir"
 STAGE_TEXT = "text"
@@ -42,7 +44,7 @@ CREATE TABLE IF NOT EXISTS files (
     name TEXT NOT NULL COLLATE NOCASE,
     size INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
-    status TEXT NOT NULL,        -- ok | truncated | empty | binary | too_big | error
+    status TEXT NOT NULL,        -- ok | truncated | empty | binary | too_big | error | name_only
     encoding TEXT,
     error TEXT,
     indexed_at REAL NOT NULL,
@@ -198,6 +200,22 @@ def upsert_media(conn: sqlite3.Connection, file_id: int, fields: MediaFields) ->
              lat = excluded.lat, lon = excluded.lon, codec = excluded.codec""",
         (file_id, fields.kind, fields.width, fields.height, fields.duration_s, fields.taken_at,
          fields.camera, fields.lat, fields.lon, fields.codec))
+
+
+def set_name_only(conn: sqlite3.Connection, d: str, name: str, size: int, mtime_ns: int, *,
+                  had_text: bool) -> None:
+    """Keep a file whose content is not read in the index by its name alone; `had_text`: it was read before."""
+    file_id = conn.execute(
+        """INSERT INTO files (dir, name, size, mtime_ns, status, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (dir, name) DO UPDATE SET
+             name = excluded.name, size = excluded.size, mtime_ns = excluded.mtime_ns, status = excluded.status,
+             encoding = NULL, error = NULL, indexed_at = excluded.indexed_at
+           RETURNING id""",
+        (d, name, size, mtime_ns, NAME_ONLY, time.time())).fetchone()[0]
+    if had_text:
+        delete_chunks(conn, file_id)
+        conn.execute("DELETE FROM media WHERE file_id = ?", (file_id,))
 
 
 def delete_file(conn: sqlite3.Connection, file_id: int) -> None:

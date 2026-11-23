@@ -66,6 +66,11 @@ def kind_of(ext: str, cfg: Config) -> str | None:
     return None
 
 
+def lists_name_only(ext: str, cfg: Config) -> bool:
+    """Whether a file with this extension, whose content cannot be read, is still listed by its name."""
+    return cfg.index_all_names and kind_of(ext, cfg) is None and not (cfg.exclude_extensions and cfg.ext_excluded(ext))
+
+
 def max_bytes(kind: str, cfg: Config) -> int:
     mb = {"pdf": cfg.max_pdf_mb, "ooxml": cfg.max_office_mb, "odf": cfg.max_office_mb,
           "image": cfg.max_media_mb, "video": cfg.max_media_mb}.get(kind, cfg.max_text_mb)

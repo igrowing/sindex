@@ -76,6 +76,9 @@ class Config:
     max_pdf_mb: int = 100
     max_chars_per_file: int = 5_000_000
     chunk_chars: int = 16_000
+    # also list the files whose content cannot be read (.doc, .exe-like leftovers, .zip ...) by name, so that a
+    # search in names finds them; costs one row of the files table each and no text
+    index_all_names: bool = False
     index_media_metadata: bool = False  # EXIF/XMP/IPTC for photos, container tags for videos; header-only
     max_media_mb: int = 4000  # size ceiling before the file is even opened; only the header is ever read
     # [throttle]
@@ -184,7 +187,7 @@ class Spec:
 SPECS: dict[str, Spec] = {
     "roots": Spec(list, items="root"), "exclude_paths": Spec(list, items="path"),
     "exclude_extensions": Spec(list, items="extpat"), "exclude_globs": Spec(list, items="glob"),
-    "index_hidden": Spec(bool), "text_extensions": Spec(list, items="ext"),
+    "index_hidden": Spec(bool), "index_all_names": Spec(bool), "text_extensions": Spec(list, items="ext"),
     "max_text_mb": Spec(int, 1, 100_000), "max_office_mb": Spec(int, 1, 100_000),
     "max_pdf_mb": Spec(int, 1, 100_000), "max_chars_per_file": Spec(int, 1000, 2_000_000_000),
     "chunk_chars": Spec(int, 1000, 1_000_000),
@@ -363,6 +366,9 @@ exclude_extensions = {exclude_extensions}
 # the whole path ("*\\.ssh\\*", "D:\\Private\\*"). * matches any text, ? one character, case is ignored.
 exclude_globs = {exclude_globs}
 index_hidden = {index_hidden}
+# Also list files whose content cannot be read (.doc, .zip, ...) by their folder and file name, so that a
+# search in names finds them. It adds one row to the index for every such file, but no text.
+index_all_names = {index_all_names}
 # Files with these extensions are indexed as text (HTML and XML-like ones without their tags). Add your
 # own; PDF, Office and RTF files are always read by their own readers.
 text_extensions = {text_extensions}

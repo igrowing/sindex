@@ -13,7 +13,7 @@ from collections.abc import Callable
 
 from . import db
 from .config import Config
-from .extract import MEDIA_KINDS, file_ext, kind_of
+from .extract import MEDIA_KINDS, file_ext, kind_of, lists_name_only
 from .filters import A_DIRECTORY, PathFilter
 from .throttle import Throttle
 
@@ -50,6 +50,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
     reason = "force" if force else "scan"
     queued = 0
     dirs = 0
+    listed = 0  # files kept by name alone that were added, changed or dropped
     stack = [top] if not filt.dir_excluded(top) else []
     conn.execute("BEGIN")
     try:
@@ -57,6 +58,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
             d = stack.pop()
             throttle.checkpoint()
             seen: dict[str, tuple[str, int, int]] = {}
+            named: dict[str, tuple[str, int, int]] = {}  # the same for files whose content is not read
             try:
                 with os.scandir(d) as it:
                     for e in it:
@@ -68,21 +70,35 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
                         if attrs & A_DIRECTORY:
                             if not filt.skip_dir_entry(e.path, e.name, attrs):
                                 stack.append(e.path)
-                        elif kind_of(file_ext(e.name), cfg) and not filt.skip_file_entry(e.path, e.name, attrs):
-                            seen[e.name.lower()] = (e.name, st.st_size, st.st_mtime_ns)
+                        else:
+                            ext = file_ext(e.name)
+                            kind = kind_of(ext, cfg)
+                            if (kind or lists_name_only(ext, cfg)) and not filt.skip_file_entry(e.path, e.name, attrs):
+                                (seen if kind else named)[e.name.lower()] = (e.name, st.st_size, st.st_mtime_ns)
             except (FileNotFoundError, NotADirectoryError):
                 pass  # gone: every file we know here gets queued (and then removed)
             except OSError as e:
                 log.debug("cannot list %s: %s", d, e)
                 continue  # unreadable is not the same as deleted
 
-            for name, size, mtime_ns in conn.execute(
-                    "SELECT name, size, mtime_ns FROM files WHERE dir = ?", (d,)).fetchall():
+            for file_id, name, size, mtime_ns, status in conn.execute(
+                    "SELECT id, name, size, mtime_ns, status FROM files WHERE dir = ?", (d,)).fetchall():
                 entry = seen.pop(name.lower(), None)
-                if force or entry is None or entry[1] != size or entry[2] != mtime_ns:
+                if (listing := named.pop(name.lower(), None)) is not None:
+                    # written here, not queued: there is no text to extract, so a queue row would only double the writes
+                    if status != db.NAME_ONLY or listing[1] != size or listing[2] != mtime_ns:
+                        db.set_name_only(conn, d, listing[0], listing[1], listing[2], had_text=status != db.NAME_ONLY)
+                        listed += 1
+                elif entry is None and status == db.NAME_ONLY:
+                    conn.execute("DELETE FROM files WHERE id = ?", (file_id,))  # gone, or no longer listed
+                    listed += 1
+                elif force or entry is None or entry[1] != size or entry[2] != mtime_ns or status == db.NAME_ONLY:
                     stage, prio = queue_target(name, cfg, force=force)
                     db.enqueue(conn, os.path.join(d, name), stage, reason=reason, priority=prio)
                     queued += 1
+            for name, size, mtime_ns in named.values():
+                db.set_name_only(conn, d, name, size, mtime_ns, had_text=False)
+                listed += 1
             for name, _, _ in seen.values():
                 stage, prio = queue_target(name, cfg, force=force)
                 db.enqueue(conn, os.path.join(d, name), stage, reason=reason, priority=prio)
@@ -103,6 +119,7 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
         for (d,) in stale:  # streamed from the cursor, not materialized
             throttle.checkpoint()
             if filt.dir_excluded(d) or not os.path.isdir(d):
+                listed += conn.execute("DELETE FROM files WHERE dir = ? AND status = ?", (d, db.NAME_ONLY)).rowcount
                 for (name,) in conn.execute("SELECT name FROM files WHERE dir = ?", (d,)).fetchall():
                     stage, prio = queue_target(name, cfg)
                     db.enqueue(conn, os.path.join(d, name), stage, reason="scan", priority=prio)
@@ -111,5 +128,5 @@ def scan(conn: sqlite3.Connection, top: str, filt: PathFilter, throttle: Throttl
     except BaseException:
         conn.execute("ROLLBACK")
         raise
-    log.info("scanned %s: %d dirs, %d files queued", top, dirs, queued)
+    log.info("scanned %s: %d dirs, %d files queued, %d names listed", top, dirs, queued, listed)
     return queued

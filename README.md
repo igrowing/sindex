@@ -204,7 +204,11 @@ Four checkboxes sit under the search box: **Also in folder- and file-names**, **
 line). Names adds the folder and file names to the search. Only in names searches the folder and file names alone
 (`names_only=1` in `/api/search`): it reads no stored text, so it is fast whatever the wildcards, RegEx or Case
 sensitive ask for, its results have no snippet, and an exclusion alone (`-kyo`) lists every file whose path lacks the
-word, also those without indexed text. The two names boxes are one choice: ticking one clears the other. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
+word, also those without indexed text. The two names boxes are one choice: ticking one clears the other.
+Files whose content sindex cannot read (`.doc`, `.zip`, ...) are in the names only if `index_all_names` is on
+(Settings, "List the names of files that cannot be read", off by default): it stores one row per such file, with no
+text, so the index grows by about 350 bytes per file (59,000 names added 20 MB, and 56 MB of writes, to a scan) and names searches scan more rows. A file excluded by
+extension or name is never listed. Case sensitive compares the typed letters exactly, in contents and in names (`kyo` no longer finds `KYO`);
 in contents it checks the text of every file the word index found, so a very common word takes longer.
 Use RegEx turns the whole query into one Python regular expression for the contents (`^` and `$` match at line
 starts and ends) and, with the names box, for the full path (`D:\folder\file.txt`); case is ignored unless Case

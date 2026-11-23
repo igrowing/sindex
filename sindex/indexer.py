@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, control, db, scanner
-from .extract import file_ext, kind_of, max_bytes
+from .extract import file_ext, kind_of, lists_name_only, max_bytes
 from .extract.job import Chunk, Result, Task
 from .extract.pool import make_runner
 from .filters import SKIP_FILE_ATTRS, PathFilter
@@ -399,6 +399,7 @@ class Indexer:
             "index_hidden": c.index_hidden,
             "text_extensions": sorted(c.text_exts),
             "index_media_metadata": c.index_media_metadata,
+            "index_all_names": c.index_all_names,
         }
 
     def _load_volumes(self) -> None:
@@ -479,7 +480,8 @@ class Indexer:
     def _wanted(self, name: str, reason: int, *, is_dir: bool) -> bool:
         if is_dir:
             return bool(reason & DIR_REASONS)
-        return kind_of(file_ext(name), self.cfg) is not None
+        ext = file_ext(name)
+        return kind_of(ext, self.cfg) is not None or lists_name_only(ext, self.cfg)
 
     def _on_change(self, ch: Change) -> None:
         if ch.parent_path is None or self.filter.dir_excluded(ch.parent_path):
@@ -655,8 +657,9 @@ class Indexer:
         row = conn.execute("SELECT id, size, mtime_ns, status FROM files WHERE dir = ? AND name = ?",
                            (d, name)).fetchone()
         kind = self.filter.file_kind(path)
+        name_only = kind is None and self.filter.lists_name(path)
         try:
-            st = os.stat(path, follow_symlinks=False) if kind else None
+            st = os.stat(path, follow_symlinks=False) if kind or name_only else None
         except (FileNotFoundError, NotADirectoryError):
             st = None
         except OSError as e:
@@ -666,7 +669,13 @@ class Indexer:
             if row:
                 db.delete_file(conn, row[0])
             return False, None
-        if row and not force and row[1] == st.st_size and row[2] == st.st_mtime_ns and row[3] != "indexing":
+        if name_only:
+            if row and not force and row[3] == db.NAME_ONLY and row[1] == st.st_size and row[2] == st.st_mtime_ns:
+                return False, None
+            db.set_name_only(conn, d, name, st.st_size, st.st_mtime_ns, had_text=bool(row) and row[3] != db.NAME_ONLY)
+            return False, None
+        if (row and not force and row[1] == st.st_size and row[2] == st.st_mtime_ns
+                and row[3] not in ("indexing", db.NAME_ONLY)):
             return False, None  # unchanged ('indexing' is a leftover of an interrupted run: redo)
 
         file_id = conn.execute(

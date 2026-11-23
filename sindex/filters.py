@@ -9,7 +9,7 @@ import stat
 import regex
 
 from .config import Config
-from .extract import file_ext, kind_of
+from .extract import file_ext, kind_of, lists_name_only
 
 A_HIDDEN = stat.FILE_ATTRIBUTE_HIDDEN
 A_SYSTEM = stat.FILE_ATTRIBUTE_SYSTEM
@@ -145,8 +145,14 @@ class PathFilter:
     def file_kind(self, path: str) -> str | None:
         """Extractor kind if `path` belongs in the index, else None."""
         kind = kind_of(file_ext(path), self.cfg)
-        if kind is None or self.dir_excluded(os.path.dirname(path)):
-            return None
-        if self._glob_excluded(path, os.path.basename(path), is_dir=False):
+        if kind is None or self._path_excluded(path):
             return None
         return kind
+
+    def lists_name(self, path: str) -> bool:
+        """Whether `path` is kept in the index by its name alone: its content cannot be read, nothing excludes it."""
+        return lists_name_only(file_ext(path), self.cfg) and not self._path_excluded(path)
+
+    def _path_excluded(self, path: str) -> bool:
+        return self.dir_excluded(os.path.dirname(path)) or self._glob_excluded(path, os.path.basename(path),
+                                                                                is_dir=False)
